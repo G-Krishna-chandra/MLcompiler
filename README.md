@@ -154,5 +154,5 @@ The project is structured to easily integrate:
 
 ## License
 
-[Add your license here]
+
 
