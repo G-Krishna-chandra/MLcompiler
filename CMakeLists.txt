@@ -43,6 +43,10 @@ if(BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+# Diagnostic binary for Metal availability
+add_executable(metal_diag tools/metal_diag.mm)
+target_link_libraries(metal_diag PRIVATE "-framework Foundation" "-framework Metal" "-framework CoreGraphics" "-framework QuartzCore")
+
 # Future: MLIR/LLVM integration point
 # find_package(MLIR REQUIRED CONFIG)
 # find_package(LLVM REQUIRED CONFIG)
@@ -51,7 +55,6 @@ message(STATUS "MLCompiler configuration:")
 message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build tests: ${BUILD_TESTS}")
-
 
 
 

@@ -36,6 +36,15 @@ target_link_libraries(mlc_tests PRIVATE
     GTest::gtest_main
     GTest::gmock
 )
+if(APPLE)
+    target_link_libraries(mlc_tests PRIVATE
+        "-framework Metal"
+        "-framework MetalPerformanceShaders"
+        "-framework Foundation"
+        "-framework CoreGraphics"
+        "-framework QuartzCore"
+        "-framework Accelerate")
+endif()
 
 target_include_directories(mlc_tests PRIVATE
     ${CMAKE_SOURCE_DIR}
