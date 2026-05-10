@@ -465,8 +465,10 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                 if (t.shape.size() != 2) {
                     throw std::runtime_error("Weight tensor '" + weight_name + "' must be 2D");
                 }
-                size_t rows = static_cast<size_t>(t.shape[0]);
-                size_t cols = static_cast<size_t>(t.shape[1]);
+                // GGML convention: shape[0]=ne0=cols (input dim), shape[1]=ne1=rows (output dim).
+                // Same convention as Session::runLinear; mirrors the dispatcher fix at :963-964.
+                size_t cols = static_cast<size_t>(t.shape[0]);
+                size_t rows = static_cast<size_t>(t.shape[1]);
                 if (cols != input.size()) {
                     throw std::runtime_error("Input size mismatch for '" + weight_name + "'");
                 }
