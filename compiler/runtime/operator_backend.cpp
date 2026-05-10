@@ -960,8 +960,10 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                 CpuExecutionBackend cpu;
                 return cpu.execute(node, context, descriptor);
             }
-            size_t rows = static_cast<size_t>(w_it->second.shape[0]);
-            size_t cols = static_cast<size_t>(w_it->second.shape[1]);
+            // GGML convention: shape[0]=ne0=cols (input dim), shape[1]=ne1=rows (output dim).
+            // Same convention as Session::runLinear in session.cpp:194-195.
+            size_t cols = static_cast<size_t>(w_it->second.shape[0]);
+            size_t rows = static_cast<size_t>(w_it->second.shape[1]);
             bool transpose_weight = false;
             if (cols != input->size()) {
                 if (rows == input->size()) {
