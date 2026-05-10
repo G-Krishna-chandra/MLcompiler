@@ -58,6 +58,8 @@ void printUsage(const char* program_name) {
     std::cout << "  plan <gguf_path>       Build a high-level execution plan for the model\n";
     std::cout << "  run [options] <gguf_path> [token]\n";
     std::cout << "                       Dry-run the execution plan, embeddings/logits, and schedule\n";
+    std::cout << "  decode <gguf_path> <comma-separated-token-ids> [--start <pos>] [--max-steps <n>] [--topk <k>]\n";
+    std::cout << "                       Execute the graph token-by-token (Metal by default)\n";
     std::cout << "  capabilities          Show built-in runtime/Metal capabilities\n";
     std::cout << "  help                   Show this help message\n";
     std::cout << "\n";
@@ -118,6 +120,17 @@ void printCommandHelp(const std::string& command) {
         std::cout << "Usage: mlc plan <gguf_path>\n\n";
         std::cout << "Arguments:\n";
         std::cout << "  gguf_path      Path to the GGUF model file\n\n";
+    } else if (command == "decode") {
+        std::cout << "Command: decode\n";
+        std::cout << "  Execute the compiled graph for a sequence of token ids.\n\n";
+        std::cout << "Usage: mlc decode <gguf_path> <comma-separated-token-ids> "
+                     "[--start <pos>] [--max-steps <n>] [--topk <k>]\n\n";
+        std::cout << "Options:\n";
+        std::cout << "  --start <pos>         Starting sequence position (default 0, wraps at context length)\n";
+        std::cout << "  --max-steps <n>       Limit how many tokens from the list are executed\n";
+        std::cout << "  --topk <k>            Softmax the logits and print top-k token ids/probabilities\n";
+        std::cout << "Example:\n";
+        std::cout << "  mlc decode model.gguf 1,2,3,4 --start 10\n";
         std::cout << "Example:\n";
         std::cout << "  mlc plan model.gguf\n";
     } else if (command == "run") {

@@ -12,7 +12,21 @@
 #include "runtime/execution_plan_builder.hpp"
 #include "runtime/model_runner.hpp"
 #include "runtime/metal_runtime.hpp"
+#include "runtime/decode_runner.hpp"
+#include "runtime/tokenizer.hpp"
+#include "runtime/sampling.hpp"
 #include "util/cli_helpers.hpp"
+
+#ifdef MLC_ENABLE_LLAMA_TOKENIZER
+#include "llama.h"
+#endif
+
+#include <random>
+#include <limits>
+#include <cstdio>
+#include <cstdlib>
+#include <array>
+#include <fstream>
 
 namespace {
     std::string trim(const std::string& s) {
@@ -29,18 +43,126 @@ namespace {
 
     std::vector<float> parseFloatList(const std::string& text) {
         std::vector<float> values;
-        std::stringstream ss(text);
-        std::string token;
-        while (std::getline(ss, token, ',')) {
-            std::string cleaned = trim(token);
-            if (cleaned.empty()) continue;
-            values.push_back(std::stof(cleaned));
+        std::string normalized = text;
+        for (char& c : normalized) {
+            if (c == ',') c = ' ';
+        }
+        std::stringstream ss(normalized);
+        float v = 0.0f;
+        while (ss >> v) {
+            values.push_back(v);
         }
         if (values.empty()) {
             throw std::runtime_error("Input list must contain at least one value");
         }
         return values;
     }
+
+    struct ChatMessage {
+        std::string role;
+        std::string content;
+    };
+
+    bool templateHasBosHint(const std::string& tmpl) {
+        if (tmpl.find("bos_token") != std::string::npos) return true;
+        if (tmpl.find("<s>") != std::string::npos) return true;
+        if (tmpl.find("<|begin_of_text|>") != std::string::npos) return true;
+        return false;
+    }
+
+    std::string renderChatTemplateSimple(const std::string& tmpl,
+                                         const std::vector<ChatMessage>& messages,
+                                         bool add_generation_prompt,
+                                         const mlc::runtime::Tokenizer& tokenizer) {
+        if (tmpl.find("<|user|>") == std::string::npos &&
+            tmpl.find("<|assistant|>") == std::string::npos &&
+            tmpl.find("<|system|>") == std::string::npos) {
+            return {};
+        }
+        std::string eos = tokenizer.tokenString(tokenizer.eosId());
+        if (eos.empty()) {
+            eos = "</s>";
+        }
+        std::string bos;
+        if (templateHasBosHint(tmpl)) {
+            bos = tokenizer.tokenString(tokenizer.bosId());
+            if (bos.empty()) {
+                bos = "<s>";
+            }
+        }
+        std::string out;
+        if (!bos.empty()) {
+            out += bos;
+        }
+        for (const auto& msg : messages) {
+            if (msg.role == "user") {
+                out += "<|user|>\n";
+            } else if (msg.role == "assistant") {
+                out += "<|assistant|>\n";
+            } else if (msg.role == "system") {
+                out += "<|system|>\n";
+            } else {
+                continue;
+            }
+            out += msg.content;
+            out += eos;
+        }
+        if (add_generation_prompt) {
+            out += "<|assistant|>";
+        }
+        return out;
+    }
+
+#ifdef MLC_ENABLE_LLAMA_TOKENIZER
+    std::string applyChatTemplateLlama(const std::string& tmpl,
+                                       const std::vector<ChatMessage>& messages,
+                                       bool add_generation_prompt,
+                                       std::string* error) {
+        if (tmpl.empty()) {
+            if (error) *error = "empty template";
+            return {};
+        }
+
+        std::vector<std::string> roles;
+        std::vector<std::string> contents;
+        std::vector<llama_chat_message> chat;
+        roles.reserve(messages.size());
+        contents.reserve(messages.size());
+        chat.reserve(messages.size());
+        for (const auto& msg : messages) {
+            roles.push_back(msg.role);
+            contents.push_back(msg.content);
+            chat.push_back({roles.back().c_str(), contents.back().c_str()});
+        }
+
+        int32_t needed = llama_chat_apply_template(tmpl.c_str(),
+                                                   chat.data(),
+                                                   chat.size(),
+                                                   add_generation_prompt,
+                                                   nullptr,
+                                                   0);
+        if (needed < 0) {
+            if (error) *error = "template apply failed (size)";
+            return {};
+        }
+        std::string out;
+        out.resize(static_cast<size_t>(needed));
+        int32_t written = llama_chat_apply_template(tmpl.c_str(),
+                                                    chat.data(),
+                                                    chat.size(),
+                                                    add_generation_prompt,
+                                                    out.data(),
+                                                    static_cast<int32_t>(out.size()));
+        if (written < 0) {
+            if (error) *error = "template apply failed (render)";
+            return {};
+        }
+        if (static_cast<size_t>(written) < out.size()) {
+            out.resize(static_cast<size_t>(written));
+        }
+        return out;
+    }
+#endif
 
     uint64_t calculateElementCount(const std::vector<int64_t>& shape) {
         uint64_t count = 1;
@@ -78,6 +200,436 @@ namespace {
         if (!parseUnsigned(text, tmp)) return false;
         out = static_cast<size_t>(tmp);
         return true;
+    }
+
+    std::vector<uint64_t> parseTokenList(const std::string& text) {
+        std::vector<uint64_t> tokens;
+        std::stringstream ss(text);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            item = trim(item);
+            if (item.empty()) continue;
+            uint64_t value = 0;
+            if (!parseUnsigned(item, value)) {
+                throw std::runtime_error("Invalid token id: " + item);
+            }
+            tokens.push_back(value);
+        }
+        if (tokens.empty()) {
+            throw std::runtime_error("Token list must contain at least one id");
+        }
+        return tokens;
+    }
+
+    struct LogitsTraceConfig {
+        FILE* file = nullptr;
+        size_t top_k_override = 0;
+    };
+
+    struct EmbeddingsTraceConfig {
+        FILE* file = nullptr;
+        size_t preview = 0;
+    };
+
+    struct ChatTraceConfig {
+        FILE* prompt_file = nullptr;
+        FILE* tokens_file = nullptr;
+    };
+
+    bool parseSizeTEnv(const char* text, size_t& out) {
+        if (!text || !*text) return false;
+        char* end = nullptr;
+        unsigned long value = std::strtoul(text, &end, 10);
+        if (!end || *end != '\0') return false;
+        out = static_cast<size_t>(value);
+        return true;
+    }
+
+    const LogitsTraceConfig& logitsTraceConfig() {
+        static LogitsTraceConfig cfg = []() {
+            LogitsTraceConfig out;
+            const char* path = std::getenv("MLC_LOGITS_FILE");
+            if (path && *path) {
+                out.file = std::fopen(path, "a");
+                if (out.file) {
+                    std::setvbuf(out.file, nullptr, _IOLBF, 0);
+                }
+            }
+            size_t top_k = 0;
+            const char* env_topk = std::getenv("MLC_LOGITS_TOPK");
+            if (parseSizeTEnv(env_topk, top_k)) {
+                out.top_k_override = top_k;
+            }
+            return out;
+        }();
+        return cfg;
+    }
+
+    const EmbeddingsTraceConfig& embeddingsTraceConfig() {
+        static EmbeddingsTraceConfig cfg = []() {
+            EmbeddingsTraceConfig out;
+            const char* path = std::getenv("MLC_EMBEDDINGS_FILE");
+            if (path && *path) {
+                out.file = std::fopen(path, "a");
+                if (out.file) {
+                    std::setvbuf(out.file, nullptr, _IOLBF, 0);
+                }
+            }
+            size_t preview = 0;
+            const char* env_preview = std::getenv("MLC_EMBEDDINGS_PREVIEW");
+            if (parseSizeTEnv(env_preview, preview)) {
+                out.preview = preview;
+            } else {
+                out.preview = 16;
+            }
+            return out;
+        }();
+        return cfg;
+    }
+
+    const ChatTraceConfig& chatTraceConfig() {
+        static ChatTraceConfig cfg = []() {
+            ChatTraceConfig out;
+            const char* prompt_path = std::getenv("MLC_CHAT_PROMPT_FILE");
+            if (prompt_path && *prompt_path) {
+                out.prompt_file = std::fopen(prompt_path, "a");
+                if (out.prompt_file) {
+                    std::setvbuf(out.prompt_file, nullptr, _IOLBF, 0);
+                }
+            }
+            const char* tokens_path = std::getenv("MLC_CHAT_TOKENS_FILE");
+            if (tokens_path && *tokens_path) {
+                out.tokens_file = std::fopen(tokens_path, "a");
+                if (out.tokens_file) {
+                    std::setvbuf(out.tokens_file, nullptr, _IOLBF, 0);
+                }
+            }
+            return out;
+        }();
+        return cfg;
+    }
+
+    void logChatPrompt(const ChatTraceConfig& cfg,
+                       size_t turn,
+                       bool used_template,
+                       const std::string& rendered) {
+        if (!cfg.prompt_file) return;
+        std::fprintf(cfg.prompt_file,
+                     "[ChatPrompt] turn=%zu used_template=%d length=%zu\n",
+                     turn,
+                     used_template ? 1 : 0,
+                     rendered.size());
+        if (!rendered.empty()) {
+            std::fwrite(rendered.data(), 1, rendered.size(), cfg.prompt_file);
+            if (rendered.back() != '\n') {
+                std::fputc('\n', cfg.prompt_file);
+            }
+        }
+        std::fprintf(cfg.prompt_file, "[ChatPromptEnd]\n");
+        std::fflush(cfg.prompt_file);
+    }
+
+    size_t resolveTopK(const LogitsTraceConfig& cfg, size_t default_top_k) {
+        if (cfg.top_k_override > 0) return cfg.top_k_override;
+        if (default_top_k > 0) return default_top_k;
+        return 5;
+    }
+
+    std::vector<std::pair<uint64_t, float>>
+    topKLogits(const std::vector<float>& logits, size_t top_k) {
+        std::vector<std::pair<uint64_t, float>> out;
+        if (logits.empty() || top_k == 0) return out;
+        top_k = std::min(top_k, logits.size());
+        std::vector<std::pair<float, uint64_t>> scored;
+        scored.reserve(logits.size());
+        for (uint64_t i = 0; i < logits.size(); ++i) {
+            scored.push_back({logits[i], i});
+        }
+        if (top_k < scored.size()) {
+            std::nth_element(scored.begin(),
+                             scored.begin() + top_k,
+                             scored.end(),
+                             [](const auto& a, const auto& b) {
+                                 return a.first > b.first;
+                             });
+            scored.resize(top_k);
+        }
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        out.reserve(top_k);
+        for (const auto& p : scored) {
+            out.push_back({p.second, p.first});
+        }
+        return out;
+    }
+
+    void logTokenListToFile(FILE* file,
+                            const char* label,
+                            size_t seq,
+                            const std::vector<uint64_t>& tokens) {
+        if (!file) return;
+        std::fprintf(file, "[Tokens] seq=%zu label=%s count=%zu ids=",
+                     seq,
+                     label ? label : "tokens",
+                     tokens.size());
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (i > 0) std::fprintf(file, ",");
+            std::fprintf(file, "%llu",
+                         static_cast<unsigned long long>(tokens[i]));
+        }
+        std::fprintf(file, "\n");
+        std::fflush(file);
+    }
+
+    void logTokenList(const LogitsTraceConfig& cfg,
+                      const char* label,
+                      size_t seq,
+                      const std::vector<uint64_t>& tokens) {
+        logTokenListToFile(cfg.file, label, seq, tokens);
+    }
+
+    void logLogits(const LogitsTraceConfig& cfg,
+                   const char* phase,
+                   size_t seq,
+                   size_t step,
+                   uint64_t token,
+                   size_t pos,
+                   const std::vector<float>& logits,
+                   size_t default_top_k) {
+        if (!cfg.file || logits.empty()) return;
+        size_t top_k = resolveTopK(cfg, default_top_k);
+        if (top_k == 0) return;
+        float min_val = logits.front();
+        float max_val = logits.front();
+        double sum = 0.0;
+        for (float v : logits) {
+            min_val = std::min(min_val, v);
+            max_val = std::max(max_val, v);
+            sum += static_cast<double>(v);
+        }
+        double mean = sum / static_cast<double>(logits.size());
+        auto top = topKLogits(logits, top_k);
+        std::fprintf(cfg.file,
+                     "[Logits] seq=%zu phase=%s step=%zu token=%llu pos=%zu count=%zu min=%.6g max=%.6g mean=%.6g topk=%zu entries=",
+                     seq,
+                     phase ? phase : "step",
+                     step,
+                     static_cast<unsigned long long>(token),
+                     pos,
+                     logits.size(),
+                     min_val,
+                     max_val,
+                     mean,
+                     top.size());
+        for (size_t i = 0; i < top.size(); ++i) {
+            if (i > 0) std::fprintf(cfg.file, ",");
+            std::fprintf(cfg.file,
+                         "%llu:%.6g",
+                         static_cast<unsigned long long>(top[i].first),
+                         top[i].second);
+        }
+        std::fprintf(cfg.file, "\n");
+        std::fflush(cfg.file);
+    }
+
+    void logEmbeddings(const EmbeddingsTraceConfig& cfg,
+                       const char* phase,
+                       size_t seq,
+                       size_t step,
+                       uint64_t token,
+                       size_t pos,
+                       const float* data,
+                       size_t count) {
+        if (!cfg.file || !data || count == 0) return;
+        size_t preview = std::min(cfg.preview, count);
+        if (preview == 0) return;
+        float min_val = data[0];
+        float max_val = data[0];
+        double sum = 0.0;
+        for (size_t i = 0; i < count; ++i) {
+            min_val = std::min(min_val, data[i]);
+            max_val = std::max(max_val, data[i]);
+            sum += static_cast<double>(data[i]);
+        }
+        double mean = sum / static_cast<double>(count);
+        std::fprintf(cfg.file,
+                     "[Embeddings] seq=%zu phase=%s step=%zu token=%llu pos=%zu count=%zu min=%.6g max=%.6g mean=%.6g values=",
+                     seq,
+                     phase ? phase : "step",
+                     step,
+                     static_cast<unsigned long long>(token),
+                     pos,
+                     count,
+                     min_val,
+                     max_val,
+                     mean);
+        for (size_t i = 0; i < preview; ++i) {
+            if (i > 0) std::fprintf(cfg.file, ",");
+            std::fprintf(cfg.file, "%.6g", data[i]);
+        }
+        std::fprintf(cfg.file, "\n");
+        std::fflush(cfg.file);
+    }
+
+    std::vector<std::vector<uint64_t>> parseTokenBatches(const std::string& text) {
+        std::vector<std::vector<uint64_t>> batches;
+        std::stringstream ss(text);
+        std::string segment;
+        while (std::getline(ss, segment, ';')) {
+            std::string cleaned = trim(segment);
+            if (cleaned.empty()) {
+                continue;
+            }
+            batches.push_back(parseTokenList(cleaned));
+        }
+        if (batches.empty()) {
+            throw std::runtime_error("Token list must contain at least one sequence");
+        }
+        return batches;
+    }
+
+    // Lightweight shell escaping for single-quoted strings.
+    std::string shellEscape(const std::string& text) {
+        std::string out;
+        out.reserve(text.size() + 2);
+        out.push_back('\'');
+        for (char c : text) {
+            if (c == '\'') {
+                out.append("'\"'\"'");
+            } else {
+                out.push_back(c);
+            }
+        }
+        out.push_back('\'');
+        return out;
+    }
+
+    // Replace all occurrences of placeholder with escaped value.
+    std::string substitute(const std::string& templ,
+                           const std::string& placeholder,
+                           const std::string& value) {
+        std::string out;
+        size_t pos = 0;
+        while (true) {
+            size_t found = templ.find(placeholder, pos);
+            if (found == std::string::npos) {
+                out.append(templ.substr(pos));
+                break;
+            }
+            out.append(templ.substr(pos, found - pos));
+            out.append(value);
+            pos = found + placeholder.size();
+        }
+        return out;
+    }
+
+    std::string runCommandCapture(const std::string& cmd) {
+        std::array<char, 256> buffer{};
+        std::string result;
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) {
+            throw std::runtime_error("Failed to run command: " + cmd);
+        }
+        while (fgets(buffer.data(), buffer.size(), pipe)) {
+            result.append(buffer.data());
+        }
+        int rc = pclose(pipe);
+        if (rc != 0) {
+            throw std::runtime_error("Tokenizer command failed with exit code " + std::to_string(rc));
+        }
+        return result;
+    }
+
+    std::vector<uint64_t> parseIdsFromOutput(const std::string& text) {
+        std::vector<uint64_t> ids;
+        // If output contains a bracketed list (e.g., [1, 2, 3]), focus on that substring.
+        size_t l = text.rfind('[');
+        size_t r = text.rfind(']');
+        std::string view = text;
+        if (l != std::string::npos && r != std::string::npos && r > l) {
+            view = text.substr(l + 1, r - l - 1);
+        }
+        std::string current;
+        auto flush = [&]() {
+            if (current.empty()) return;
+            uint64_t v = 0;
+            if (parseUnsigned(current, v)) {
+                ids.push_back(v);
+            }
+            current.clear();
+        };
+        for (char c : view) {
+            if (std::isdigit(static_cast<unsigned char>(c))) {
+                current.push_back(c);
+            } else {
+                flush();
+            }
+        }
+        flush();
+        return ids;
+    }
+
+    std::vector<uint64_t> tokenizeExternal(const std::string& cmd_template,
+                                           const std::string& text) {
+        if (cmd_template.empty()) return {};
+        std::string escaped = shellEscape(text);
+        std::string cmd = substitute(cmd_template, "{text}", escaped);
+        std::string out = runCommandCapture(cmd);
+        return parseIdsFromOutput(out);
+    }
+
+    std::string detokenizeExternal(const std::string& cmd_template,
+                                   const std::vector<uint64_t>& ids) {
+        if (cmd_template.empty() || ids.empty()) return {};
+        std::ostringstream oss;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << ids[i];
+        }
+        std::string escaped_ids = shellEscape(oss.str());
+        std::string cmd = substitute(cmd_template, "{ids}", escaped_ids);
+        return runCommandCapture(cmd);
+    }
+
+    void printDecodeResult(const mlc::runtime::DecodeResult& res, size_t preview) {
+        if (!res.success) {
+            std::cout << "Decode failed after " << res.steps.size() << " steps.\n";
+        } else {
+            std::cout << "Decode completed " << res.steps.size() << " steps.\n";
+        }
+        for (size_t i = 0; i < res.steps.size(); ++i) {
+            const auto& step = res.steps[i];
+            std::cout << "Step " << i << " token=" << step.token
+                      << " pos=" << step.position
+                      << " success=" << (step.success ? "yes" : "no") << "\n";
+            if (!step.trace.empty()) {
+                std::cout << "  trace:\n";
+                for (const auto& line : step.trace) {
+                    std::cout << "    - " << line << "\n";
+                }
+            }
+            if (!step.success && !step.error.empty()) {
+                std::cout << "  error: " << step.error << "\n";
+            }
+            if (!step.top_indices.empty()) {
+                std::cout << "  topk: ";
+                for (size_t j = 0; j < step.top_indices.size(); ++j) {
+                    if (j > 0) std::cout << ", ";
+                    std::cout << step.top_indices[j] << " (" << step.top_probs[j] << ")";
+                }
+                std::cout << "\n";
+            }
+            if (!step.logits.empty()) {
+                std::cout << "  logits: ";
+                size_t n = std::min(preview, step.logits.size());
+                for (size_t j = 0; j < n; ++j) {
+                    if (j > 0) std::cout << ", ";
+                    std::cout << step.logits[j];
+                }
+                if (n < step.logits.size()) std::cout << ", ...";
+                std::cout << "\n";
+            }
+        }
     }
 
     void printFloatPreview(const std::vector<float>& values) {
@@ -428,19 +980,83 @@ namespace {
 
         const std::string& gguf_path = args[0];
         const std::string& tensor_name = args[1];
-        const std::string& input_values = args[2];
+        std::string input_values = args[2];
+        size_t top_k = 0;
+        std::string output_path;
+        for (size_t i = 3; i < args.size(); ++i) {
+            const std::string& arg = args[i];
+            if (arg == "--topk" && i + 1 < args.size()) {
+                if (!parseSizeT(args[++i], top_k)) {
+                    std::cerr << "Error: invalid value for --topk\n";
+                    return 1;
+                }
+            } else if (arg.rfind("--topk=", 0) == 0) {
+                if (!parseSizeT(arg.substr(7), top_k)) {
+                    std::cerr << "Error: invalid value for --topk\n";
+                    return 1;
+                }
+            } else if (arg == "--output-file" && i + 1 < args.size()) {
+                output_path = args[++i];
+            } else if (arg.rfind("--output-file=", 0) == 0) {
+                output_path = arg.substr(14);
+            } else {
+                std::cerr << "Unknown linear option: " << arg << "\n";
+                return 1;
+            }
+        }
 
         try {
+            if (!input_values.empty() && input_values[0] == '@') {
+                const std::string path = input_values.substr(1);
+                std::ifstream file(path);
+                if (!file) {
+                    std::cerr << "Error: failed to read input file " << path << "\n";
+                    return 1;
+                }
+                std::ostringstream oss;
+                oss << file.rdbuf();
+                input_values = oss.str();
+            }
             auto inputs = parseFloatList(input_values);
             mlc::runtime::Session session(gguf_path);
             auto outputs = session.runLinear(tensor_name, inputs);
 
-            std::cout << "Linear output (" << outputs.size() << " values):\n";
-            for (size_t i = 0; i < outputs.size(); ++i) {
-                if (i > 0) std::cout << ", ";
-                std::cout << outputs[i];
+            std::ostream* out = &std::cout;
+            std::ofstream file_out;
+            if (!output_path.empty()) {
+                file_out.open(output_path);
+                if (!file_out) {
+                    std::cerr << "Error: failed to open output file " << output_path << "\n";
+                    return 1;
+                }
+                out = &file_out;
             }
-            std::cout << "\n";
+            if (top_k > 0) {
+                if (top_k > outputs.size()) top_k = outputs.size();
+                std::vector<std::pair<float, size_t>> scored;
+                scored.reserve(outputs.size());
+                for (size_t i = 0; i < outputs.size(); ++i) {
+                    scored.emplace_back(outputs[i], i);
+                }
+                std::partial_sort(scored.begin(),
+                                  scored.begin() + top_k,
+                                  scored.end(),
+                                  [](const auto& a, const auto& b) { return a.first > b.first; });
+                scored.resize(top_k);
+                *out << "Top-" << top_k << " logits:\n";
+                for (size_t i = 0; i < scored.size(); ++i) {
+                    *out << scored[i].second << ":" << scored[i].first;
+                    if (i + 1 < scored.size()) *out << ", ";
+                }
+                *out << "\n";
+            } else {
+                *out << "Linear output (" << outputs.size() << " values):\n";
+                for (size_t i = 0; i < outputs.size(); ++i) {
+                    if (i > 0) *out << ", ";
+                    *out << outputs[i];
+                }
+                *out << "\n";
+            }
         } catch (const std::exception& e) {
             std::cerr << "Error: " << e.what() << "\n";
             return 1;
@@ -669,6 +1285,1071 @@ int handleRunCommand(const mlc::util::ParsedArgs& parsed) {
     return 0;
 }
 
+int handleDecodeCommand(const mlc::util::ParsedArgs& parsed) {
+    std::vector<std::string> positional;
+    size_t start_pos = 0;
+    size_t max_steps = 0;
+    size_t top_k = 0;
+    bool evict_on_full = true;
+    bool cache_report = false;
+
+    for (size_t i = 0; i < parsed.arguments.size(); ++i) {
+        const std::string& arg = parsed.arguments[i];
+        if (arg == "--start" && i + 1 < parsed.arguments.size()) {
+            if (!parseSizeT(parsed.arguments[++i], start_pos)) {
+                std::cerr << "Error: invalid value for --start\n";
+                return 1;
+            }
+        } else if (arg == "--max-steps" && i + 1 < parsed.arguments.size()) {
+            if (!parseSizeT(parsed.arguments[++i], max_steps)) {
+                std::cerr << "Error: invalid value for --max-steps\n";
+                return 1;
+            }
+        } else if (arg == "--topk" && i + 1 < parsed.arguments.size()) {
+            if (!parseSizeT(parsed.arguments[++i], top_k)) {
+                std::cerr << "Error: invalid value for --topk\n";
+                return 1;
+            }
+        } else if (arg.rfind("--start=", 0) == 0) {
+            if (!parseSizeT(arg.substr(8), start_pos)) {
+                std::cerr << "Error: invalid value for --start\n";
+                return 1;
+            }
+        } else if (arg.rfind("--max-steps=", 0) == 0) {
+            if (!parseSizeT(arg.substr(12), max_steps)) {
+                std::cerr << "Error: invalid value for --max-steps\n";
+                return 1;
+            }
+        } else if (arg.rfind("--topk=", 0) == 0) {
+            if (!parseSizeT(arg.substr(7), top_k)) {
+                std::cerr << "Error: invalid value for --topk\n";
+                return 1;
+            }
+        } else if (arg == "--no-evict") {
+            evict_on_full = false;
+        } else if (arg == "--cache-report") {
+            cache_report = true;
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.size() < 2) {
+        std::cerr << "Usage: mlc decode <gguf_path> <token-ids|seq1;seq2> "
+                     "[--start <pos>] [--max-steps <n>] [--topk <k>]\n";
+        return 1;
+    }
+
+    const std::string& gguf_path = positional[0];
+    std::vector<std::vector<uint64_t>> batches;
+    try {
+        batches = parseTokenBatches(positional[1]);
+    } catch (const std::exception& e) {
+        std::cerr << "Error parsing tokens: " << e.what() << "\n";
+        return 1;
+    }
+
+    auto printCacheReport = [&](const std::vector<mlc::runtime::CacheReportEntry>& report) {
+        if (report.empty()) return;
+        std::cout << "KV cache report (" << report.size() << " tensors):\n";
+        for (const auto& entry : report) {
+            std::cout << "  - " << entry.name
+                      << " dtype=" << mlc::frontend::ggufDtypeToString(entry.dtype)
+                      << " qv=" << entry.quant_version
+                      << " row_stride=" << entry.row_stride_bytes
+                      << " bytes=" << entry.byte_size
+                      << "\n";
+        }
+    };
+
+    try {
+        mlc::runtime::DecodeRunner runner(gguf_path);
+        size_t preview = 8;
+
+        if (batches.size() == 1) {
+            mlc::runtime::DecodeOptions opts;
+            opts.tokens = std::move(batches.front());
+            opts.start_position = start_pos;
+            opts.max_steps = max_steps;
+            opts.top_k = top_k;
+            opts.evict_on_full = evict_on_full;
+            opts.cache_report = cache_report;
+            auto res = runner.run(opts);
+            printDecodeResult(res, preview);
+            if (cache_report) {
+                printCacheReport(res.cache_report);
+            }
+            return res.success ? 0 : 1;
+        }
+
+        mlc::runtime::DecodeBatchOptions opts;
+        opts.sequences = std::move(batches);
+        opts.start_position = start_pos;
+        opts.max_steps = max_steps;
+        opts.top_k = top_k;
+        opts.evict_on_full = evict_on_full;
+        opts.cache_report = cache_report;
+        auto batch_res = runner.runBatch(opts);
+
+        if (!batch_res.success) {
+            std::cout << "Batch decode failed after processing "
+                      << batch_res.results.size() << " sequences.\n";
+            return 1;
+        }
+
+        for (size_t i = 0; i < batch_res.results.size(); ++i) {
+            std::cout << "Sequence " << i << ":\n";
+            printDecodeResult(batch_res.results[i], preview);
+            if (cache_report) {
+                printCacheReport(batch_res.results[i].cache_report);
+            }
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+// Forward declare llama.cpp-backed chat for fallback routing.
+int handleChatLlamaCommand(const std::vector<std::string>& args);
+
+int handleChatCommand(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        std::cerr << "Usage: mlc chat <gguf_path> --prompt-tokens <id,id,...> [--max-new N] "
+                     "[--temperature T] [--topk K] [--topp P] [--start POS] [--no-evict] [--eos ids]\n"
+                     "Optional: --prompt-text \"...\" [--tokenizer-cmd '<cmd with {text} placeholder>']\n"
+                     "Optional: --detokenizer-cmd '<cmd with {ids} placeholder>' --decode-output\n";
+        return 1;
+    }
+
+    const std::string& gguf_path = args[0];
+    std::vector<uint64_t> prompt_tokens;
+    std::string prompt_text;
+    std::vector<uint64_t> eos_tokens;
+    size_t max_new = 64;
+    float temperature = 1.0f;
+    size_t top_k = 40;
+    float top_p = 0.9f;
+    size_t start_pos = 0;
+    bool evict_on_full = true;
+    bool decode_output = false;
+    std::string tokenizer_cmd;
+    std::string detokenizer_cmd;
+    bool raw_prompt = false;
+    bool use_llama_backend = false;
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if ((arg == "--prompt-tokens" || arg == "--prompt") && i + 1 < args.size()) {
+            prompt_tokens = parseTokenList(args[++i]);
+        } else if (arg.rfind("--prompt-tokens=", 0) == 0) {
+            prompt_tokens = parseTokenList(arg.substr(16));
+        } else if ((arg == "--prompt-text" || arg == "--text") && i + 1 < args.size()) {
+            prompt_text = args[++i];
+            decode_output = true;
+        } else if (arg.rfind("--prompt-text=", 0) == 0) {
+            prompt_text = arg.substr(14);
+            decode_output = true;
+        } else if (arg == "--max-new" && i + 1 < args.size()) {
+            if (!parseSizeT(args[++i], max_new)) {
+                std::cerr << "Error: invalid value for --max-new\n";
+                return 1;
+            }
+        } else if (arg.rfind("--max-new=", 0) == 0) {
+            if (!parseSizeT(arg.substr(10), max_new)) {
+                std::cerr << "Error: invalid value for --max-new\n";
+                return 1;
+            }
+        } else if (arg == "--temperature" && i + 1 < args.size()) {
+            try {
+                temperature = std::stof(args[++i]);
+            } catch (...) {
+                std::cerr << "Error: invalid value for --temperature\n";
+                return 1;
+            }
+        } else if (arg.rfind("--temperature=", 0) == 0) {
+            try {
+                temperature = std::stof(arg.substr(14));
+            } catch (...) {
+                std::cerr << "Error: invalid value for --temperature\n";
+                return 1;
+            }
+        } else if (arg == "--topk" && i + 1 < args.size()) {
+            if (!parseSizeT(args[++i], top_k)) {
+                std::cerr << "Error: invalid value for --topk\n";
+                return 1;
+            }
+        } else if (arg.rfind("--topk=", 0) == 0) {
+            if (!parseSizeT(arg.substr(7), top_k)) {
+                std::cerr << "Error: invalid value for --topk\n";
+                return 1;
+            }
+        } else if (arg == "--topp" && i + 1 < args.size()) {
+            try {
+                top_p = std::stof(args[++i]);
+            } catch (...) {
+                std::cerr << "Error: invalid value for --topp\n";
+                return 1;
+            }
+        } else if (arg.rfind("--topp=", 0) == 0) {
+            try {
+                top_p = std::stof(arg.substr(7));
+            } catch (...) {
+                std::cerr << "Error: invalid value for --topp\n";
+                return 1;
+            }
+        } else if (arg == "--start" && i + 1 < args.size()) {
+            if (!parseSizeT(args[++i], start_pos)) {
+                std::cerr << "Error: invalid value for --start\n";
+                return 1;
+            }
+        } else if (arg.rfind("--start=", 0) == 0) {
+            if (!parseSizeT(arg.substr(8), start_pos)) {
+                std::cerr << "Error: invalid value for --start\n";
+                return 1;
+            }
+        } else if (arg == "--no-evict") {
+            evict_on_full = false;
+        } else if (arg == "--eos" && i + 1 < args.size()) {
+            eos_tokens = parseTokenList(args[++i]);
+        } else if (arg.rfind("--eos=", 0) == 0) {
+            eos_tokens = parseTokenList(arg.substr(6));
+        } else if (arg == "--decode-output") {
+            decode_output = true;
+        } else if (arg == "--no-decode") {
+            decode_output = false;
+        } else if (arg == "--tokenizer-cmd" && i + 1 < args.size()) {
+            tokenizer_cmd = args[++i];
+        } else if (arg.rfind("--tokenizer-cmd=", 0) == 0) {
+            tokenizer_cmd = arg.substr(16);
+        } else if (arg == "--detokenizer-cmd" && i + 1 < args.size()) {
+            detokenizer_cmd = args[++i];
+        } else if (arg.rfind("--detokenizer-cmd=", 0) == 0) {
+            detokenizer_cmd = arg.substr(19);
+        } else if (arg == "--raw-prompt") {
+            raw_prompt = true;
+        } else if (arg == "--llama-backend") {
+            use_llama_backend = true;
+        } else {
+            std::cerr << "Unknown chat option: " << arg << "\n";
+            return 1;
+        }
+    }
+
+    // Fast-path fallback to llama.cpp only when explicitly requested.
+    if (prompt_tokens.empty() && use_llama_backend) {
+#ifdef MLC_ENABLE_LLAMA_TOKENIZER
+        std::string text_for_tok = prompt_text;
+        if (!raw_prompt) {
+            if (text_for_tok.empty()) text_for_tok = "Hello";
+            text_for_tok = "[INST] <<SYS>>You are a helpful assistant.<</SYS>>\n" + text_for_tok + " [/INST]";
+        }
+        std::vector<std::string> llama_args;
+        llama_args.push_back(gguf_path);
+        llama_args.push_back("--prompt");
+        llama_args.push_back(text_for_tok.empty() ? prompt_text : text_for_tok);
+        llama_args.push_back("--max-new");
+        llama_args.push_back(std::to_string(max_new));
+        llama_args.push_back("--temperature");
+        llama_args.push_back(std::to_string(temperature));
+        llama_args.push_back("--topk");
+        llama_args.push_back(std::to_string(top_k));
+        llama_args.push_back("--topp");
+        llama_args.push_back(std::to_string(top_p));
+        if (raw_prompt) llama_args.push_back("--raw");
+        return handleChatLlamaCommand(llama_args);
+#else
+        std::cerr << "Llama backend not available; build with llama.cpp to enable --llama-backend\n";
+        return 1;
+#endif
+    }
+
+    try {
+        mlc::runtime::Session session(gguf_path);
+        mlc::runtime::Tokenizer tokenizer(session.loader());
+
+        std::string text_for_tok = prompt_text;
+        if (!raw_prompt) {
+            if (text_for_tok.empty()) {
+                text_for_tok = "Hello";
+            }
+            text_for_tok = "[INST] <<SYS>>You are a helpful assistant.<</SYS>>\n" + text_for_tok + " [/INST]";
+        }
+
+        // Prefer external tokenizer when prompt text is provided and command is set.
+        if (prompt_tokens.empty() && !prompt_text.empty()) {
+            if (!tokenizer_cmd.empty()) {
+                prompt_tokens = tokenizeExternal(tokenizer_cmd, prompt_text);
+                if (prompt_tokens.empty()) {
+                    std::cerr << "External tokenizer returned no tokens; falling back to internal\n";
+                }
+            }
+            if (prompt_tokens.empty()) {
+                if (!tokenizer.valid()) {
+                    std::cerr << "Error: tokenizer not available; provide --prompt-tokens or --tokenizer-cmd\n";
+                    return 1;
+                }
+                mlc::runtime::TokenizerConfig tcfg;
+                tcfg.add_bos = true;
+                tcfg.add_eos = false;
+                prompt_tokens = tokenizer.encode(text_for_tok, tcfg);
+            }
+        }
+
+        if (prompt_tokens.empty()) {
+            std::cerr << "Error: provide --prompt-text or --prompt-tokens\n";
+            return 1;
+        }
+        const auto& log_cfg = logitsTraceConfig();
+        logTokenList(log_cfg, "prompt_tokens", 0, prompt_tokens);
+        auto graph = mlc::runtime::ExecutionPlanBuilder::BuildFromLoader(session.loader());
+        const size_t context_len = std::max<size_t>(1, graph.modelConfig().context_length);
+        mlc::runtime::ExecutionContext context(session, &graph);
+        mlc::runtime::ExecutionExecutor executor(graph, &mlc::runtime::BackendRegistry::Default(), &context);
+
+        auto setTokenInputs = [&](uint64_t token, size_t pos) {
+            context.setToken(token);
+            context.setSequencePosition(pos);
+            static const std::vector<std::string> kTokenInputs = {"tokens", "token_ids"};
+            for (const auto& name : kTokenInputs) {
+                if (graph.tensors().count(name)) {
+                    context.setTensor(name, {static_cast<float>(token)});
+                }
+            }
+        };
+
+        auto runStep = [&](uint64_t token, size_t pos, std::vector<float>& logits_out) -> bool {
+            setTokenInputs(token, pos);
+            auto res = executor.run();
+            if (!res.success) {
+                if (!res.trace.empty()) {
+                    std::cerr << "Execution failed: " << formatTraceEntry(res.trace.back()) << "\n";
+                } else {
+                    std::cerr << "Execution failed\n";
+                }
+                return false;
+            }
+            const auto* logits = context.getTensor("logits");
+            if (!logits || logits->empty()) {
+                std::cerr << "Logits not produced for token " << token << "\n";
+                return false;
+            }
+            logits_out = *logits;
+            return true;
+        };
+
+        // Prime with prompt tokens.
+        size_t pos = start_pos;
+        std::vector<float> logits;
+        for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+            if (pos >= context_len) {
+                if (!evict_on_full) {
+                    std::cerr << "Context length exceeded during prompt; use --no-evict only for short prompts\n";
+                    return 1;
+                }
+                context.clearStateTensors();
+                pos = 0;
+            }
+            if (!runStep(prompt_tokens[i], pos, logits)) {
+                return 1;
+            }
+            logLogits(log_cfg, "prompt", 0, i, prompt_tokens[i], pos, logits, top_k);
+            pos += 1;
+        }
+
+        mlc::runtime::SamplerOptions sampler_opts;
+        sampler_opts.temperature = temperature;
+        sampler_opts.top_k = top_k;
+        sampler_opts.top_p = top_p;
+        std::mt19937 rng(std::random_device{}());
+
+        std::vector<uint8_t> control_mask;
+        if (tokenizer.valid()) {
+            size_t vocab = tokenizer.vocabSize();
+            control_mask.assign(vocab, 0);
+            for (size_t id = 0; id < vocab; ++id) {
+                if (tokenizer.isControlToken(id) && !tokenizer.isEogToken(id)) {
+                    control_mask[id] = 1;
+                }
+            }
+        }
+
+        std::vector<uint64_t> generated;
+        for (size_t i = 0; i < max_new; ++i) {
+            const std::vector<float>* sample_logits = &logits;
+            std::vector<float> masked;
+            if (!control_mask.empty() && logits.size() == control_mask.size()) {
+                masked = logits;
+                for (size_t id = 0; id < masked.size(); ++id) {
+                    if (control_mask[id]) {
+                        masked[id] = -1e9f;
+                    }
+                }
+                sample_logits = &masked;
+            }
+            uint64_t next = mlc::runtime::sampleLogits(*sample_logits, sampler_opts, rng);
+            if (next == std::numeric_limits<uint64_t>::max()) {
+                std::cerr << "Sampling failed at step " << i << "\n";
+                break;
+            }
+            generated.push_back(next);
+            std::cout << next;
+            if (i + 1 < max_new) std::cout << ", ";
+            bool hit_eos = std::find(eos_tokens.begin(), eos_tokens.end(), next) != eos_tokens.end();
+            if (hit_eos) {
+                std::cout << " [eos]\n";
+                break;
+            }
+
+            if (pos >= context_len) {
+                if (evict_on_full) {
+                    context.clearStateTensors();
+                    pos = 0;
+                } else {
+                    std::cout << "\nReached context limit; stopping\n";
+                    break;
+                }
+            }
+            if (!runStep(next, pos, logits)) {
+                break;
+            }
+            logLogits(log_cfg, "gen", 0, i, next, pos, logits, top_k);
+            pos += 1;
+        }
+        if (!generated.empty() && decode_output) {
+            std::cout << "\n";
+            std::string decoded;
+            if (!detokenizer_cmd.empty()) {
+                decoded = detokenizeExternal(detokenizer_cmd, generated);
+            } else if (tokenizer.valid()) {
+                decoded = tokenizer.decode(generated);
+            }
+            if (!decoded.empty()) {
+                std::cout << "Decoded: " << decoded << "\n";
+            } else {
+                std::cout << "Decoded: [unavailable]\n";
+            }
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+int handleChatReplCommand(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        std::cerr << "Usage: mlc chat-repl <gguf_path> [--max-new N] [--temperature T] [--topk K] [--topp P]\n"
+                     "                        [--system \"...\"] [--no-system] [--no-template] [--print-ids]\n";
+        return 1;
+    }
+
+    const std::string& gguf_path = args[0];
+    size_t max_new = 64;
+    float temperature = 0.8f;
+    size_t top_k = 40;
+    float top_p = 0.9f;
+    size_t start_pos = 0;
+    bool print_ids = false;
+    bool use_template = true;
+    bool include_system = true;
+    std::string system_message = "You are a helpful assistant.";
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "--max-new" && i + 1 < args.size()) {
+            parseSizeT(args[++i], max_new);
+        } else if (arg.rfind("--max-new=", 0) == 0) {
+            parseSizeT(arg.substr(10), max_new);
+        } else if (arg == "--temperature" && i + 1 < args.size()) {
+            temperature = std::stof(args[++i]);
+        } else if (arg.rfind("--temperature=", 0) == 0) {
+            temperature = std::stof(arg.substr(14));
+        } else if (arg == "--topk" && i + 1 < args.size()) {
+            parseSizeT(args[++i], top_k);
+        } else if (arg.rfind("--topk=", 0) == 0) {
+            parseSizeT(arg.substr(7), top_k);
+        } else if (arg == "--topp" && i + 1 < args.size()) {
+            top_p = std::stof(args[++i]);
+        } else if (arg.rfind("--topp=", 0) == 0) {
+            top_p = std::stof(arg.substr(7));
+        } else if (arg == "--print-ids") {
+            print_ids = true;
+        } else if ((arg == "--system" || arg == "--system-message") && i + 1 < args.size()) {
+            system_message = args[++i];
+        } else if (arg.rfind("--system=", 0) == 0) {
+            system_message = arg.substr(9);
+        } else if (arg == "--no-system") {
+            include_system = false;
+        } else if (arg == "--no-template" || arg == "--raw") {
+            use_template = false;
+        }
+    }
+
+    try {
+        mlc::runtime::Session session(gguf_path);
+        mlc::runtime::Tokenizer tokenizer(session.loader());
+        if (!tokenizer.valid()) {
+            std::cerr << "Tokenizer not available in GGUF\n";
+            return 1;
+        }
+
+        std::string chat_template;
+        if (use_template) {
+            const auto& kv = session.loader().kvMetadata();
+            auto it = kv.find("tokenizer.chat_template");
+            if (it != kv.end() && it->second.type == mlc::frontend::GGUFValueType::STRING) {
+                chat_template = std::get<std::string>(it->second.data);
+            }
+        }
+        const bool can_template = use_template && !chat_template.empty();
+        bool warned_template = false;
+
+        auto graph = mlc::runtime::ExecutionPlanBuilder::BuildFromLoader(session.loader());
+        const size_t context_len = std::max<size_t>(1, graph.modelConfig().context_length);
+        mlc::runtime::ExecutionContext context(session, &graph);
+        mlc::runtime::ExecutionExecutor executor(graph, &mlc::runtime::BackendRegistry::Default(), &context);
+
+        auto setTokenInputs = [&](uint64_t token, size_t pos) {
+            context.setToken(token);
+            context.setSequencePosition(pos);
+            static const std::vector<std::string> kTokenInputs = {"tokens", "token_ids"};
+            for (const auto& name : kTokenInputs) {
+                if (graph.tensors().count(name)) {
+                    context.setTensor(name, {static_cast<float>(token)});
+                }
+            }
+        };
+
+        auto runStep = [&](uint64_t token, size_t pos, std::vector<float>& logits_out) -> bool {
+            setTokenInputs(token, pos);
+            auto res = executor.run();
+            if (!res.success) {
+                std::cerr << "Execution failed\n";
+                return false;
+            }
+            const auto* logits = context.getTensor("logits");
+            if (!logits || logits->empty()) {
+                std::cerr << "Logits not produced\n";
+                return false;
+            }
+            logits_out = *logits;
+            return true;
+        };
+
+        mlc::runtime::SamplerOptions sampler_opts;
+        sampler_opts.temperature = temperature;
+        sampler_opts.top_k = top_k;
+        sampler_opts.top_p = top_p;
+        std::mt19937 rng(std::random_device{}());
+        const auto& chat_trace = chatTraceConfig();
+        const auto& log_cfg = logitsTraceConfig();
+
+        std::vector<uint8_t> control_mask;
+        if (tokenizer.valid()) {
+            size_t vocab = tokenizer.vocabSize();
+            control_mask.assign(vocab, 0);
+            for (size_t id = 0; id < vocab; ++id) {
+                if (tokenizer.isControlToken(id) && !tokenizer.isEogToken(id)) {
+                    control_mask[id] = 1;
+                }
+            }
+        }
+
+        std::vector<uint64_t> history;
+        size_t processed = 0;
+        if (!can_template) {
+            auto bos = tokenizer.bosId();
+            if (bos != std::numeric_limits<uint64_t>::max()) {
+                history.push_back(bos);
+            }
+        }
+
+        size_t pos = start_pos;
+        std::cout << "Interactive chat. Type 'exit' to quit.\n";
+        std::vector<ChatMessage> messages;
+        if (include_system && !system_message.empty()) {
+            messages.push_back({"system", system_message});
+        }
+        std::string line;
+        bool first_turn = true;
+        size_t turn_index = 0;
+        while (true) {
+            std::cout << "You: ";
+            if (!std::getline(std::cin, line)) break;
+            if (line == "exit" || line == "quit") break;
+
+            messages.push_back({"user", line});
+            bool used_template = false;
+#ifdef MLC_ENABLE_LLAMA_TOKENIZER
+#endif
+            if (can_template && !used_template) {
+                std::string rendered = renderChatTemplateSimple(chat_template, messages, true, tokenizer);
+                if (!rendered.empty()) {
+                    mlc::runtime::TokenizerConfig cfg;
+                    cfg.add_bos = !templateHasBosHint(chat_template);
+                    cfg.add_eos = false;
+                    history = tokenizer.encode(rendered, cfg);
+                    processed = 0;
+                    pos = start_pos;
+                    context.clearStateTensors();
+                    used_template = true;
+                    logChatPrompt(chat_trace, turn_index, true, rendered);
+                    logTokenListToFile(chat_trace.tokens_file, "chat_prompt_tokens", turn_index, history);
+                }
+            }
+#ifdef MLC_ENABLE_LLAMA_TOKENIZER
+            if (can_template && !used_template) {
+                std::string err;
+                std::string rendered = applyChatTemplateLlama(chat_template, messages, true, &err);
+                if (!rendered.empty()) {
+                    mlc::runtime::TokenizerConfig cfg;
+                    cfg.add_bos = !templateHasBosHint(chat_template);
+                    cfg.add_eos = false;
+                    history = tokenizer.encode(rendered, cfg);
+                    processed = 0;
+                    pos = start_pos;
+                    context.clearStateTensors();
+                    used_template = true;
+                    logChatPrompt(chat_trace, turn_index, true, rendered);
+                    logTokenListToFile(chat_trace.tokens_file, "chat_prompt_tokens", turn_index, history);
+                } else if (!warned_template) {
+                    std::cerr << "Warning: failed to apply chat template (" << err
+                              << "); falling back to legacy prompt format.\n";
+                    warned_template = true;
+                }
+            }
+#endif
+            if (!used_template) {
+                std::string chat_text;
+                if (first_turn) {
+                    if (include_system && !system_message.empty()) {
+                        chat_text = "[INST] <<SYS>>" + system_message + "<</SYS>>\n" + line + " [/INST]";
+                    } else {
+                        chat_text = "[INST] " + line + " [/INST]";
+                    }
+                } else {
+                    chat_text = "[INST] " + line + " [/INST]";
+                }
+                first_turn = false;
+
+                mlc::runtime::TokenizerConfig cfg;
+                cfg.add_bos = false;
+                cfg.add_eos = false;
+                auto encoded = tokenizer.encode(chat_text + "\n", cfg);
+                history.insert(history.end(), encoded.begin(), encoded.end());
+                logChatPrompt(chat_trace, turn_index, false, chat_text + "\n");
+                logTokenListToFile(chat_trace.tokens_file, "chat_prompt_tokens", turn_index, history);
+            }
+            logTokenList(log_cfg, "chat_prompt_tokens", turn_index, history);
+
+            std::vector<float> logits;
+            // Feed any unprocessed tokens (including BOS once).
+            for (size_t i = processed; i < history.size(); ++i) {
+                if (pos >= context_len) {
+                    context.clearStateTensors();
+                    // Rebuild KV from scratch when reset.
+                    pos = 0;
+                    processed = 0;
+                    i = processed;
+                }
+                if (!runStep(history[i], pos, logits)) {
+                    return 1;
+                }
+                logLogits(log_cfg, "prompt", turn_index, i, history[i], pos, logits, top_k);
+                pos += 1;
+            }
+            processed = history.size();
+
+            std::vector<uint64_t> generated;
+            for (size_t i = 0; i < max_new; ++i) {
+                const std::vector<float>* sample_logits = &logits;
+                std::vector<float> masked;
+                if (!control_mask.empty() && logits.size() == control_mask.size()) {
+                    masked = logits;
+                    for (size_t id = 0; id < masked.size(); ++id) {
+                        if (control_mask[id]) {
+                            masked[id] = -1e9f;
+                        }
+                    }
+                    sample_logits = &masked;
+                }
+                uint64_t next = mlc::runtime::sampleLogits(*sample_logits, sampler_opts, rng);
+                if (next == std::numeric_limits<uint64_t>::max()) break;
+                if (next == tokenizer.eosId()) {
+                    break;
+                }
+                generated.push_back(next);
+                history.push_back(next);
+                if (pos >= context_len) {
+                    context.clearStateTensors();
+                    pos = 0;
+                    processed = 0;
+                    // Rebuild KV and logits.
+                    std::vector<float> tmp_logits;
+                    for (size_t j = 0; j < history.size(); ++j) {
+                        if (!runStep(history[j], pos, tmp_logits)) break;
+                        pos += 1;
+                    }
+                    logits = tmp_logits;
+                    processed = history.size();
+                    continue;
+                }
+                if (!runStep(next, pos, logits)) break;
+                logLogits(log_cfg, "gen", turn_index, i, next, pos, logits, top_k);
+                pos += 1;
+            }
+            if (print_ids) {
+                std::cout << "Model ids: ";
+                for (size_t i = 0; i < generated.size(); ++i) {
+                    if (i) std::cout << ", ";
+                    std::cout << generated[i];
+                }
+                std::cout << "\n";
+            }
+            std::string decoded = tokenizer.decode(generated);
+            std::cout << "Model: " << (decoded.empty() ? "[empty]" : decoded) << "\n";
+            if (used_template && !decoded.empty()) {
+                messages.push_back({"assistant", decoded});
+            }
+            processed = history.size();
+            turn_index += 1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+int handleChatLlamaCommand(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        std::cerr << "Usage: mlc chat-llama <gguf_path> --prompt \"...\" [--max-new N] [--temperature T] [--topk K] [--topp P]\n";
+        return 1;
+    }
+    const std::string& gguf_path = args[0];
+    std::string prompt;
+    size_t max_new = 128;
+    float temperature = 0.7f;
+    size_t top_k = 40;
+    float top_p = 0.9f;
+    bool raw_prompt = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if ((arg == "--prompt" || arg == "-p") && i + 1 < args.size()) {
+            prompt = args[++i];
+        } else if (arg.rfind("--prompt=", 0) == 0) {
+            prompt = arg.substr(9);
+        } else if (arg == "--max-new" && i + 1 < args.size()) {
+            parseSizeT(args[++i], max_new);
+        } else if (arg.rfind("--max-new=", 0) == 0) {
+            parseSizeT(arg.substr(10), max_new);
+        } else if (arg == "--temperature" && i + 1 < args.size()) {
+            temperature = std::stof(args[++i]);
+        } else if (arg.rfind("--temperature=", 0) == 0) {
+            temperature = std::stof(arg.substr(14));
+        } else if (arg == "--topk" && i + 1 < args.size()) {
+            parseSizeT(args[++i], top_k);
+        } else if (arg.rfind("--topk=", 0) == 0) {
+            parseSizeT(arg.substr(7), top_k);
+        } else if (arg == "--topp" && i + 1 < args.size()) {
+            top_p = std::stof(args[++i]);
+        } else if (arg.rfind("--topp=", 0) == 0) {
+            top_p = std::stof(arg.substr(7));
+        } else if (arg == "--raw") {
+            raw_prompt = true;
+        }
+    }
+    if (!raw_prompt) {
+        if (prompt.empty()) prompt = "Hello";
+        prompt = "[INST] <<SYS>>You are a helpful assistant.<</SYS>>\n" + prompt + " [/INST]";
+    }
+
+#ifdef MLC_ENABLE_LLAMA_TOKENIZER
+    llama_model_params mparams = llama_model_default_params();
+    mparams.use_mmap = true;
+    llama_model* model = llama_model_load_from_file(gguf_path.c_str(), mparams);
+    if (!model) {
+        std::cerr << "Failed to load model via llama.cpp\n";
+        return 1;
+    }
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = 2048;
+    llama_context* ctx = llama_new_context_with_model(model, cparams);
+    if (!ctx) {
+        std::cerr << "Failed to create context\n";
+        llama_model_free(model);
+        return 1;
+    }
+
+    auto vocab = llama_model_get_vocab(model);
+    // Tokenize prompt
+    int32_t needed = llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()),
+                                    nullptr, 0, true, false);
+    if (needed < 0) needed = -needed;
+    std::vector<llama_token> tokens(static_cast<size_t>(needed));
+    int32_t written = llama_tokenize(vocab, prompt.c_str(), static_cast<int32_t>(prompt.size()),
+                                     tokens.data(), needed, true, false);
+    if (written < 0) written = -written;
+    tokens.resize(static_cast<size_t>(written));
+
+    const auto& log_cfg = logitsTraceConfig();
+    const auto& emb_cfg = embeddingsTraceConfig();
+    if (emb_cfg.file) {
+        llama_set_embeddings(ctx, true);
+    }
+    size_t pos = 0;
+    std::vector<uint64_t> prompt_tokens;
+    prompt_tokens.reserve(tokens.size());
+    for (llama_token t : tokens) {
+        prompt_tokens.push_back(static_cast<uint64_t>(t));
+    }
+    if (log_cfg.file) {
+        logTokenList(log_cfg, "prompt_tokens", 0, prompt_tokens);
+    }
+    if (emb_cfg.file) {
+        logTokenListToFile(emb_cfg.file, "prompt_tokens", 0, prompt_tokens);
+    }
+    if (log_cfg.file || emb_cfg.file) {
+        int32_t n_embd = llama_model_n_embd(model);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            llama_token tok = tokens[i];
+            llama_batch prompt_batch = llama_batch_get_one(&tok, 1);
+            if (llama_decode(ctx, prompt_batch) != 0) {
+                std::cerr << "llama_decode failed on prompt\n";
+                llama_free(ctx);
+                llama_model_free(model);
+                return 1;
+            }
+            const float* logits_ptr = llama_get_logits(ctx);
+            int64_t n_vocab = llama_vocab_n_tokens(vocab);
+            std::vector<float> logits(logits_ptr, logits_ptr + n_vocab);
+            if (log_cfg.file) {
+                logLogits(log_cfg, "prompt", 0, i, static_cast<uint64_t>(tok), pos, logits, top_k);
+            }
+            if (emb_cfg.file) {
+                float* emb = llama_get_embeddings_ith(ctx, -1);
+                if (emb) {
+                    logEmbeddings(emb_cfg, "prompt", 0, i, static_cast<uint64_t>(tok), pos, emb, n_embd);
+                }
+            }
+            pos += 1;
+        }
+    } else {
+        // Evaluate prompt (auto-tracked positions)
+        llama_batch prompt_batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+        if (llama_decode(ctx, prompt_batch) != 0) {
+            std::cerr << "llama_decode failed on prompt\n";
+            llama_free(ctx);
+            llama_model_free(model);
+            return 1;
+        }
+        pos = tokens.size();
+    }
+
+    auto sample_next = [&](const std::vector<float>& logits_vec) -> llama_token {
+        // simple top-k/top-p sampling with temperature
+        std::vector<std::pair<float, llama_token>> scored;
+        scored.reserve(logits_vec.size());
+        for (int i = 0; i < (int)logits_vec.size(); ++i) {
+            scored.emplace_back(logits_vec[i] / std::max(temperature, 1e-5f), (llama_token)i);
+        }
+        std::partial_sort(scored.begin(),
+                          scored.begin() + std::min(top_k, scored.size()),
+                          scored.end(),
+                          [](auto& a, auto& b) { return a.first > b.first; });
+        if (top_k < scored.size()) scored.resize(top_k);
+        // top-p cutoff
+        float max_logit = scored.front().first;
+        float sum = 0.f;
+        for (auto& kv : scored) kv.first = std::exp(kv.first - max_logit), sum += kv.first;
+        std::vector<std::pair<float, llama_token>> filtered;
+        float acc = 0.f;
+        for (auto& kv : scored) {
+            float p = kv.first / sum;
+            acc += p;
+            filtered.emplace_back(p, kv.second);
+            if (acc >= top_p) break;
+        }
+        float r = (float)rand() / (float)RAND_MAX;
+        float cur = 0.f;
+        for (auto& kv : filtered) {
+            cur += kv.first;
+            if (r <= cur) return kv.second;
+        }
+        return filtered.back().second;
+    };
+
+    std::vector<llama_token> generated;
+    for (size_t i = 0; i < max_new; ++i) {
+        const float* logits_ptr = llama_get_logits(ctx);
+        auto vocab = llama_model_get_vocab(model);
+        int64_t n_vocab = llama_vocab_n_tokens(vocab);
+        std::vector<float> logits(logits_ptr, logits_ptr + n_vocab);
+        if (log_cfg.file) {
+            uint64_t prev_token = prompt_tokens.empty() ? 0
+                                                        : static_cast<uint64_t>(prompt_tokens.back());
+            if (!generated.empty()) {
+                prev_token = static_cast<uint64_t>(generated.back());
+            }
+            logLogits(log_cfg, "gen", 0, i, prev_token, pos, logits, top_k);
+        }
+        llama_token next = sample_next(logits);
+        if (next == llama_vocab_eos(vocab)) break;
+        generated.push_back(next);
+        llama_batch gen_batch = llama_batch_get_one(&next, 1);
+        if (llama_decode(ctx, gen_batch) != 0) break;
+        if (emb_cfg.file) {
+            int32_t n_embd = llama_model_n_embd(model);
+            float* emb = llama_get_embeddings_ith(ctx, -1);
+            if (emb) {
+                logEmbeddings(emb_cfg, "gen", 0, i, static_cast<uint64_t>(next), pos, emb, n_embd);
+            }
+        }
+        pos += 1;
+    }
+
+    // Detokenize
+    int32_t guess = (int32_t)generated.size() * 8 + 32;
+    std::string decoded;
+    std::vector<char> buf((size_t)guess);
+    int32_t det = llama_detokenize(vocab,
+                                   generated.data(),
+                                   (int32_t)generated.size(),
+                                   buf.data(),
+                                   (int32_t)buf.size(),
+                                   true,
+                                   false);
+    if (det < 0) {
+        int32_t need = -det;
+        buf.resize((size_t)need);
+        det = llama_detokenize(vocab,
+                               generated.data(),
+                               (int32_t)generated.size(),
+                               buf.data(),
+                               (int32_t)buf.size(),
+                               true,
+                               false);
+    }
+    if (det > 0) decoded.assign(buf.data(), (size_t)det);
+    std::cout << decoded << "\n";
+
+    llama_free(ctx);
+    llama_model_free(model);
+    return 0;
+#else
+    std::cerr << "chat-llama requires llama.cpp integration\n";
+    return 1;
+#endif
+}
+
+int handleTokenizeCommand(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        std::cerr << "Usage: mlc tokenize <gguf_path> <text> [--no-bos] [--eos] "
+                     "[--tokenizer-cmd '<cmd with {text} placeholder>'] "
+                     "[--detokenizer-cmd '<cmd with {ids} placeholder>']\n";
+        return 1;
+    }
+    const std::string& gguf_path = args[0];
+    std::string text = args[1];
+    bool add_bos = true;
+    bool add_eos = false;
+    std::string tokenizer_cmd;
+    std::string detokenizer_cmd;
+    for (size_t i = 2; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "--no-bos") {
+            add_bos = false;
+        } else if (arg == "--eos") {
+            add_eos = true;
+        } else if (arg.rfind("--text=", 0) == 0) {
+            text = arg.substr(7);
+        } else if (arg == "--tokenizer-cmd" && i + 1 < args.size()) {
+            tokenizer_cmd = args[++i];
+        } else if (arg.rfind("--tokenizer-cmd=", 0) == 0) {
+            tokenizer_cmd = arg.substr(16);
+        } else if (arg == "--detokenizer-cmd" && i + 1 < args.size()) {
+            detokenizer_cmd = args[++i];
+        } else if (arg.rfind("--detokenizer-cmd=", 0) == 0) {
+            detokenizer_cmd = arg.substr(19);
+        } else {
+            std::cerr << "Unknown option for tokenize: " << arg << "\n";
+            return 1;
+        }
+    }
+
+    try {
+        mlc::frontend::GGUFLoader loader(gguf_path);
+        loader.load();
+        std::vector<uint64_t> ids;
+        if (!tokenizer_cmd.empty()) {
+            ids = tokenizeExternal(tokenizer_cmd, text);
+        }
+        mlc::runtime::Tokenizer tokenizer(loader);
+        if (ids.empty()) {
+            if (!tokenizer.valid()) {
+                std::cerr << "Error: tokenizer metadata missing in GGUF and external tokenizer not provided\n";
+                return 1;
+            }
+            mlc::runtime::TokenizerConfig cfg;
+            cfg.add_bos = add_bos;
+            cfg.add_eos = add_eos;
+            ids = tokenizer.encode(text, cfg);
+        }
+
+        std::cout << "Tokens (" << ids.size() << "): ";
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << ids[i];
+        }
+        std::cout << "\n";
+        std::string decoded;
+        if (!detokenizer_cmd.empty()) {
+            decoded = detokenizeExternal(detokenizer_cmd, ids);
+        } else if (tokenizer.valid()) {
+            decoded = tokenizer.decode(ids);
+        }
+        if (!decoded.empty()) {
+            std::cout << "Decoded: " << decoded << "\n";
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+int handleDetokenizeCommand(const std::vector<std::string>& args) {
+    if (args.size() < 2) {
+        std::cerr << "Usage: mlc detokenize <gguf_path> <id0,id1,...>\n";
+        return 1;
+    }
+    const std::string& gguf_path = args[0];
+    std::vector<uint64_t> ids;
+    try {
+        ids = parseTokenList(args[1]);
+    } catch (const std::exception& e) {
+        std::cerr << "Error parsing ids: " << e.what() << "\n";
+        return 1;
+    }
+    try {
+        mlc::frontend::GGUFLoader loader(gguf_path);
+        loader.load();
+        mlc::runtime::Tokenizer tokenizer(loader);
+        if (!tokenizer.valid()) {
+            std::cerr << "Error: tokenizer metadata missing in GGUF\n";
+            return 1;
+        }
+        std::string decoded = tokenizer.decode(ids);
+        std::cout << decoded << "\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
+
 int handleCapabilitiesCommand() {
     auto& metal = mlc::runtime::MetalExecutor::Instance();
     bool device_available = metal.isAvailable();
@@ -727,6 +2408,18 @@ int main(int argc, char* argv[]) {
         return handlePlanCommand(args.arguments);
     } else if (args.command == "run") {
         return handleRunCommand(args);
+    } else if (args.command == "decode") {
+        return handleDecodeCommand(args);
+    } else if (args.command == "chat") {
+        return handleChatCommand(args.arguments);
+    } else if (args.command == "chat-repl") {
+        return handleChatReplCommand(args.arguments);
+    } else if (args.command == "chat-llama") {
+        return handleChatLlamaCommand(args.arguments);
+    } else if (args.command == "tokenize") {
+        return handleTokenizeCommand(args.arguments);
+    } else if (args.command == "detokenize") {
+        return handleDetokenizeCommand(args.arguments);
     } else if (args.command == "capabilities") {
         return handleCapabilitiesCommand();
     } else {
