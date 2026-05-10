@@ -54,6 +54,30 @@ std::vector<std::string> ExecutionContext::tensorNames() const {
     return names;
 }
 
+void ExecutionContext::registerTap(const std::string& tensor_name) {
+    if (tensor_name.empty()) return;
+    tap_names_.insert(tensor_name);
+}
+
+void ExecutionContext::clearTaps() {
+    tap_names_.clear();
+    tap_data_.clear();
+}
+
+bool ExecutionContext::isTapped(const std::string& tensor_name) const {
+    return tap_names_.count(tensor_name) > 0;
+}
+
+void ExecutionContext::captureTapIfRegistered(const std::string& tensor_name) {
+    if (tap_names_.empty()) return;
+    if (!tap_names_.count(tensor_name)) return;
+    auto it = tensors_.find(tensor_name);
+    if (it == tensors_.end()) return;
+    const std::vector<float>* data = it->second.tryFloatData();
+    if (!data) return;
+    tap_data_[tensor_name] = *data;
+}
+
 std::vector<float>& ExecutionContext::allocateTensor(const std::string& name,
                                                      size_t elements,
                                                      bool zero_initialize) {

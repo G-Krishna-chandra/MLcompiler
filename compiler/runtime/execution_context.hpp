@@ -8,6 +8,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace mlc {
@@ -49,6 +50,19 @@ public:
 
     const std::vector<float>& getParameter(const std::string& tensor_name) const;
 
+    // Tap mechanism: register tensor names to capture into host buffers as the
+    // executor produces them. The latest value of each tapped tensor is kept;
+    // when the executor runs prefill multiple times, the tap reflects the most
+    // recent step. tapsEmpty() lets callers (the executor) skip work fast when
+    // no taps are registered.
+    void registerTap(const std::string& tensor_name);
+    void clearTaps();
+    bool tapsEmpty() const { return tap_names_.empty(); }
+    bool isTapped(const std::string& tensor_name) const;
+    // Called by the executor after a node produces an output. No-op if not tapped.
+    void captureTapIfRegistered(const std::string& tensor_name);
+    const std::unordered_map<std::string, std::vector<float>>& tapData() const { return tap_data_; }
+
 #if defined(__APPLE__)
     MetalBufferHandle* ensureMetalBuffer(const std::string& name,
                                          std::vector<float>& data);
@@ -66,6 +80,8 @@ private:
     size_t sequence_position_ = 0;
     std::unordered_map<std::string, TensorStorage> tensors_;
     mutable std::unordered_map<std::string, TensorStorage> parameter_cache_;
+    std::unordered_set<std::string> tap_names_;
+    std::unordered_map<std::string, std::vector<float>> tap_data_;
 #if defined(__APPLE__)
     std::unordered_map<std::string, MetalBufferHandle> metal_buffers_;
 #endif

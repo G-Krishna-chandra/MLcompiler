@@ -15,7 +15,17 @@
 #include "runtime/decode_runner.hpp"
 #include "runtime/tokenizer.hpp"
 #include "runtime/sampling.hpp"
+#include "runtime/parity_harness.hpp"
+#include "runtime/quantization.hpp"
+#include "runtime/execution_executor.hpp"
+#include "runtime/execution_context.hpp"
+#include "runtime/operator_backend.hpp"
+#include "runtime/kernel_registry.hpp"
 #include "util/cli_helpers.hpp"
+
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
 
 #ifdef MLC_ENABLE_LLAMA_TOKENIZER
 #include "llama.h"
@@ -2374,6 +2384,534 @@ int handleCapabilitiesCommand() {
     }
     return 0;
 }
+
+int handleCompareCommand(const std::vector<std::string>& args) {
+    enum class Mode { None, MetalVsCpu, VsLlamacpp };
+    auto usage = []() {
+        std::cerr << "Usage: mlc compare <mode> <gguf_path> --prompt \"...\" [options]\n"
+                     "Modes:\n"
+                     "  --metal-vs-cpu              Run the model twice in-process (CPU-pinned vs Metal)\n"
+                     "                                and diff per-layer tap tensors.\n"
+                     "  --vs-llamacpp               Run mlc once (CPU pinned) and compare against\n"
+                     "                                pre-dumped llama.cpp tensors at boundaries.\n"
+                     "Options:\n"
+                     "  --prompt \"<text>\"           Prompt text (required).\n"
+                     "  --tap <pattern>             Substring pattern for tensors to capture.\n"
+                     "                                Repeatable. Default: embedding/per-block boundaries\n"
+                     "                                + final_norm + logits.\n"
+                     "  --csv-out <path>            Write per-tensor metrics to CSV at <path>.\n"
+                     "  --reference-dir <dir>       (vs-llamacpp only) Directory of reference tensor\n"
+                     "                                dumps. Each tensor X is read from\n"
+                     "                                <dir>/<sanitized(X)>.f32.bin (raw little-endian f32,\n"
+                     "                                length must match).\n"
+                     "  --wrap-chat                 Wrap prompt with [INST] template before tokenizing\n"
+                     "                                (default off — raw prompt for parity tests).\n";
+    };
+
+    if (args.empty()) { usage(); return 1; }
+
+    Mode mode = Mode::None;
+    mlc::runtime::parity::CompareOptions opts;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--metal-vs-cpu") {
+            if (mode != Mode::None) { std::cerr << "compare: pick one mode\n"; return 1; }
+            mode = Mode::MetalVsCpu;
+        } else if (a == "--vs-llamacpp") {
+            if (mode != Mode::None) { std::cerr << "compare: pick one mode\n"; return 1; }
+            mode = Mode::VsLlamacpp;
+        } else if (a == "--prompt" && i + 1 < args.size()) {
+            opts.prompt = args[++i];
+        } else if (a.rfind("--prompt=", 0) == 0) {
+            opts.prompt = a.substr(9);
+        } else if (a == "--tap" && i + 1 < args.size()) {
+            opts.tap_patterns.push_back(args[++i]);
+        } else if (a.rfind("--tap=", 0) == 0) {
+            opts.tap_patterns.push_back(a.substr(6));
+        } else if (a == "--csv-out" && i + 1 < args.size()) {
+            opts.csv_path = args[++i];
+        } else if (a.rfind("--csv-out=", 0) == 0) {
+            opts.csv_path = a.substr(10);
+        } else if (a == "--reference-dir" && i + 1 < args.size()) {
+            opts.reference_dir = args[++i];
+        } else if (a.rfind("--reference-dir=", 0) == 0) {
+            opts.reference_dir = a.substr(16);
+        } else if (a == "--wrap-chat") {
+            opts.wrap_chat_template = true;
+        } else if (!a.empty() && a[0] != '-' && opts.gguf_path.empty()) {
+            opts.gguf_path = a;
+        } else {
+            std::cerr << "compare: unknown option '" << a << "'\n";
+            usage();
+            return 1;
+        }
+    }
+    if (mode == Mode::None) { std::cerr << "compare: missing --metal-vs-cpu or --vs-llamacpp\n"; usage(); return 1; }
+    if (opts.gguf_path.empty()) { std::cerr << "compare: missing <gguf_path>\n"; usage(); return 1; }
+    if (opts.prompt.empty()) { std::cerr << "compare: missing --prompt\n"; usage(); return 1; }
+    if (mode == Mode::VsLlamacpp && opts.reference_dir.empty()) {
+        std::cerr << "compare --vs-llamacpp: missing --reference-dir\n"; return 1;
+    }
+
+    try {
+        mlc::runtime::parity::CompareReport report =
+            (mode == Mode::MetalVsCpu)
+                ? mlc::runtime::parity::compareMetalVsCpu(opts)
+                : mlc::runtime::parity::compareVsLlamaCpp(opts);
+
+        mlc::runtime::parity::printTable(report, std::cout);
+        if (!opts.csv_path.empty()) {
+            if (!mlc::runtime::parity::writeCsv(report, opts.csv_path)) {
+                std::cerr << "compare: failed to write CSV at " << opts.csv_path << "\n";
+                return 2;
+            }
+            std::cerr << "compare: wrote CSV to " << opts.csv_path << "\n";
+        }
+        return report.success ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::cerr << "compare: error: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+// ============================================================================
+// test-matmul-q4: focused micro-test for metal.matmul.quant on Q4_0 weights.
+// CPU-dequant + Accelerate sgemv reference vs the Metal kernel, on real
+// block-0 weights and on synthetic stress shapes.
+// ============================================================================
+
+namespace q4diag {
+
+// HANDWRITTEN reference: dequantize + cblas_sgemv driven by caller-supplied
+// (rows, cols, transpose). Mirrors operator_backend.cpp's interpretation —
+// rows = shape[0], cols = shape[1]. NOT a canonical anchor: it shares any
+// shape-axis assumption the caller (and the Metal kernel) makes.
+std::vector<float> cpuMatmulHandwritten(const uint8_t* weights,
+                             size_t rows,
+                             size_t cols,
+                             size_t row_stride,
+                             uint32_t qversion,
+                             const std::vector<float>& input,
+                             bool transpose) {
+    std::vector<float> dq(rows * cols);
+    for (size_t r = 0; r < rows; ++r) {
+        mlc::runtime::dequantizeRowQ4_0(weights + r * row_stride, cols, qversion,
+                                         dq.data() + r * cols);
+    }
+    size_t out_size = transpose ? cols : rows;
+    std::vector<float> out(out_size, 0.0f);
+#if defined(__APPLE__)
+    cblas_sgemv(CblasRowMajor, transpose ? CblasTrans : CblasNoTrans,
+                static_cast<int>(rows), static_cast<int>(cols),
+                1.0f, dq.data(), static_cast<int>(cols),
+                input.data(), 1,
+                0.0f, out.data(), 1);
+#else
+    // Portable fallback (slower).
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t c = 0; c < cols; ++c) {
+            float w = dq[r * cols + c];
+            if (transpose) out[c] += w * input[r];
+            else            out[r] += w * input[c];
+        }
+    }
+#endif
+    return out;
+}
+
+// CANONICAL reference: invokes Session::runLinear, the same function the
+// in-graph CPU backend calls (operator_backend.cpp:362). Encodes whatever
+// shape-axis convention runLinear uses (currently GGML: cols=shape[0],
+// rows=shape[1]). This is the anchor — any divergence between handwritten
+// and canonical is a convention/dispatch-class bug, not a kernel bug.
+std::vector<float> cpuMatmulCanonical(const mlc::runtime::Session& session,
+                                       const std::string& weight_name,
+                                       const std::vector<float>& input) {
+    return session.runLinear(weight_name, input);
+}
+
+// Classify a 3-way pairwise comparison. Threshold 0.999 picks up any divergence
+// beyond float-rounding noise (well above the ~1e-6 we see when math agrees).
+//   OK                — all three pairs agree.
+//   DISPATCH MISMATCH — H↔M agree but disagree with C: handwritten and Metal
+//                       share the wrong convention (Bug B signature).
+//   KERNEL ERROR      — H↔C agree but disagree with M: dispatch is fine,
+//                       Metal kernel is wrong (Bug A signature).
+//   BOTH              — neither pair agrees: kernel and dispatch both off,
+//                       or some other independent failure.
+const char* classifyDivergence(float h_c, float h_m, float c_m) {
+    constexpr float kThreshold = 0.999f;
+    auto ok = [](float x) {
+        return std::isfinite(x) && x >= kThreshold;
+    };
+    bool hc_ok = ok(h_c);
+    bool hm_ok = ok(h_m);
+    bool cm_ok = ok(c_m);
+    if (hc_ok && hm_ok && cm_ok) return "OK";
+    if (hm_ok && !cm_ok) return "DISPATCH MISMATCH";
+    if (hc_ok && !hm_ok) return "KERNEL ERROR";
+    return "BOTH";
+}
+
+struct DiagMetrics {
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    float rms = 0.0f;
+    float cosine = 0.0f;
+    std::vector<size_t> worst_idx;       // top-K output indices by |error|
+    std::vector<float>  worst_err;
+    std::vector<float>  bucket_mean_err; // 16 equal-width buckets across output dim
+};
+
+DiagMetrics metrics(const std::vector<float>& a, const std::vector<float>& b, int top_k = 8) {
+    DiagMetrics m;
+    if (a.size() != b.size() || a.empty()) {
+        m.cosine = std::numeric_limits<float>::quiet_NaN();
+        return m;
+    }
+    double max_abs = 0, sum_abs = 0, sum_sq = 0, dot = 0, na2 = 0, nb2 = 0;
+    std::vector<std::pair<float, size_t>> errs;
+    errs.reserve(a.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        double d  = double(a[i]) - double(b[i]);
+        double ad = std::fabs(d);
+        if (ad > max_abs) max_abs = ad;
+        sum_abs += ad;
+        sum_sq  += d * d;
+        dot += double(a[i]) * double(b[i]);
+        na2 += double(a[i]) * double(a[i]);
+        nb2 += double(b[i]) * double(b[i]);
+        errs.push_back({static_cast<float>(ad), i});
+    }
+    m.max_abs  = static_cast<float>(max_abs);
+    m.mean_abs = static_cast<float>(sum_abs / a.size());
+    m.rms      = static_cast<float>(std::sqrt(sum_sq / a.size()));
+    m.cosine   = (na2 > 0 && nb2 > 0)
+                     ? static_cast<float>(dot / (std::sqrt(na2) * std::sqrt(nb2)))
+                     : std::numeric_limits<float>::quiet_NaN();
+
+    int K = std::min<int>(top_k, static_cast<int>(errs.size()));
+    std::partial_sort(errs.begin(), errs.begin() + K, errs.end(),
+                      [](const auto& p, const auto& q) { return p.first > q.first; });
+    for (int i = 0; i < K; ++i) {
+        m.worst_idx.push_back(errs[i].second);
+        m.worst_err.push_back(errs[i].first);
+    }
+
+    constexpr int B = 16;
+    std::vector<double> sums(B, 0.0);
+    std::vector<int> counts(B, 0);
+    for (size_t i = 0; i < a.size(); ++i) {
+        int b_idx = std::min(B - 1, static_cast<int>(i * B / a.size()));
+        sums[b_idx] += std::fabs(double(a[i]) - double(b[i]));
+        counts[b_idx]++;
+    }
+    m.bucket_mean_err.resize(B);
+    for (int i = 0; i < B; ++i) {
+        m.bucket_mean_err[i] = counts[i] > 0
+                                   ? static_cast<float>(sums[i] / counts[i])
+                                   : 0.0f;
+    }
+    return m;
+}
+
+// Capture blk.0.attn_norm.out from a single CPU-pinned prefill of `prompt`.
+std::vector<float> captureRealInput(mlc::runtime::Session& session,
+                                    const std::string& prompt) {
+    using namespace mlc::runtime;
+
+    Tokenizer tokenizer(session.loader());
+    if (!tokenizer.valid()) throw std::runtime_error("tokenizer init failed");
+    TokenizerConfig cfg; cfg.add_bos = true; cfg.add_eos = false;
+    auto tokens = tokenizer.encode(prompt, cfg);
+    if (tokens.empty()) throw std::runtime_error("tokenizer produced no tokens");
+
+    bool prior = KernelDescriptorRegistry::forceCpu();
+    KernelDescriptorRegistry::setForceCpu(true);
+
+    auto graph = ExecutionPlanBuilder::BuildFromLoader(session.loader());
+    ExecutionContext context(session, &graph);
+    ExecutionExecutor executor(graph, &BackendRegistry::Default(), &context);
+    context.registerTap("blk.0.attn_norm.out");
+
+    size_t pos = 0;
+    for (uint64_t tok : tokens) {
+        context.setToken(tok);
+        context.setSequencePosition(pos);
+        for (const auto& tname : {std::string("tokens"), std::string("token_ids")}) {
+            if (graph.tensors().count(tname)) {
+                context.setTensor(tname, {static_cast<float>(tok)});
+            }
+        }
+        auto res = executor.run();
+        if (!res.success) {
+            KernelDescriptorRegistry::setForceCpu(prior);
+            throw std::runtime_error("CPU prefill failed at token index " + std::to_string(pos));
+        }
+        ++pos;
+    }
+    KernelDescriptorRegistry::setForceCpu(prior);
+
+    auto it = context.tapData().find("blk.0.attn_norm.out");
+    if (it == context.tapData().end()) {
+        throw std::runtime_error("blk.0.attn_norm.out was not produced");
+    }
+    return it->second;
+}
+
+} // namespace q4diag
+
+int handleTestMatmulQ4Command(const std::vector<std::string>& args) {
+    using namespace mlc::runtime;
+    using namespace mlc::frontend;
+
+    auto usage = []() {
+        std::cerr << "Usage: mlc test-matmul-q4 <gguf_path>"
+                     " [--stress] [--seed N] [--prompt \"...\"] [--synthetic-input]\n"
+                     "Compares CPU-dequant+sgemv reference vs metal.matmul.quant on Q4_0 weights.\n"
+                     "By default uses captured blk.0.attn_norm.out as the input vector;\n"
+                     "--synthetic-input uses a deterministic random vector instead.\n"
+                     "--stress varies output dim N (K=2048 fixed) for both kernel variants.\n";
+    };
+    if (args.empty()) { usage(); return 1; }
+
+    std::string gguf_path;
+    bool do_stress = false;
+    bool synthetic_input = false;
+    uint64_t seed = 42;
+    std::string prompt = "The capital of France is";
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--stress") do_stress = true;
+        else if (a == "--synthetic-input") synthetic_input = true;
+        else if (a == "--seed" && i + 1 < args.size()) {
+            try { seed = std::stoull(args[++i]); }
+            catch (...) { std::cerr << "bad --seed\n"; return 1; }
+        }
+        else if (a == "--prompt" && i + 1 < args.size()) prompt = args[++i];
+        else if (gguf_path.empty() && !a.empty() && a[0] != '-') gguf_path = a;
+        else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
+    }
+    if (gguf_path.empty()) { usage(); return 1; }
+
+    try {
+        Session session(gguf_path);
+        const auto& tensors = session.loader().tensors();
+        uint32_t qversion = session.loader().quantizationVersion();
+
+        // Input vector (size K=2048 — TinyLlama hidden_dim).
+        std::vector<float> input;
+        if (synthetic_input) {
+            input.resize(2048);
+            std::mt19937_64 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+            for (auto& v : input) v = dist(rng);
+            std::printf("# input source: synthetic N(0,0.1) seed=%llu\n",
+                        static_cast<unsigned long long>(seed));
+        } else {
+            std::printf("# input source: captured blk.0.attn_norm.out from CPU prefill of \"%s\"\n",
+                        prompt.c_str());
+            input = q4diag::captureRealInput(session, prompt);
+        }
+        if (input.empty()) {
+            std::cerr << "input vector is empty\n";
+            return 1;
+        }
+        float in_min = input[0], in_max = input[0];
+        double in_sum = 0.0, in_sq = 0.0;
+        for (float v : input) {
+            in_min = std::min(in_min, v);
+            in_max = std::max(in_max, v);
+            in_sum += v;
+            in_sq  += double(v) * double(v);
+        }
+        std::printf("# input size=%zu min=%.4g max=%.4g mean=%.4g rms=%.4g\n\n",
+                    input.size(), in_min, in_max, in_sum / input.size(),
+                    std::sqrt(in_sq / input.size()));
+
+        // === Real block-0 weights — 3-way comparison ===
+        // H = handwritten CPU (operator_backend's rows=shape[0] convention)
+        // C = canonical CPU  (Session::runLinear — GGML cols=shape[0] convention)
+        // M = Metal kernel   (called via the operator_backend dispatch path)
+        // The pairwise cosines isolate kernel bugs from dispatch/convention bugs.
+        std::printf("=== Real Q4_0 weights from block 0 (3-way: H=handwritten, C=canonical, M=metal) ===\n");
+        std::printf("%-31s | %-13s | %-11s | %10s | %10s | %10s | %s\n",
+                    "weight", "shape", "kernel",
+                    "H<->C cos", "H<->M cos", "C<->M cos", "flag");
+        std::printf("%s\n", std::string(120, '-').c_str());
+
+        const std::vector<std::string> wnames = {
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight"
+        };
+
+        struct PerWeightDiag {
+            std::string name;
+            size_t shape0 = 0, shape1 = 0;
+            std::vector<float> cm_buckets;
+            std::vector<size_t> cm_worst_idx;
+        };
+        std::vector<PerWeightDiag> diags;
+
+        for (const auto& name : wnames) {
+            auto it = tensors.find(name);
+            if (it == tensors.end()) {
+                std::printf("%-31s | (not found in GGUF)\n", name.c_str());
+                continue;
+            }
+            const auto& info = it->second;
+            if (info.shape.size() != 2) {
+                std::printf("%-31s | (shape rank != 2)\n", name.c_str());
+                continue;
+            }
+            size_t shape0 = static_cast<size_t>(info.shape[0]);
+            size_t shape1 = static_cast<size_t>(info.shape[1]);
+
+            // Handwritten path: replicate operator_backend.cpp:963-973.
+            size_t hw_rows = shape0;
+            size_t hw_cols = shape1;
+            bool hw_transpose;
+            if (hw_cols == input.size())      hw_transpose = false;
+            else if (hw_rows == input.size()) hw_transpose = true;
+            else {
+                std::printf("%-31s | (neither hw_rows nor hw_cols match input %zu)\n",
+                            name.c_str(), input.size());
+                continue;
+            }
+
+            const auto& raw = session.tensorData(info);
+            size_t row_stride = raw.size() / hw_rows;
+
+            auto handwritten = q4diag::cpuMatmulHandwritten(
+                raw.data(), hw_rows, hw_cols, row_stride, qversion, input, hw_transpose);
+
+            std::vector<float> canonical;
+            try {
+                canonical = q4diag::cpuMatmulCanonical(session, name, input);
+            } catch (const std::exception& e) {
+                std::printf("%-31s | canonical (Session::runLinear) failed: %s\n",
+                            name.c_str(), e.what());
+                continue;
+            }
+
+            std::vector<float> metal;
+            bool ok = hw_transpose
+                ? MetalExecutor::Instance().runMatMulQ4_0Transposed(
+                      raw, input, hw_rows, hw_cols, row_stride, qversion, metal, nullptr)
+                : MetalExecutor::Instance().runMatMulQ4_0(
+                      raw, input, hw_rows, hw_cols, row_stride, qversion, metal, nullptr);
+            if (!ok) {
+                std::printf("%-31s | metal kernel returned ok=false\n", name.c_str());
+                continue;
+            }
+
+            auto m_hc = q4diag::metrics(handwritten, canonical, 0);
+            auto m_hm = q4diag::metrics(handwritten, metal, 0);
+            auto m_cm = q4diag::metrics(canonical, metal, 8);
+
+            char shape_buf[24];
+            std::snprintf(shape_buf, sizeof(shape_buf), "[%zu,%zu]", shape0, shape1);
+            const char* flag = q4diag::classifyDivergence(m_hc.cosine, m_hm.cosine, m_cm.cosine);
+            std::printf("%-31s | %-13s | %-11s | %10.6f | %10.6f | %10.6f | %s\n",
+                        name.c_str(), shape_buf,
+                        hw_transpose ? "transposed" : "non-trans",
+                        m_hc.cosine, m_hm.cosine, m_cm.cosine, flag);
+
+            PerWeightDiag d;
+            d.name = name;
+            d.shape0 = shape0;
+            d.shape1 = shape1;
+            d.cm_buckets = m_cm.bucket_mean_err;
+            d.cm_worst_idx = m_cm.worst_idx;
+            diags.push_back(std::move(d));
+        }
+
+        // === Bucket histogram of C↔M error across output dim (most actionable) ===
+        std::printf("\n=== Mean |error| of C<->M (canonical vs metal) per output-dim bucket (16 slices) ===\n");
+        std::printf("%-31s ", "weight");
+        for (int b = 0; b < 16; ++b) std::printf(" B%-7d", b);
+        std::printf("\n");
+        for (const auto& d : diags) {
+            std::printf("%-31s ", d.name.c_str());
+            for (float v : d.cm_buckets) std::printf(" %-8.3g", v);
+            std::printf("\n");
+        }
+
+        if (!do_stress) return 0;
+
+        // === Synthetic stress: K=2048 fixed, vary N for both kernels ===
+        std::printf("\n=== Synthetic stress (K=2048 fixed, vary N) ===\n");
+        std::printf("%-13s | %-11s | %9s | %9s | %9s | %9s\n",
+                    "shape", "kernel", "cosine", "max_abs", "mean_abs", "rms");
+        std::printf("%s\n", std::string(80, '-').c_str());
+
+        const std::vector<size_t> N_values = {64, 128, 256, 512, 1024, 2048, 4096, 8192};
+        const size_t K = 2048;
+        if (input.size() != K) {
+            std::cerr << "(stress requires input size " << K
+                      << " but have " << input.size() << ")\n";
+            return 1;
+        }
+        std::vector<float> tmp_row;
+        std::vector<uint8_t> tmp_quant;
+
+        auto run_one = [&](size_t weight_rows, size_t weight_cols, bool transpose,
+                           uint64_t shape_seed) {
+            size_t row_stride = q4_0RowSize(weight_cols, qversion);
+            std::vector<uint8_t> weights(weight_rows * row_stride);
+            std::mt19937_64 rng(shape_seed);
+            std::normal_distribution<float> dist(0.0f, 0.05f);
+            tmp_row.assign(weight_cols, 0.0f);
+            for (size_t r = 0; r < weight_rows; ++r) {
+                for (auto& v : tmp_row) v = dist(rng);
+                quantizeRowQ4_0(tmp_row.data(), weight_cols, qversion, tmp_quant);
+                std::memcpy(weights.data() + r * row_stride, tmp_quant.data(),
+                            std::min(tmp_quant.size(), row_stride));
+            }
+            auto cpu_out = q4diag::cpuMatmulHandwritten(weights.data(), weight_rows, weight_cols,
+                                              row_stride, qversion, input, transpose);
+            std::vector<float> metal_out;
+            bool ok = transpose
+                ? MetalExecutor::Instance().runMatMulQ4_0Transposed(
+                      weights, input, weight_rows, weight_cols, row_stride, qversion,
+                      metal_out, nullptr)
+                : MetalExecutor::Instance().runMatMulQ4_0(
+                      weights, input, weight_rows, weight_cols, row_stride, qversion,
+                      metal_out, nullptr);
+            char shape_buf[24];
+            std::snprintf(shape_buf, sizeof(shape_buf), "[%zu,%zu]", weight_rows, weight_cols);
+            if (!ok) {
+                std::printf("%-13s | %-11s | (metal returned ok=false)\n",
+                            shape_buf, transpose ? "transposed" : "non-trans");
+                return;
+            }
+            auto m = q4diag::metrics(cpu_out, metal_out, 0);
+            std::printf("%-13s | %-11s | %9.6f | %9.3e | %9.3e | %9.3e\n",
+                        shape_buf, transpose ? "transposed" : "non-trans",
+                        m.cosine, m.max_abs, m.mean_abs, m.rms);
+        };
+
+        for (size_t N : N_values) {
+            // Non-transposed: weight is [N, K]; rows=N, cols=K. K is multiple of 32 ✓.
+            run_one(/*weight_rows=*/N, /*weight_cols=*/K, /*transpose=*/false,
+                    seed ^ (N * 0x9E3779B97F4A7C15ULL));
+        }
+        for (size_t N : N_values) {
+            // Transposed: weight is [K, N]; rows=K, cols=N. Need N % 32 == 0.
+            if (N % 32 != 0) continue;
+            run_one(/*weight_rows=*/K, /*weight_cols=*/N, /*transpose=*/true,
+                    seed ^ (N * 0xBF58476D1CE4E5B9ULL));
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "test-matmul-q4: " << e.what() << "\n";
+        return 1;
+    }
+}
 }
 
 int main(int argc, char* argv[]) {
@@ -2420,6 +2958,10 @@ int main(int argc, char* argv[]) {
         return handleTokenizeCommand(args.arguments);
     } else if (args.command == "detokenize") {
         return handleDetokenizeCommand(args.arguments);
+    } else if (args.command == "compare") {
+        return handleCompareCommand(args.arguments);
+    } else if (args.command == "test-matmul-q4") {
+        return handleTestMatmulQ4Command(args.arguments);
     } else if (args.command == "capabilities") {
         return handleCapabilitiesCommand();
     } else {

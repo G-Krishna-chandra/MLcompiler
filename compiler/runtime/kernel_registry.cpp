@@ -7,12 +7,16 @@ namespace runtime {
 
 namespace {
 
+bool& forceCpuFlag() {
+    static bool value = (std::getenv("MLC_FORCE_CPU") != nullptr);
+    return value;
+}
+
 int scoreKernel(const KernelDescriptor& kernel,
                 const KernelSelectionQuery& query) {
     int score = 0;
 
-    static bool force_cpu = (std::getenv("MLC_FORCE_CPU") != nullptr);
-    if (force_cpu && kernel.backend != BackendKind::CPU) {
+    if (forceCpuFlag() && kernel.backend != BackendKind::CPU) {
         return std::numeric_limits<int>::min();
     }
 
@@ -246,6 +250,14 @@ const KernelDescriptor* KernelDescriptorRegistry::findById(const std::string& id
     auto it = index_by_id_.find(id);
     if (it == index_by_id_.end()) return nullptr;
     return &kernels_[it->second];
+}
+
+bool KernelDescriptorRegistry::forceCpu() {
+    return forceCpuFlag();
+}
+
+void KernelDescriptorRegistry::setForceCpu(bool value) {
+    forceCpuFlag() = value;
 }
 
 } // namespace runtime

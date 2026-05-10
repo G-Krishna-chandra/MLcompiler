@@ -400,6 +400,13 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             }
         }
 
+        // Tap: capture per-tensor host snapshots if registered. Cheap when no taps.
+        if (context_ && !context_->tapsEmpty()) {
+            for (const auto& output : node->outputs) {
+                context_->captureTapIfRegistered(output);
+            }
+        }
+
         if (node->annotations.count("kv_cache_k") || node->annotations.count("kv_cache_v")) {
             std::ostringstream oss;
             oss << "kv-cache";

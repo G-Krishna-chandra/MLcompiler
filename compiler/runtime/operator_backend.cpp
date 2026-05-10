@@ -7,6 +7,7 @@
 #include <vector>
 #include "runtime/attention_cpu.hpp"
 #include "runtime/execution_context.hpp"
+#include "runtime/kernel_registry.hpp"
 #include "runtime/metal_runtime.hpp"
 #include "runtime/quant_utils.hpp"
 #if defined(__AVX2__) || defined(__AVX512F__)
@@ -1314,8 +1315,7 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
 BackendRegistry::BackendRegistry() = default;
 
 const ExecutionBackend& BackendRegistry::backendFor(BackendKind kind) const {
-    static bool force_cpu = (std::getenv("MLC_FORCE_CPU") != nullptr);
-    if (force_cpu) {
+    if (KernelDescriptorRegistry::forceCpu()) {
         return cpu_backend_;
     }
 

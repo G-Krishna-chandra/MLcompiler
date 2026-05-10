@@ -48,6 +48,12 @@ public:
     const KernelDescriptor* select(const KernelSelectionQuery& query) const;
     const KernelDescriptor* findById(const std::string& id) const;
 
+    // Programmatic override for force-CPU mode. Initial value is taken from
+    // MLC_FORCE_CPU env var on first read; the harness can flip this to
+    // run two passes (CPU vs Metal) in the same process.
+    static bool forceCpu();
+    static void setForceCpu(bool value);
+
 private:
     KernelDescriptorRegistry();
 

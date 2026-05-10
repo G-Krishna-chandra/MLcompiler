@@ -3403,3 +3403,42 @@ TEST(TokenizerTest, EncodesAndDecodesText) {
 
     fs::remove(path);
 }
+
+#include "runtime/parity_harness.hpp"
+
+TEST(ParityHarnessTest, EmbeddingOutputMatchesBetweenMetalAndCpu) {
+    // Real model needed — synthetic GGUFs in this file don't carry full weights.
+    // Skip when the model isn't on disk so CI without the asset still passes.
+    const char* env_path = std::getenv("MLC_PARITY_MODEL");
+    std::string path = env_path ? env_path
+                                : "models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf";
+    if (!fs::exists(path)) {
+        GTEST_SKIP() << "Parity model not found at " << path
+                     << " (set MLC_PARITY_MODEL to override)";
+    }
+
+    mlc::runtime::parity::CompareOptions opts;
+    opts.gguf_path = path;
+    opts.prompt = "Hi";
+    // Only need the embedding boundary for this assertion — keeps the test fast.
+    opts.tap_patterns = {"hidden_state_0"};
+
+    auto report = mlc::runtime::parity::compareMetalVsCpu(opts);
+    ASSERT_FALSE(report.layers.empty());
+
+    const mlc::runtime::parity::LayerComparison* embed = nullptr;
+    for (const auto& l : report.layers) {
+        if (l.name == "hidden_state_0") {
+            embed = &l;
+            break;
+        }
+    }
+    ASSERT_NE(embed, nullptr) << "hidden_state_0 not captured by either side";
+    EXPECT_TRUE(embed->present_a);
+    EXPECT_TRUE(embed->present_b);
+    EXPECT_GT(embed->element_count, 0u);
+    EXPECT_GT(embed->cosine_sim, 0.9999f)
+        << "embedding cosine_sim=" << embed->cosine_sim
+        << " (max_abs=" << embed->max_abs_diff
+        << " rms=" << embed->rms << ")";
+}
