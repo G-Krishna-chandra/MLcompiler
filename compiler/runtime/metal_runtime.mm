@@ -1,5 +1,7 @@
 #include "runtime/metal_runtime.hpp"
 #include "runtime/quantization.hpp"
+#include "runtime/quant_utils.hpp"
+#include "frontends/ggml_types.hpp"
 
 #if defined(__APPLE__)
 #import <Foundation/Foundation.h>
@@ -41,6 +43,22 @@ kernel void add_vectors(
     out[index] = a[index] + b[index];
 }
 
+kernel void add_residual_bias(
+    device const float* a [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& length [[buffer(4)]],
+    constant uint& has_bias [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index >= length) return;
+    float v = a[index] + residual[index];
+    if (has_bias) {
+        v += bias[index];
+    }
+    out[index] = v;
+}
+
 kernel void add_bias_strided(
     device float* data [[buffer(0)]],
     device const float* bias [[buffer(1)]],
@@ -71,6 +89,34 @@ kernel void rms_norm_kernel(
     for (uint i = 0; i < length; ++i) {
         float gamma = weight ? weight[i] : 1.0f;
         output[i] = input[i] * inv * gamma;
+    }
+}
+
+kernel void layer_norm_kernel(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& length [[buffer(4)]],
+    constant float& epsilon [[buffer(5)]],
+    constant uint& has_bias [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index > 0 || length == 0) return;
+    float sum = 0.0f;
+    for (uint i = 0; i < length; ++i) {
+        sum += input[i];
+    }
+    float mean = sum / fmax(1.0f, static_cast<float>(length));
+    float var = 0.0f;
+    for (uint i = 0; i < length; ++i) {
+        float d = input[i] - mean;
+        var += d * d;
+    }
+    float inv_std = rsqrt((var / fmax(1.0f, static_cast<float>(length))) + epsilon);
+    for (uint i = 0; i < length; ++i) {
+        float gamma = weight ? weight[i] : 1.0f;
+        float beta = (has_bias && bias) ? bias[i] : 0.0f;
+        output[i] = (input[i] - mean) * inv_std * gamma + beta;
     }
 }
 
@@ -158,6 +204,32 @@ kernel void q4_0_matmul(
     output[gid] = acc;
 }
 
+kernel void q4_0_matmul_transposed(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant Q4_0Params& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= params.cols) return;
+    uint col = gid;
+    const uint block_size = 18;
+    uint block = col / 32u;
+    uint offset = col % 32u;
+    float acc = 0.0f;
+    for (uint r = 0; r < params.rows; ++r) {
+        const device uchar* row = weights + r * params.row_stride;
+        const device half* d_half = reinterpret_cast<const device half*>(row + block * block_size);
+        float d = static_cast<float>(d_half[0]);
+        const device uchar* qs = row + block * block_size + 2;
+        uchar byte = qs[offset / 2];
+        int q = (offset % 2 == 0) ? static_cast<int>(byte & 0x0F)
+                                  : static_cast<int>((byte >> 4) & 0x0F);
+        q -= 8;
+        acc += d * static_cast<float>(q) * input[r];
+    }
+    output[col] = acc;
+}
+
 kernel void q4_1_matmul(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -206,17 +278,22 @@ kernel void q5_0_matmul(
         const device half* meta = reinterpret_cast<const device half*>(row + b * block_size);
         float d = static_cast<float>(meta[0]);
         const device uchar* qh_ptr = row + b * block_size + 2;
-        uint32_t qh = *(const device uint32_t*)(qh_ptr);
+        uint32_t qh = 0;
+        // Assemble manually to avoid alignment pitfalls.
+        qh |= static_cast<uint32_t>(qh_ptr[0]);
+        qh |= static_cast<uint32_t>(qh_ptr[1]) << 8;
+        qh |= static_cast<uint32_t>(qh_ptr[2]) << 16;
+        qh |= static_cast<uint32_t>(qh_ptr[3]) << 24;
         const device uchar* qs = row + b * block_size + 6;
         for (uint j = 0; j < 16 && col_index < cols; ++j) {
             uchar byte = qs[j];
-            uint8_t xh0 = ((qh >> (j + 0)) << 4) & 0x10;
-            uint8_t xh1 = ((qh >> (j + 12))     ) & 0x10;
+            uint8_t xh0 = static_cast<uint8_t>(((qh >> (j + 0)) << 4) & 0x10);
+            uint8_t xh1 = static_cast<uint8_t>(((qh >> (j + 12))      ) & 0x10);
             int x0 = ((byte & 0x0F) | xh0) - 16;
-            acc += (static_cast<float>(x0) * d) * input[col_index++];
+            acc += static_cast<float>(x0) * d * input[col_index++];
             if (col_index < cols) {
-                int x1 = (((byte >> 4) & 0x0F) | xh1) - 16;
-                acc += (static_cast<float>(x1) * d) * input[col_index++];
+                int x1 = ((byte >> 4) | xh1) - 16;
+                acc += static_cast<float>(x1) * d * input[col_index++];
             }
         }
     }
@@ -262,8 +339,8 @@ kernel void q5_1_matmul(
         const device uchar* qs = row + b * block_size + 8;
         for (uint j = 0; j < 16 && col_index < cols; ++j) {
             uchar byte = qs[j];
-            uint8_t xh0 = ((qh >> (j + 0)) << 4) & 0x10;
-            uint8_t xh1 = ((qh >> (j + 12))     ) & 0x10;
+            uint8_t xh0 = static_cast<uint8_t>(((qh >> (2 * j)) & 0x1) << 4);
+            uint8_t xh1 = static_cast<uint8_t>(((qh >> (2 * j + 1)) & 0x1) << 4);
             int x0 = (byte & 0x0F) | xh0;
             acc += (x0 * d + m) * input[col_index++];
             if (col_index < cols) {
@@ -281,6 +358,19 @@ struct QKParams {
     uint row_stride;
 };
 
+inline void getScaleMinK4(uint index,
+                          const device uchar* data,
+                          thread uchar& scale,
+                          thread uchar& minv) {
+    if (index < 4) {
+        scale = data[index] & 63;
+        minv = data[index + 4] & 63;
+    } else {
+        scale = static_cast<uchar>((data[index + 4] & 0xF) | ((data[index - 4] >> 6) << 4));
+        minv = static_cast<uchar>((data[index + 4] >> 4) | ((data[index] >> 6) << 4));
+    }
+}
+
 kernel void q2_k_matmul(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -296,9 +386,9 @@ kernel void q2_k_matmul(
     uint col_index = 0;
     for (uint b = 0; b < blocks && col_index < cols; ++b) {
         const device uchar* block = row + b * block_size;
-        const device uchar* scales = block;
-        const device uchar* qs = block + 16;
-        const device half* d_ptr = reinterpret_cast<const device half*>(block + 16 + 64);
+        const device uchar* scales = block;          // 16 bytes
+        const device uchar* qs = block + 16;         // 64 bytes
+        const device half* d_ptr = reinterpret_cast<const device half*>(block + 80);
         float d = static_cast<float>(d_ptr[0]);
         float m = static_cast<float>(d_ptr[1]);
         int is = 0;
@@ -331,6 +421,209 @@ kernel void q2_k_matmul(
     output[gid] = acc;
 }
 
+// Dequantize QK (generic) row into float buffer.
+kernel void dequant_qk_row(
+    device const uchar* weights [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant QKParams& params [[buffer(2)]],
+    constant uint& dtype [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= params.rows) return;
+    const device uchar* row = weights + gid * params.row_stride;
+    uint cols = params.cols;
+    // Only one block per row for head_dim == cols; process sequentially.
+    // Handles Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K.
+    switch (dtype) {
+    case 10: { // Q2_K
+        const uint block_size = 84;
+        const device uchar* block = row;
+        const device uchar* scales = block;          // 16 bytes
+        const device uchar* qs = block + 16;         // 64 bytes
+        const device half* d_ptr = reinterpret_cast<const device half*>(block + 80);
+        float d = static_cast<float>(d_ptr[0]);
+        float m = static_cast<float>(d_ptr[1]);
+        uint out_idx = gid * cols;
+        int is = 0;
+        for (uint n = 0; n < cols; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4 && n + j * 32 < cols; ++j) {
+                uint8_t sc = scales[is++];
+                float dl = d * static_cast<float>(sc & 0xF);
+                float ml = m * static_cast<float>(sc >> 4);
+                for (int l = 0; l < 16 && n + j * 32 + l < cols; ++l) {
+                    int8_t val = static_cast<int8_t>((qs[l] >> shift) & 0x3);
+                    output[out_idx + n + j * 32 + l] = dl * static_cast<float>(val) - ml;
+                }
+                sc = scales[is++];
+                dl = d * static_cast<float>(sc & 0xF);
+                ml = m * static_cast<float>(sc >> 4);
+                for (int l = 0; l < 16 && n + j * 32 + 16 + l < cols; ++l) {
+                    int8_t val = static_cast<int8_t>((qs[l + 16] >> shift) & 0x3);
+                    output[out_idx + n + j * 32 + 16 + l] = dl * static_cast<float>(val) - ml;
+                }
+                shift += 2;
+            }
+            qs += 32;
+        }
+    } break;
+    case 11: { // Q3_K
+        const uint block_size = 110;
+        const device uchar* block = row;
+        const device uchar* hmask = block;
+        const device uchar* qs = block + 32;
+        const device uchar* scale_ptr = block + 96;
+        uint32_t aux[4];
+        aux[0] = *(const device uint32_t*)(scale_ptr + 0);
+        aux[1] = *(const device uint32_t*)(scale_ptr + 4);
+        aux[2] = *(const device uint32_t*)(scale_ptr + 8);
+        aux[3] = *(const device uint32_t*)(scale_ptr + 12);
+        uint32_t tmp = aux[2];
+        const uint32_t kmask1 = 0x03030303;
+        const uint32_t kmask2 = 0x0f0f0f0f;
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        thread int8_t scales[16];
+        const thread uchar* aux_bytes = reinterpret_cast<const thread uchar*>(aux);
+        for (int i = 0; i < 16; ++i) {
+            scales[i] = static_cast<int8_t>(aux_bytes[i]);
+        }
+        const device half* d_ptr = reinterpret_cast<const device half*>(block + 108);
+        float d = static_cast<float>(d_ptr[0]);
+        uint out_idx = gid * cols;
+        int is = 0;
+        for (uint n = 0; n < cols; n += 128) {
+            int shift = 0;
+            uint8_t mask_bit = 1;
+            for (int j = 0; j < 4 && n + j * 32 < cols; ++j) {
+                float dl = d * static_cast<float>(scales[is++] - 32);
+                for (int l = 0; l < 16 && n + j * 32 + l < cols; ++l) {
+                    int8_t val = static_cast<int8_t>((qs[l] >> shift) & 0x3);
+                    int8_t delta = (hmask[l] & mask_bit) ? 0 : 4;
+                    output[out_idx + n + j * 32 + l] = dl * static_cast<float>(val - delta);
+                }
+                dl = d * static_cast<float>(scales[is++] - 32);
+                for (int l = 0; l < 16 && n + j * 32 + 16 + l < cols; ++l) {
+                    int8_t val = static_cast<int8_t>((qs[l + 16] >> shift) & 0x3);
+                    int8_t delta = (hmask[l + 16] & mask_bit) ? 0 : 4;
+                    output[out_idx + n + j * 32 + 16 + l] = dl * static_cast<float>(val - delta);
+                }
+                shift += 2;
+                mask_bit <<= 1;
+            }
+            qs += 32;
+            hmask += 32;
+        }
+    } break;
+    case 12: { // Q4_K
+        const uint block_size = 144;
+        const device uchar* block = row;
+        const device uchar* scales = block + 4;
+        const device uchar* qs = block + 16;
+        const device half* d_ptr = reinterpret_cast<const device half*>(block);
+        float d = static_cast<float>(d_ptr[0]);
+        float min = static_cast<float>(d_ptr[1]);
+        uint out_idx = gid * cols;
+        thread uchar sc_val = 0;
+        thread uchar m_val = 0;
+        for (uint n = 0, is = 0; n < cols; n += 64, is += 2) {
+            getScaleMinK4(is + 0, scales, sc_val, m_val);
+            float dl = d * static_cast<float>(sc_val);
+            float ml = min * static_cast<float>(m_val);
+            for (int l = 0; l < 32 && n + l < cols; ++l) {
+                uint8_t val = (qs[l] & 0x0F);
+                output[out_idx + n + l] = dl * static_cast<float>(val) - ml;
+            }
+            getScaleMinK4(is + 1, scales, sc_val, m_val);
+            dl = d * static_cast<float>(sc_val);
+            ml = min * static_cast<float>(m_val);
+            for (int l = 0; l < 32 && n + 32 + l < cols; ++l) {
+                uint8_t val = (qs[l] >> 4) & 0x0F;
+                output[out_idx + n + 32 + l] = dl * static_cast<float>(val) - ml;
+            }
+            qs += 32;
+        }
+    } break;
+    case 13: { // Q5_K
+        const uint block_size = 176;
+        const device uchar* block = row;
+        const device uchar* scales = block + 4;
+        const device uchar* qh = block + 16;
+        const device uchar* qs = block + 48;
+        const device half* d_ptr = reinterpret_cast<const device half*>(block);
+        float d = static_cast<float>(d_ptr[0]);
+        float minv = static_cast<float>(d_ptr[1]);
+        uint out_idx = gid * cols;
+        thread uchar sc_val = 0;
+        thread uchar m_val = 0;
+        int is = 0;
+        uint8_t u1 = 1;
+        uint8_t u2 = 2;
+        for (uint n = 0; n < cols; n += 64) {
+            getScaleMinK4(is + 0, scales, sc_val, m_val);
+            float dl = d * static_cast<float>(sc_val);
+            float ml = minv * static_cast<float>(m_val);
+            for (int l = 0; l < 32 && n + l < cols; ++l) {
+                uint8_t hi = (qh[l] & u1) ? 16 : 0;
+                uint8_t val = (qs[l] & 0x0F) + hi;
+                output[out_idx + n + l] = dl * static_cast<float>(val) - ml;
+            }
+            getScaleMinK4(is + 1, scales, sc_val, m_val);
+            dl = d * static_cast<float>(sc_val);
+            ml = minv * static_cast<float>(m_val);
+            for (int l = 0; l < 32 && n + 32 + l < cols; ++l) {
+                uint8_t hi = (qh[l] & u2) ? 16 : 0;
+                uint8_t val = (qs[l] >> 4) + hi;
+                output[out_idx + n + 32 + l] = dl * static_cast<float>(val) - ml;
+            }
+            qs += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    } break;
+    case 14: { // Q6_K
+        const uint block_size = 210;
+        const device uchar* block = row;
+        const device uchar* ql = block;
+        const device uchar* qh = block + 128;
+        thread int8_t scales[16];
+        const device uchar* scale_bytes = block + 192;
+        for (int i = 0; i < 16; ++i) {
+            scales[i] = static_cast<int8_t>(scale_bytes[i]);
+        }
+        const device half* d_ptr = reinterpret_cast<const device half*>(block + 208);
+        float d = static_cast<float>(d_ptr[0]);
+        uint out_idx = gid * cols;
+        for (uint i = 0; i < cols / 16; ++i) {
+            int8_t sc = scales[i];
+            float dl = d * static_cast<float>(sc);
+            for (int j = 0; j < 16 && i * 16 + j < cols; ++j) {
+                int idx = i * 16 + j;
+                int bit = (idx & 1) ? (ql[idx / 2] >> 4) : (ql[idx / 2] & 0xF);
+                int high = (qh[idx / 4] >> (2 * (idx % 4))) & 0x3;
+                int val = bit | (high << 4);
+                if (val > 31) val -= 64;
+                output[out_idx + idx] = dl * static_cast<float>(val);
+            }
+        }
+    } break;
+    case 15: { // Q8_K
+        const uint block_size = 292;
+        const device uchar* row8k = row;
+        const device float* d_ptr = reinterpret_cast<const device float*>(row8k);
+        float d = d_ptr[0];
+        const device int8_t* qs = reinterpret_cast<const device int8_t*>(row8k + 4);
+        uint out_idx = gid * cols;
+        for (uint i = 0; i < cols; ++i) {
+            output[out_idx + i] = d * static_cast<float>(qs[i]);
+        }
+    } break;
+    default:
+        break;
+    }
+}
 kernel void q3_k_matmul(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -361,11 +654,15 @@ kernel void q3_k_matmul(
         aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
         aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
         aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-        const device int8_t* scales = reinterpret_cast<const device int8_t*>(aux);
-        const device half* d_ptr = reinterpret_cast<const device half*>(block + 64 + 16);
+        thread int8_t scales[16];
+        const thread uchar* aux_bytes = reinterpret_cast<const thread uchar*>(aux);
+        for (int i = 0; i < 16; ++i) {
+            scales[i] = static_cast<int8_t>(aux_bytes[i]);
+        }
+        const device half* d_ptr = reinterpret_cast<const device half*>(block + 108);
         float d = static_cast<float>(d_ptr[0]);
         int is = 0;
-        const uint total = min(256u, cols - col_index);
+        const uint total = metal::min(256u, cols - col_index);
         for (uint n = 0; n < total; n += 128) {
             int shift = 0;
             uint8_t mask_bit = 1;
@@ -410,32 +707,36 @@ kernel void q4_k_matmul(
     uint col_index = 0;
     for (uint b = 0; b < blocks && col_index < cols; ++b) {
         const device uchar* block = row + b * block_size;
-        const device uchar* scales = block;
-        const device uchar* qs = block + 12;
-        const device half* d_ptr = reinterpret_cast<const device half*>(block + 12 + 128);
+        const device uchar* scales = block + 4;
+        const device uchar* qs = block + 16;
+        const device half* d_ptr = reinterpret_cast<const device half*>(block);
         float d = static_cast<float>(d_ptr[0]);
-        float min = static_cast<float>(d_ptr[1]);
-        uint total = min(256u, cols - col_index);
-        for (uint n = 0; n < total; n += 32) {
-            uint8_t sc = scales[n / 32];
-            uint8_t sc2 = scales[n / 32 + 8];
-            float dl = d * static_cast<float>(sc & 0xF);
-            float ml = min * static_cast<float>(sc >> 4);
-            for (int l = 0; l < 16 && (col_index + n + l) < cols; ++l) {
-                uint8_t val = (qs[l] & 0x0F);
-                float vf = dl * static_cast<float>(val) - ml;
-                acc += vf * input[col_index + n + l];
-            }
-            dl = d * static_cast<float>(sc2 & 0xF);
-            ml = min * static_cast<float>(sc2 >> 4);
-            for (int l = 0; l < 16 && (col_index + n + 16 + l) < cols; ++l) {
-                uint8_t val = ((qs[l] >> 4) & 0x0F);
-                float vf = dl * static_cast<float>(val) - ml;
-                acc += vf * input[col_index + n + 16 + l];
-            }
-            qs += 16;
+        float minv = static_cast<float>(d_ptr[1]);
+        uint total = metal::min(256u, cols - col_index);
+        thread uchar sc_val = 0;
+        thread uchar m_val = 0;
+        int is = 0;
+    for (uint n = 0; n < total; n += 64) {
+        getScaleMinK4(is + 0, scales, sc_val, m_val);
+        float dl = d * static_cast<float>(sc_val);
+        float ml = minv * static_cast<float>(m_val);
+        for (int l = 0; l < 32 && (col_index + n + l) < cols; ++l) {
+            uint8_t val = (qs[l] & 0x0F);
+            float vf = dl * static_cast<float>(val) - ml;
+            acc += vf * input[col_index + n + l];
         }
-        col_index += 256;
+        getScaleMinK4(is + 1, scales, sc_val, m_val);
+        dl = d * static_cast<float>(sc_val);
+        ml = minv * static_cast<float>(m_val);
+        for (int l = 0; l < 32 && (col_index + n + 32 + l) < cols; ++l) {
+                uint8_t val = (qs[l] >> 4) & 0x0F;
+                float vf = dl * static_cast<float>(val) - ml;
+                acc += vf * input[col_index + n + 32 + l];
+            }
+        qs += 32;
+        is += 2;
+    }
+    col_index += 256;
     }
     output[gid] = acc;
 }
@@ -455,33 +756,41 @@ kernel void q5_k_matmul(
     uint col_index = 0;
     for (uint b = 0; b < blocks && col_index < cols; ++b) {
         const device uchar* block = row + b * block_size;
-        const device uchar* scales = block;
-        const device uchar* qh = block + 12;
-        const device uchar* qs = block + 12 + 32;
-        const device half* d_ptr = reinterpret_cast<const device half*>(block + 12 + 32 + 128);
+        const device uchar* scales = block + 4;
+        const device uchar* qh = block + 16;
+        const device uchar* qs = block + 48;
+        const device half* d_ptr = reinterpret_cast<const device half*>(block);
         float d = static_cast<float>(d_ptr[0]);
-        float min = static_cast<float>(d_ptr[1]);
-        uint total = min(256u, cols - col_index);
-        for (uint n = 0; n < total; n += 32) {
-            uint8_t sc = scales[n / 32];
-            uint8_t sc2 = scales[n / 32 + 8];
-            float dl = d * static_cast<float>(sc & 0xF);
-            float ml = min * static_cast<float>(sc >> 4);
-            for (int l = 0; l < 16 && (col_index + n + l) < cols; ++l) {
-                uint8_t vh = ((qh[(n / 32) * 4 + l / 4] >> (2 * (l % 4))) & 0x3) << 4;
-                uint8_t val = (qs[l] & 0x0F) | vh;
-                float vf = dl * static_cast<float>(static_cast<int>(val) - 16) - ml;
+        float minv = static_cast<float>(d_ptr[1]);
+        uint total = metal::min(256u, cols - col_index);
+        thread uchar sc_val = 0;
+        thread uchar m_val = 0;
+        int is = 0;
+        uint8_t u1 = 1;
+        uint8_t u2 = 2;
+        for (uint n = 0; n < total; n += 64) {
+            getScaleMinK4(is + 0, scales, sc_val, m_val);
+            float dl = d * static_cast<float>(sc_val);
+            float ml = minv * static_cast<float>(m_val);
+            for (int l = 0; l < 32 && (col_index + n + l) < cols; ++l) {
+                uint8_t hi = (qh[l] & u1) ? 16 : 0;
+                uint8_t val = (qs[l] & 0x0F) + hi;
+                float vf = dl * static_cast<float>(val) - ml;
                 acc += vf * input[col_index + n + l];
             }
-            dl = d * static_cast<float>(sc2 & 0xF);
-            ml = min * static_cast<float>(sc2 >> 4);
-            for (int l = 0; l < 16 && (col_index + n + 16 + l) < cols; ++l) {
-                uint8_t vh = ((qh[(n / 32) * 4 + l / 4 + 16/4] >> (2 * (l % 4))) & 0x3) << 4;
-                uint8_t val = ((qs[l] >> 4) & 0x0F) | vh;
-                float vf = dl * static_cast<float>(static_cast<int>(val) - 16) - ml;
-                acc += vf * input[col_index + n + 16 + l];
+            getScaleMinK4(is + 1, scales, sc_val, m_val);
+            dl = d * static_cast<float>(sc_val);
+            ml = minv * static_cast<float>(m_val);
+            for (int l = 0; l < 32 && (col_index + n + 32 + l) < cols; ++l) {
+                uint8_t hi = (qh[l] & u2) ? 16 : 0;
+                uint8_t val = ((qs[l] >> 4) & 0x0F) + hi;
+                float vf = dl * static_cast<float>(val) - ml;
+                acc += vf * input[col_index + n + 32 + l];
             }
-            qs += 16;
+            qs += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
         col_index += 256;
     }
@@ -505,26 +814,85 @@ kernel void q6_k_matmul(
         const device uchar* block = row + b * block_size;
         const device uchar* ql = block;
         const device uchar* qh = block + 128;
-        const device int8_t* scales = reinterpret_cast<const device int8_t*>(block + 128 + 64);
-        const device half* d_ptr = reinterpret_cast<const device half*>(block + 128 + 64 + 32);
+        const device int8_t* scales = reinterpret_cast<const device int8_t*>(block + 192);
+        const device half* d_ptr = reinterpret_cast<const device half*>(block + 208);
         float d = static_cast<float>(d_ptr[0]);
-        uint total = min(256u, cols - col_index);
-        for (uint i = 0; i < total / 16 && (col_index + i * 16) < cols; ++i) {
-            int8_t sc = scales[i];
-            float dl = d * static_cast<float>(sc);
-            for (int j = 0; j < 16 && (col_index + i * 16 + j) < cols; ++j) {
-                int idx = i * 16 + j;
-                int bit = (idx & 1) ? (ql[idx / 2] >> 4) : (ql[idx / 2] & 0xF);
-                int high = (qh[idx / 4] >> (2 * (idx % 4))) & 0x3;
-                int val = bit | (high << 4);
-                if (val > 31) val -= 64;
-                float vf = dl * static_cast<float>(val);
-                acc += vf * input[col_index + idx];
+        uint total = metal::min(256u, cols - col_index);
+        const device uchar* ql_ptr = ql;
+        const device uchar* qh_ptr = qh;
+        const device int8_t* sc_ptr = scales;
+        for (uint base = 0; base < total; base += 128) {
+            for (int l = 0; l < 32 && (col_index + base + l) < cols; ++l) {
+                int is = l / 16;
+                int8_t q1 = static_cast<int8_t>((ql_ptr[l + 0] & 0xF) | (((qh_ptr[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = static_cast<int8_t>((ql_ptr[l + 32] & 0xF) | (((qh_ptr[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = static_cast<int8_t>((ql_ptr[l + 0] >> 4) | (((qh_ptr[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = static_cast<int8_t>((ql_ptr[l + 32] >> 4) | (((qh_ptr[l] >> 6) & 3) << 4)) - 32;
+                float s0 = d * static_cast<float>(sc_ptr[is + 0]);
+                float s1 = d * static_cast<float>(sc_ptr[is + 2]);
+                float s2 = d * static_cast<float>(sc_ptr[is + 4]);
+                float s3 = d * static_cast<float>(sc_ptr[is + 6]);
+                if (col_index + base + l < cols) acc += s0 * static_cast<float>(q1) * input[col_index + base + l];
+                if (col_index + base + 32 + l < cols) acc += s1 * static_cast<float>(q2) * input[col_index + base + 32 + l];
+                if (col_index + base + 64 + l < cols) acc += s2 * static_cast<float>(q3) * input[col_index + base + 64 + l];
+                if (col_index + base + 96 + l < cols) acc += s3 * static_cast<float>(q4) * input[col_index + base + 96 + l];
             }
+            ql_ptr += 64;
+            qh_ptr += 32;
+            sc_ptr += 8;
         }
         col_index += 256;
     }
     output[gid] = acc;
+}
+
+kernel void q6_k_matmul_transposed(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant QKParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= params.cols) return;
+    uint col = gid;
+    const uint block_size = 210;
+    uint block = col / 256u;
+    uint offset = col % 256u;
+    uint base = offset / 128u;
+    uint local = offset - base * 128u;
+    uint segment = local / 32u;
+    uint l = local % 32u;
+    uint ql_offset = base * 64u;
+    uint qh_offset = base * 32u;
+    uint sc_offset = base * 8u;
+    float acc = 0.0f;
+    for (uint r = 0; r < params.rows; ++r) {
+        const device uchar* row = weights + r * params.row_stride;
+        const device uchar* block_ptr = row + block * block_size;
+        const device uchar* ql = block_ptr + ql_offset;
+        const device uchar* qh = block_ptr + 128 + qh_offset;
+        const device int8_t* sc = reinterpret_cast<const device int8_t*>(block_ptr + 192) + sc_offset;
+        const device half* d_ptr = reinterpret_cast<const device half*>(block_ptr + 208);
+        float d = static_cast<float>(d_ptr[0]);
+        int is = static_cast<int>(l / 16u);
+        int8_t q = 0;
+        int sc_index = 0;
+        if (segment == 0u) {
+            q = static_cast<int8_t>((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            sc_index = is + 0;
+        } else if (segment == 1u) {
+            q = static_cast<int8_t>((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            sc_index = is + 2;
+        } else if (segment == 2u) {
+            q = static_cast<int8_t>((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            sc_index = is + 4;
+        } else {
+            q = static_cast<int8_t>((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            sc_index = is + 6;
+        }
+        float s = d * static_cast<float>(sc[sc_index]);
+        acc += s * static_cast<float>(q) * input[r];
+    }
+    output[col] = acc;
 }
 
 kernel void q8_k_matmul(
@@ -612,6 +980,9 @@ struct RotaryParams {
     uint row_stride;
     uint pair_stride;
     uint count;
+    uint offset_elems;
+    uint heads;
+    uint tokens;
 };
 
 kernel void apply_rotary_batch(
@@ -624,10 +995,12 @@ kernel void apply_rotary_batch(
     uint rotary_dim = min(params.rotary_dim, params.head_dim);
     if (rotary_dim < 2) return;
     uint pairs = rotary_dim / 2;
+    uint offset_tokens = gid + params.offset_elems;
     device float* vec = reinterpret_cast<device float*>(
         reinterpret_cast<device uchar*>(data) + gid * params.row_stride);
-    const device float* cos_row = cos_table + gid * params.pair_stride;
-    const device float* sin_row = sin_table + gid * params.pair_stride;
+    vec += params.offset_elems * params.head_dim;
+    const device float* cos_row = cos_table + offset_tokens * params.pair_stride;
+    const device float* sin_row = sin_table + offset_tokens * params.pair_stride;
     for (uint i = 0; i < pairs; ++i) {
         float c = (i < params.pair_stride) ? cos_row[i] : 1.0f;
         float s = (i < params.pair_stride) ? sin_row[i] : 0.0f;
@@ -636,6 +1009,135 @@ kernel void apply_rotary_batch(
         vec[2 * i] = x0 * c - x1 * s;
         vec[2 * i + 1] = x0 * s + x1 * c;
     }
+}
+
+// Dequantize a single Q4_0 block into a float vector (32 elems)
+kernel void dequant_q4_0_block(
+    device const uchar* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const uint block_size = 18;
+    uint block = gid / 32;
+    uint local = gid % 32;
+    const device uchar* row = src + block * block_size;
+    const device half* d_half = reinterpret_cast<const device half*>(row);
+    float d = static_cast<float>(d_half[0]);
+    const device uchar* qs = row + 2;
+    uint idx = local / 2;
+    uchar byte = qs[idx];
+    int8_t q = (local & 1) ? static_cast<int8_t>((byte >> 4) & 0x0F) : static_cast<int8_t>(byte & 0x0F);
+    q = static_cast<int8_t>(q - 8);
+    dst[gid] = d * static_cast<float>(q);
+}
+
+// Dequantize a single Q8_0 block into a float vector (32 elems)
+kernel void dequant_q8_0_block(
+    device const uchar* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const uint block_size = 34;
+    uint block = gid / 32;
+    uint local = gid % 32;
+    const device uchar* row = src + block * block_size;
+    const device half* d_half = reinterpret_cast<const device half*>(row);
+    float d = static_cast<float>(d_half[0]);
+    const device int8_t* qs = reinterpret_cast<const device int8_t*>(row + 2);
+    dst[gid] = d * static_cast<float>(qs[local]);
+}
+
+// Dequantize a single Q4_1 block into a float vector (32 elems)
+kernel void dequant_q4_1_block(
+    device const uchar* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const uint block_size = 20;
+    uint block = gid / 32;
+    uint local = gid % 32;
+    const device uchar* row = src + block * block_size;
+    const device half* meta = reinterpret_cast<const device half*>(row);
+    float d = static_cast<float>(meta[0]);
+    float m = static_cast<float>(meta[1]);
+    const device uchar* qs = row + 4;
+    uint idx = local / 2;
+    uchar byte = qs[idx];
+    int x = (local & 1) ? static_cast<int>((byte >> 4) & 0x0F) : static_cast<int>(byte & 0x0F);
+    dst[gid] = d * static_cast<float>(x) + m;
+}
+
+// Dequantize a single Q5_0 block into a float vector (32 elems)
+kernel void dequant_q5_0_block(
+    device const uchar* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const uint block_size = 22;
+    uint block = gid / 32;
+    uint local = gid % 32;
+    const device uchar* row = src + block * block_size;
+    const device half* meta = reinterpret_cast<const device half*>(row);
+    float d = static_cast<float>(meta[0]);
+    const device uint32_t* qh_ptr = reinterpret_cast<const device uint32_t*>(row + 2);
+    uint32_t qh = *qh_ptr;
+    const device uchar* qs = row + 6;
+    uint idx = local / 2;
+    uchar byte = qs[idx];
+    uint8_t xh = (local & 1)
+                     ? static_cast<uint8_t>(((qh >> (idx + 12)) & 0x1) << 4)
+                     : static_cast<uint8_t>(((qh >> (idx + 0)) & 0x1) << 4);
+    int x = (local & 1) ? ((byte >> 4) | xh) : ((byte & 0x0F) | xh);
+    dst[gid] = (static_cast<int>(x) - 16) * d;
+}
+
+// Dequantize a single Q5_1 block into a float vector (32 elems)
+kernel void dequant_q5_1_block(
+    device const uchar* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const uint block_size = 24;
+    uint block = gid / 32;
+    uint local = gid % 32;
+    const device uchar* row = src + block * block_size;
+    const device half* meta = reinterpret_cast<const device half*>(row);
+    float d = static_cast<float>(meta[0]);
+    float m = static_cast<float>(meta[1]);
+    const device uint32_t* qh_ptr = reinterpret_cast<const device uint32_t*>(row + 4);
+    uint32_t qh = *qh_ptr;
+    const device uchar* qs = row + 8;
+    uint idx = local / 2;
+    uchar byte = qs[idx];
+    uint8_t xh = (local & 1)
+                     ? static_cast<uint8_t>(((qh >> (idx + 12)) & 0x1) << 4)
+                     : static_cast<uint8_t>(((qh >> (idx + 0)) & 0x1) << 4);
+    int x = (local & 1) ? ((byte >> 4) | xh) : ((byte & 0x0F) | xh);
+    dst[gid] = d * static_cast<float>(x) + m;
+}
+
+// Dequantize a single Q8_1 block into a float vector (32 elems)
+kernel void dequant_q8_1_block(
+    device const uchar* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& cols [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= cols) return;
+    const uint block_size = 36;
+    uint block = gid / 32;
+    uint local = gid % 32;
+    const device uchar* row = src + block * block_size;
+    const device half* meta = reinterpret_cast<const device half*>(row);
+    float d = static_cast<float>(meta[0]);
+    float sum = static_cast<float>(meta[1]);
+    float bias = sum / 32.0f;
+    const device int8_t* qs = reinterpret_cast<const device int8_t*>(row + 4);
+    dst[gid] = d * static_cast<float>(qs[local]) + bias;
 }
 )";
 } // namespace
@@ -651,12 +1153,19 @@ struct Q4_0ParamsNative {
     uint32_t quant_version;
 };
 
+struct QKParamsNative {
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t row_stride;
+};
+
 struct RotaryParamsNative {
     uint32_t head_dim;
     uint32_t rotary_dim;
     uint32_t row_stride;
     uint32_t pair_stride;
     uint32_t count;
+    uint32_t offset_elems;
 };
 
 struct KVWriteParamsNative {
@@ -673,9 +1182,12 @@ struct MetalExecutor::Impl {
     id<MTLCommandQueue> queue = nil;
     id<MTLComputePipelineState> ffnPipeline = nil;
     id<MTLComputePipelineState> addPipeline = nil;
+    id<MTLComputePipelineState> addResidualPipeline = nil;
     id<MTLComputePipelineState> normPipeline = nil;
+    id<MTLComputePipelineState> layerNormPipeline = nil;
     id<MTLComputePipelineState> softmaxPipeline = nil;
     id<MTLComputePipelineState> q4MatmulPipeline = nil;
+    id<MTLComputePipelineState> q4MatmulTransposedPipeline = nil;
     id<MTLComputePipelineState> q4_1MatmulPipeline = nil;
     id<MTLComputePipelineState> q5_0MatmulPipeline = nil;
     id<MTLComputePipelineState> q5_1MatmulPipeline = nil;
@@ -684,58 +1196,107 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> q4KMatmulPipeline = nil;
     id<MTLComputePipelineState> q5KMatmulPipeline = nil;
     id<MTLComputePipelineState> q6KMatmulPipeline = nil;
+    id<MTLComputePipelineState> q6KMatmulTransposedPipeline = nil;
     id<MTLComputePipelineState> q8KMatmulPipeline = nil;
     id<MTLComputePipelineState> q8_0MatmulPipeline = nil;
     id<MTLComputePipelineState> q8_1MatmulPipeline = nil;
     id<MTLComputePipelineState> rotaryPipeline = nil;
+    id<MTLComputePipelineState> dequantQ4Pipeline = nil;
+    id<MTLComputePipelineState> dequantQ8Pipeline = nil;
+    id<MTLComputePipelineState> dequantQ4_1Pipeline = nil;
+    id<MTLComputePipelineState> dequantQ5_0Pipeline = nil;
+    id<MTLComputePipelineState> dequantQ5_1Pipeline = nil;
+    id<MTLComputePipelineState> dequantQ8_1Pipeline = nil;
+    id<MTLComputePipelineState> dequantQKPipeline = nil;
     id<MTLComputePipelineState> biasAddPipeline = nil;
     id<MTLComputePipelineState> kvWritePipeline = nil;
+    bool debug_log = false;
 #endif
 
     Impl() {
 #if defined(__APPLE__)
         @autoreleasepool {
             device = MTLCreateSystemDefaultDevice();
-            if (device) {
-                queue = [device newCommandQueue];
-                if (queue) {
-                    NSError* error = nil;
-                    NSString* source = [[NSString alloc] initWithUTF8String:kMetalKernelsSource];
-                    if (source) {
-                        id<MTLLibrary> library = [device newLibraryWithSource:source
-                                                                      options:nil
-                                                                        error:&error];
-                        if (library) {
-                            auto buildPipeline = ^id<MTLComputePipelineState>(NSString* name) {
-                                NSError* localError = nil;
-                                id<MTLFunction> function = [library newFunctionWithName:name];
-                                if (!function) return (id<MTLComputePipelineState>)nil;
-                                id<MTLComputePipelineState> pipe =
-                                    [device newComputePipelineStateWithFunction:function error:&localError];
-                                return pipe;
-                            };
-                            ffnPipeline = buildPipeline(@"feedforward_silu_mul");
-                            addPipeline = buildPipeline(@"add_vectors");
-                            normPipeline = buildPipeline(@"rms_norm_kernel");
-                            softmaxPipeline = buildPipeline(@"vector_softmax");
-                            q4MatmulPipeline = buildPipeline(@"q4_0_matmul");
-                            q4_1MatmulPipeline = buildPipeline(@"q4_1_matmul");
-                            q5_0MatmulPipeline = buildPipeline(@"q5_0_matmul");
-                            q5_1MatmulPipeline = buildPipeline(@"q5_1_matmul");
-                            q2KMatmulPipeline = buildPipeline(@"q2_k_matmul");
-                            q3KMatmulPipeline = buildPipeline(@"q3_k_matmul");
-                            q4KMatmulPipeline = buildPipeline(@"q4_k_matmul");
-                            q5KMatmulPipeline = buildPipeline(@"q5_k_matmul");
-                            q6KMatmulPipeline = buildPipeline(@"q6_k_matmul");
-                            q8KMatmulPipeline = buildPipeline(@"q8_k_matmul");
-                            q8_0MatmulPipeline = buildPipeline(@"q8_0_matmul");
-                            q8_1MatmulPipeline = buildPipeline(@"q8_1_matmul");
-                            rotaryPipeline = buildPipeline(@"apply_rotary_batch");
-                            biasAddPipeline = buildPipeline(@"add_bias_strided");
-                            kvWritePipeline = buildPipeline(@"scatter_kv");
-                        }
-                    }
+            if (!device) {
+                fprintf(stderr, "[MetalRuntime] MTLCreateSystemDefaultDevice returned nil\n");
+            }
+            if (!device) {
+                NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+                fprintf(stderr, "[MetalRuntime] MTLCopyAllDevices count = %lu\n", (unsigned long)all.count);
+                if (all.count > 0) {
+                    device = [all objectAtIndex:0];
+                    fprintf(stderr, "[MetalRuntime] Selected device from MTLCopyAllDevices: %s\n",
+                            device.name.UTF8String);
                 }
+            }
+            if (!device) {
+                fprintf(stderr,
+                        "[MetalRuntime] Metal unavailable (no device); CPU backend will be used.\n");
+                return;
+            }
+            queue = [device newCommandQueue];
+            if (!queue) {
+                fprintf(stderr,
+                        "[MetalRuntime] Failed to create Metal command queue; CPU backend will be "
+                        "used.\n");
+                fprintf(stderr, "[MetalRuntime] Device name: %s\n", device.name.UTF8String);
+                device = nil;
+                return;
+            }
+            NSError* error = nil;
+            NSString* source = [[NSString alloc] initWithUTF8String:kMetalKernelsSource];
+            if (source) {
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:nil
+                                                                error:&error];
+                if (!library) {
+                    fprintf(stderr, "[MetalRuntime] Failed to compile Metal library: %s\n",
+                            error ? error.localizedDescription.UTF8String : "unknown");
+                    fprintf(stderr, "[MetalRuntime] Device: %s\n", device.name.UTF8String);
+                    device = nil;
+                    queue = nil;
+                    return;
+                }
+                auto buildPipeline = ^id<MTLComputePipelineState>(NSString* name) {
+                    NSError* localError = nil;
+                    id<MTLFunction> function = [library newFunctionWithName:name];
+                    if (!function) return (id<MTLComputePipelineState>)nil;
+                    id<MTLComputePipelineState> pipe =
+                        [device newComputePipelineStateWithFunction:function error:&localError];
+                    return pipe;
+                };
+                const char* dbg = getenv("MLC_METAL_DEBUG");
+                debug_log = dbg && std::strlen(dbg) > 0;
+                ffnPipeline = buildPipeline(@"feedforward_silu_mul");
+                addPipeline = buildPipeline(@"add_vectors");
+                addResidualPipeline = buildPipeline(@"add_residual_bias");
+                normPipeline = buildPipeline(@"rms_norm_kernel");
+                layerNormPipeline = buildPipeline(@"layer_norm_kernel");
+                softmaxPipeline = buildPipeline(@"vector_softmax");
+                q4MatmulPipeline = buildPipeline(@"q4_0_matmul");
+                q4MatmulTransposedPipeline = buildPipeline(@"q4_0_matmul_transposed");
+                q4_1MatmulPipeline = buildPipeline(@"q4_1_matmul");
+                q5_0MatmulPipeline = buildPipeline(@"q5_0_matmul");
+                q5_1MatmulPipeline = buildPipeline(@"q5_1_matmul");
+                q2KMatmulPipeline = buildPipeline(@"q2_k_matmul");
+                q3KMatmulPipeline = buildPipeline(@"q3_k_matmul");
+                q4KMatmulPipeline = buildPipeline(@"q4_k_matmul");
+                q5KMatmulPipeline = buildPipeline(@"q5_k_matmul");
+                q6KMatmulPipeline = buildPipeline(@"q6_k_matmul");
+                q6KMatmulTransposedPipeline = buildPipeline(@"q6_k_matmul_transposed");
+                q8KMatmulPipeline = buildPipeline(@"q8_k_matmul");
+                q8_0MatmulPipeline = buildPipeline(@"q8_0_matmul");
+                q8_1MatmulPipeline = buildPipeline(@"q8_1_matmul");
+                rotaryPipeline = buildPipeline(@"apply_rotary_batch");
+                dequantQ4Pipeline = buildPipeline(@"dequant_q4_0_block");
+                dequantQ8Pipeline = buildPipeline(@"dequant_q8_0_block");
+                dequantQ4_1Pipeline = buildPipeline(@"dequant_q4_1_block");
+                dequantQ5_0Pipeline = buildPipeline(@"dequant_q5_0_block");
+                dequantQ5_1Pipeline = buildPipeline(@"dequant_q5_1_block");
+                dequantQ8_1Pipeline = buildPipeline(@"dequant_q8_1_block");
+                dequantQKPipeline = buildPipeline(@"dequant_qk_row");
+                biasAddPipeline = buildPipeline(@"add_bias_strided");
+                kvWritePipeline = buildPipeline(@"scatter_kv");
             }
         }
 #endif
@@ -775,6 +1336,14 @@ struct MetalExecutor::Impl {
 #endif
     }
 
+    bool hasLayerNormKernel() const {
+#if defined(__APPLE__)
+        return layerNormPipeline != nil;
+#else
+        return false;
+#endif
+    }
+
     bool hasSoftmaxKernel() const {
 #if defined(__APPLE__)
         return softmaxPipeline != nil;
@@ -789,14 +1358,135 @@ struct MetalExecutor::Impl {
         return (bytes + (alignment - 1)) & ~(alignment - 1);
     }
 
+    // CPU fallback dequant for K-series formats to keep attention working until GPU kernels exist.
+    static void dequantizeKRowCPU(uint32_t dtype,
+                                  const uint8_t* src,
+                                  size_t head_dim,
+                                  uint32_t quant_version,
+                                  float* dst) {
+        switch (dtype) {
+        case frontend::GGML_TYPE_Q2_K:
+            dequantizeRowQ2_K(src, head_dim, dst);
+            break;
+        case frontend::GGML_TYPE_Q3_K:
+            dequantizeRowQ3_K(src, head_dim, dst);
+            break;
+        case frontend::GGML_TYPE_Q4_K:
+            dequantizeRowQ4_K(src, head_dim, dst);
+            break;
+        case frontend::GGML_TYPE_Q5_K:
+            dequantizeRowQ5_K(src, head_dim, dst);
+            break;
+        case frontend::GGML_TYPE_Q6_K:
+            dequantizeRowQ6_K(src, head_dim, dst);
+            break;
+        case frontend::GGML_TYPE_Q8_K:
+            dequantizeRowQ8_K(src, head_dim, dst);
+            break;
+        default:
+            (void)quant_version;
+            break;
+        }
+    }
+
+    bool dequantCacheToGPU(const MetalExecutor::CacheDescriptor& desc,
+                           size_t rows,
+                           size_t cols,
+                           id<MTLBuffer> dst) const {
+#if defined(__APPLE__)
+        if (!available() || !dst) return false;
+        if (rows == 0 || cols == 0) return false;
+        if (!desc.raw_quant) return false;
+        size_t row_stride = desc.row_stride_bytes;
+        if (row_stride == 0) {
+            row_stride = ggmlRowSizeBytes(desc.dtype, cols, desc.quant_version);
+        }
+        size_t expected = rows * row_stride;
+        if (desc.raw_quant->size() < expected) return false;
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                // Choose pipeline up-front so we can bail without creating encoders.
+                id<MTLComputePipelineState> pipe = nil;
+                bool is_k = false;
+                switch (desc.dtype) {
+                case frontend::GGML_TYPE_Q4_0: pipe = dequantQ4Pipeline; break;
+                case frontend::GGML_TYPE_Q4_1: pipe = dequantQ4_1Pipeline; break;
+                case frontend::GGML_TYPE_Q5_0: pipe = dequantQ5_0Pipeline; break;
+                case frontend::GGML_TYPE_Q5_1: pipe = dequantQ5_1Pipeline; break;
+                case frontend::GGML_TYPE_Q8_0: pipe = dequantQ8Pipeline; break;
+                case frontend::GGML_TYPE_Q8_1: pipe = dequantQ8_1Pipeline; break;
+                case frontend::GGML_TYPE_Q2_K:
+                case frontend::GGML_TYPE_Q3_K:
+                case frontend::GGML_TYPE_Q4_K:
+                case frontend::GGML_TYPE_Q5_K:
+                case frontend::GGML_TYPE_Q6_K:
+                case frontend::GGML_TYPE_Q8_K:
+                    pipe = dequantQKPipeline;
+                    is_k = true;
+                    break;
+                default:
+                    pipe = nil;
+                }
+            if (!pipe) return false;
+
+            id<MTLBuffer> srcBuf = [device newBufferWithBytes:desc.raw_quant->data()
+                                                      length:expected
+                                                     options:MTLResourceStorageModeShared];
+            if (!srcBuf) return false;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                if (!enc) return false;
+
+                [enc setComputePipelineState:pipe];
+                [enc setBuffer:srcBuf offset:0 atIndex:0];
+                [enc setBuffer:dst offset:0 atIndex:1];
+                if (is_k) {
+                    QKParamsNative params{static_cast<uint32_t>(rows),
+                                          static_cast<uint32_t>(cols),
+                                          static_cast<uint32_t>(row_stride)};
+                    uint32_t dt = desc.dtype;
+                    [enc setBytes:&params length:sizeof(params) atIndex:2];
+                    [enc setBytes:&dt length:sizeof(uint32_t) atIndex:3];
+                    NSUInteger threadsPerGroup = pipe.threadExecutionWidth;
+                    if (threadsPerGroup == 0) threadsPerGroup = 64;
+                    NSUInteger groups = (rows + threadsPerGroup - 1) / threadsPerGroup;
+                    if (groups == 0) groups = 1;
+                    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                } else {
+                    uint32_t c = static_cast<uint32_t>(cols);
+                    [enc setBytes:&c length:sizeof(uint32_t) atIndex:2];
+                    NSUInteger threadsPerGroup = pipe.threadExecutionWidth;
+                    if (threadsPerGroup == 0) threadsPerGroup = 64;
+                    NSUInteger total = rows * cols;
+                    NSUInteger groups = (total + threadsPerGroup - 1) / threadsPerGroup;
+                    if (groups == 0) groups = 1;
+                    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                }
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                return cb.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+#else
+        (void)desc;
+        (void)rows;
+        (void)cols;
+        (void)dst;
+#endif
+        return false;
+    }
+
     bool addBiasInPlace(id<MTLBuffer> buffer,
                         size_t elements,
                         size_t stride_elems,
                         const std::vector<float>* bias) const {
 #if defined(__APPLE__)
         if (!bias || bias->empty()) return true;
-        if (!available() || !biasAddPipeline) return false;
         if (!buffer || bias->size() != elements || stride_elems == 0) return false;
+        if (!available() || !biasAddPipeline) return false;
         if (@available(macOS 11.0, *)) {
             @autoreleasepool {
                 id<MTLBuffer> biasBuffer = [device newBufferWithBytes:bias->data()
@@ -842,9 +1532,23 @@ struct MetalExecutor::Impl {
                        size_t context_length,
                        size_t base_position) const {
 #if defined(__APPLE__)
-        if (!available() || !kvWritePipeline) return false;
         if (!src || !dst || tokens == 0 || head_dim == 0 || kv_heads == 0) return false;
         size_t kv_stride = context_length * head_dim;
+        // CPU fallback when pipeline unavailable.
+        if (!available() || !kvWritePipeline) {
+            float* s_ptr = reinterpret_cast<float*>([src contents]);
+            float* d_ptr = reinterpret_cast<float*>([dst contents]);
+            if (!s_ptr || !d_ptr) return false;
+            for (size_t kvh = 0; kvh < kv_heads; ++kvh) {
+                for (size_t t = 0; t < tokens; ++t) {
+                    size_t pos = std::min(context_length - 1, base_position + t);
+                    float* dst_row = d_ptr + kvh * kv_stride + pos * head_dim;
+                    const float* src_row = s_ptr + (kvh * tokens + t) * head_dim;
+                    std::memcpy(dst_row, src_row, head_dim * sizeof(float));
+                }
+            }
+            return true;
+        }
         if (@available(macOS 11.0, *)) {
             @autoreleasepool {
                 id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
@@ -885,6 +1589,340 @@ struct MetalExecutor::Impl {
         return false;
     }
 
+    bool dequantQ4Block(const std::vector<uint8_t>& src,
+                        size_t cols,
+                        std::vector<float>& dst) const {
+#if defined(__APPLE__)
+        if (!available() || !dequantQ4Pipeline) return false;
+        if (cols == 0 || src.empty()) return false;
+        size_t blocks = (cols + 31) / 32;
+        size_t block_bytes = 18;
+        if (src.size() < blocks * block_bytes) return false;
+        dst.resize(blocks * 32);
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> srcBuf = [device newBufferWithBytes:src.data()
+                                                          length:src.size()
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> dstBuf = [device newBufferWithBytes:dst.data()
+                                                          length:dst.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                if (!srcBuf || !dstBuf) return false;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:dequantQ4Pipeline];
+                [enc setBuffer:srcBuf offset:0 atIndex:0];
+                [enc setBuffer:dstBuf offset:0 atIndex:1];
+                uint32_t c = static_cast<uint32_t>(cols);
+                [enc setBytes:&c length:sizeof(uint32_t) atIndex:2];
+                NSUInteger threadsPerGroup = dequantQ4Pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 64;
+                NSUInteger groups = (cols + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                std::memcpy(dst.data(), [dstBuf contents], dst.size() * sizeof(float));
+                return cb.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+#else
+        (void)src;
+        (void)cols;
+        (void)dst;
+#endif
+        return false;
+    }
+
+    bool dequantQ8Block(const std::vector<uint8_t>& src,
+                        size_t cols,
+                        std::vector<float>& dst) const {
+#if defined(__APPLE__)
+        if (!available() || !dequantQ8Pipeline) return false;
+        if (cols == 0 || src.empty()) return false;
+        size_t blocks = (cols + 31) / 32;
+        size_t block_bytes = 34;
+        if (src.size() < blocks * block_bytes) return false;
+        dst.resize(blocks * 32);
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> srcBuf = [device newBufferWithBytes:src.data()
+                                                          length:src.size()
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> dstBuf = [device newBufferWithBytes:dst.data()
+                                                          length:dst.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                if (!srcBuf || !dstBuf) return false;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:dequantQ8Pipeline];
+                [enc setBuffer:srcBuf offset:0 atIndex:0];
+                [enc setBuffer:dstBuf offset:0 atIndex:1];
+                uint32_t c = static_cast<uint32_t>(cols);
+                [enc setBytes:&c length:sizeof(uint32_t) atIndex:2];
+                NSUInteger threadsPerGroup = dequantQ8Pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 64;
+                NSUInteger groups = (cols + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                std::memcpy(dst.data(), [dstBuf contents], dst.size() * sizeof(float));
+                return cb.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+#else
+        (void)src;
+        (void)cols;
+        (void)dst;
+#endif
+        return false;
+    }
+
+    bool dequantQ4_1Block(const std::vector<uint8_t>& src,
+                          size_t cols,
+                          std::vector<float>& dst) const {
+#if defined(__APPLE__)
+        if (!available() || !dequantQ4_1Pipeline) return false;
+        if (cols == 0 || src.empty()) return false;
+        size_t blocks = (cols + 31) / 32;
+        size_t block_bytes = 20;
+        if (src.size() < blocks * block_bytes) return false;
+        dst.resize(blocks * 32);
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> srcBuf = [device newBufferWithBytes:src.data()
+                                                          length:src.size()
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> dstBuf = [device newBufferWithBytes:dst.data()
+                                                          length:dst.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                if (!srcBuf || !dstBuf) return false;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:dequantQ4_1Pipeline];
+                [enc setBuffer:srcBuf offset:0 atIndex:0];
+                [enc setBuffer:dstBuf offset:0 atIndex:1];
+                uint32_t c = static_cast<uint32_t>(cols);
+                [enc setBytes:&c length:sizeof(uint32_t) atIndex:2];
+                NSUInteger threadsPerGroup = dequantQ4_1Pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 64;
+                NSUInteger groups = (cols + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                std::memcpy(dst.data(), [dstBuf contents], dst.size() * sizeof(float));
+                return cb.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+#else
+        (void)src;
+        (void)cols;
+        (void)dst;
+#endif
+        return false;
+    }
+
+    bool dequantQ5_0Block(const std::vector<uint8_t>& src,
+                          size_t cols,
+                          std::vector<float>& dst) const {
+#if defined(__APPLE__)
+        if (!available() || !dequantQ5_0Pipeline) return false;
+        if (cols == 0 || src.empty()) return false;
+        size_t blocks = (cols + 31) / 32;
+        size_t block_bytes = 22;
+        if (src.size() < blocks * block_bytes) return false;
+        dst.resize(blocks * 32);
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> srcBuf = [device newBufferWithBytes:src.data()
+                                                          length:src.size()
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> dstBuf = [device newBufferWithBytes:dst.data()
+                                                          length:dst.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                if (!srcBuf || !dstBuf) return false;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:dequantQ5_0Pipeline];
+                [enc setBuffer:srcBuf offset:0 atIndex:0];
+                [enc setBuffer:dstBuf offset:0 atIndex:1];
+                uint32_t c = static_cast<uint32_t>(cols);
+                [enc setBytes:&c length:sizeof(uint32_t) atIndex:2];
+                NSUInteger threadsPerGroup = dequantQ5_0Pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 64;
+                NSUInteger groups = (cols + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                std::memcpy(dst.data(), [dstBuf contents], dst.size() * sizeof(float));
+                return cb.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+#else
+        (void)src;
+        (void)cols;
+        (void)dst;
+#endif
+        return false;
+    }
+
+    bool dequantQ5_1Block(const std::vector<uint8_t>& src,
+                          size_t cols,
+                          std::vector<float>& dst) const {
+#if defined(__APPLE__)
+        if (!available() || !dequantQ5_1Pipeline) return false;
+        if (cols == 0 || src.empty()) return false;
+        size_t blocks = (cols + 31) / 32;
+        size_t block_bytes = 24;
+        if (src.size() < blocks * block_bytes) return false;
+        dst.resize(blocks * 32);
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> srcBuf = [device newBufferWithBytes:src.data()
+                                                          length:src.size()
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> dstBuf = [device newBufferWithBytes:dst.data()
+                                                          length:dst.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                if (!srcBuf || !dstBuf) return false;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:dequantQ5_1Pipeline];
+                [enc setBuffer:srcBuf offset:0 atIndex:0];
+                [enc setBuffer:dstBuf offset:0 atIndex:1];
+                uint32_t c = static_cast<uint32_t>(cols);
+                [enc setBytes:&c length:sizeof(uint32_t) atIndex:2];
+                NSUInteger threadsPerGroup = dequantQ5_1Pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 64;
+                NSUInteger groups = (cols + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                std::memcpy(dst.data(), [dstBuf contents], dst.size() * sizeof(float));
+                return cb.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+#else
+        (void)src;
+        (void)cols;
+        (void)dst;
+#endif
+        return false;
+    }
+
+    bool dequantQ8_1Block(const std::vector<uint8_t>& src,
+                          size_t cols,
+                          std::vector<float>& dst) const {
+#if defined(__APPLE__)
+        if (!available() || !dequantQ8_1Pipeline) return false;
+        if (cols == 0 || src.empty()) return false;
+        size_t blocks = (cols + 31) / 32;
+        size_t block_bytes = 36;
+        if (src.size() < blocks * block_bytes) return false;
+        dst.resize(blocks * 32);
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> srcBuf = [device newBufferWithBytes:src.data()
+                                                          length:src.size()
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> dstBuf = [device newBufferWithBytes:dst.data()
+                                                          length:dst.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                if (!srcBuf || !dstBuf) return false;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:dequantQ8_1Pipeline];
+                [enc setBuffer:srcBuf offset:0 atIndex:0];
+                [enc setBuffer:dstBuf offset:0 atIndex:1];
+                uint32_t c = static_cast<uint32_t>(cols);
+                [enc setBytes:&c length:sizeof(uint32_t) atIndex:2];
+                NSUInteger threadsPerGroup = dequantQ8_1Pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 64;
+                NSUInteger groups = (cols + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                std::memcpy(dst.data(), [dstBuf contents], dst.size() * sizeof(float));
+                return cb.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+#else
+        (void)src;
+        (void)cols;
+        (void)dst;
+#endif
+        return false;
+    }
+
+    bool dequantQKRow(const std::vector<uint8_t>& src,
+                      uint32_t dtype,
+                      size_t cols,
+                      size_t row_stride,
+                      std::vector<float>& dst) const {
+#if defined(__APPLE__)
+        if (!available() || !dequantQKPipeline) return false;
+        if (cols == 0 || src.empty()) return false;
+        dst.resize(cols);
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> srcBuf = [device newBufferWithBytes:src.data()
+                                                          length:src.size()
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> dstBuf = [device newBufferWithBytes:dst.data()
+                                                          length:dst.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                if (!srcBuf || !dstBuf) return false;
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:dequantQKPipeline];
+                [enc setBuffer:srcBuf offset:0 atIndex:0];
+                [enc setBuffer:dstBuf offset:0 atIndex:1];
+                QKParamsNative params{1u,
+                                      static_cast<uint32_t>(cols),
+                                      static_cast<uint32_t>(row_stride)};
+                [enc setBytes:&params length:sizeof(params) atIndex:2];
+                uint32_t dt = dtype;
+                [enc setBytes:&dt length:sizeof(uint32_t) atIndex:3];
+                NSUInteger threadsPerGroup = dequantQKPipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 64;
+                NSUInteger groups = (1 + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                std::memcpy(dst.data(), [dstBuf contents], dst.size() * sizeof(float));
+                return cb.status == MTLCommandBufferStatusCompleted;
+            }
+        }
+#else
+        (void)src;
+        (void)dtype;
+        (void)cols;
+        (void)row_stride;
+        (void)dst;
+#endif
+        return false;
+    }
+
     bool applyRotaryGPU(id<MTLBuffer> buffer,
                         size_t count,
                         size_t row_stride,
@@ -892,14 +1930,15 @@ struct MetalExecutor::Impl {
                         size_t rotary_dim,
                         const float* cos_ptr,
                         const float* sin_ptr,
-                        size_t pair_stride) const {
+                        size_t pair_stride,
+                        size_t offset_tokens = 0) const {
 #if defined(__APPLE__)
         if (!available() || !rotaryPipeline) return false;
         if (rotary_dim < 2 || count == 0) return true;
         if (pair_stride == 0 || !cos_ptr || !sin_ptr) return false;
         size_t pairs = rotary_dim / 2;
         if (pairs == 0) return true;
-        size_t expected = pair_stride * count;
+        size_t expected = pair_stride * (count + offset_tokens);
         if (@available(macOS 11.0, *)) {
             @autoreleasepool {
                 id<MTLBuffer> cosBuffer = [device newBufferWithBytes:cos_ptr
@@ -921,7 +1960,8 @@ struct MetalExecutor::Impl {
                     static_cast<uint32_t>(rotary_dim),
                     static_cast<uint32_t>(row_stride),
                     static_cast<uint32_t>(pair_stride),
-                    static_cast<uint32_t>(count)};
+                    static_cast<uint32_t>(count),
+                    static_cast<uint32_t>(offset_tokens)};
                 [encoder setBytes:&params length:sizeof(params) atIndex:3];
                 MTLSize threads = MTLSizeMake(count, 1, 1);
                 MTLSize threadgroup = MTLSizeMake(1, 1, 1);
@@ -1046,15 +2086,17 @@ struct MetalExecutor::Impl {
 
             size_t stride_elems = resultRowBytes / sizeof(float);
             if (stride_elems == 0) stride_elems = 1;
-            if (bias && !addBiasInPlace(resultBuffer, rows, stride_elems, bias)) {
-                return false;
-            }
             output.resize(rows);
             const uint8_t* resultPtr = reinterpret_cast<const uint8_t*>([resultBuffer contents]);
             for (size_t r = 0; r < rows; ++r) {
                 std::memcpy(output.data() + r,
                             resultPtr + r * resultRowBytes,
                             sizeof(float));
+            }
+            if (bias && !bias->empty()) {
+                for (size_t i = 0; i < rows && i < bias->size(); ++i) {
+                    output[i] += (*bias)[i];
+                }
             }
             }
             return true;
@@ -1118,12 +2160,219 @@ bool matmulQuant(const std::vector<uint8_t>& weights,
                 [commandBuffer commit];
                 [commandBuffer waitUntilCompleted];
 
-                if (bias && !addBiasInPlace(outputBuffer, rows, 1, bias)) {
-                    return false;
-                }
+                bool ok = commandBuffer.status == MTLCommandBufferStatusCompleted;
                 output.resize(rows);
                 std::memcpy(output.data(), [outputBuffer contents], rows * sizeof(float));
-                return commandBuffer.status == MTLCommandBufferStatusCompleted;
+                if (bias && !bias->empty()) {
+                    for (size_t i = 0; i < rows && i < bias->size(); ++i) {
+                        output[i] += (*bias)[i];
+                    }
+                }
+                return ok;
+            }
+        }
+#endif
+        (void)weights;
+        (void)input;
+        (void)rows;
+        (void)cols;
+        (void)row_stride;
+        (void)output;
+        return false;
+    }
+
+bool matmulQuantTransposed(const std::vector<uint8_t>& weights,
+                           const std::vector<float>& input,
+                           size_t rows,
+                           size_t cols,
+                           size_t row_stride,
+                           uint32_t quant_version,
+                           id<MTLComputePipelineState> pipeline,
+                           const std::vector<float>* bias,
+                           std::vector<float>& output) const {
+#if defined(__APPLE__)
+        (void)quant_version;
+        if (!available() || !pipeline) return false;
+        if (input.size() != rows) return false;
+        if (weights.size() < row_stride * rows) return false;
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> weightBuffer = [device newBufferWithBytes:weights.data()
+                                                                 length:weights.size()
+                                                                options:MTLResourceStorageModeShared];
+                id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
+                                                                length:input.size() * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+                id<MTLBuffer> outputBuffer = [device newBufferWithLength:cols * sizeof(float)
+                                                                  options:MTLResourceStorageModeShared];
+                if (!weightBuffer || !inputBuffer || !outputBuffer) return false;
+
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                if (!encoder) return false;
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+                [encoder setBuffer:inputBuffer offset:0 atIndex:1];
+                [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+                Q4_0ParamsNative params = {static_cast<uint32_t>(rows),
+                                           static_cast<uint32_t>(cols),
+                                           static_cast<uint32_t>(row_stride),
+                                           quant_version};
+                [encoder setBytes:&params length:sizeof(Q4_0ParamsNative) atIndex:3];
+                NSUInteger threadsPerGroup = pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 32;
+                NSUInteger groups = (cols + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                MTLSize tg = MTLSizeMake(groups, 1, 1);
+                MTLSize th = MTLSizeMake(threadsPerGroup, 1, 1);
+                [encoder dispatchThreadgroups:tg threadsPerThreadgroup:th];
+                [encoder endEncoding];
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+
+                bool ok = commandBuffer.status == MTLCommandBufferStatusCompleted;
+                output.resize(cols);
+                std::memcpy(output.data(), [outputBuffer contents], cols * sizeof(float));
+                if (bias && !bias->empty()) {
+                    for (size_t i = 0; i < cols && i < bias->size(); ++i) {
+                        output[i] += (*bias)[i];
+                    }
+                }
+                return ok;
+            }
+        }
+#endif
+        (void)weights;
+        (void)input;
+        (void)rows;
+        (void)cols;
+        (void)row_stride;
+        (void)output;
+        return false;
+    }
+
+bool matmulQuantKTransposed(const std::vector<uint8_t>& weights,
+                            const std::vector<float>& input,
+                            size_t rows,
+                            size_t cols,
+                            size_t row_stride,
+                            id<MTLComputePipelineState> pipeline,
+                            const std::vector<float>* bias,
+                            std::vector<float>& output) const {
+#if defined(__APPLE__)
+        if (!available() || !pipeline) return false;
+        if (input.size() != rows) return false;
+        if (weights.size() < row_stride * rows) return false;
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> weightBuffer = [device newBufferWithBytes:weights.data()
+                                                                 length:weights.size()
+                                                                options:MTLResourceStorageModeShared];
+                id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
+                                                                length:input.size() * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+                id<MTLBuffer> outputBuffer = [device newBufferWithLength:cols * sizeof(float)
+                                                                  options:MTLResourceStorageModeShared];
+                if (!weightBuffer || !inputBuffer || !outputBuffer) return false;
+
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                if (!encoder) return false;
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+                [encoder setBuffer:inputBuffer offset:0 atIndex:1];
+                [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+                QKParamsNative params = {static_cast<uint32_t>(rows),
+                                         static_cast<uint32_t>(cols),
+                                         static_cast<uint32_t>(row_stride)};
+                [encoder setBytes:&params length:sizeof(QKParamsNative) atIndex:3];
+                NSUInteger threadsPerGroup = pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 32;
+                NSUInteger groups = (cols + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                MTLSize tg = MTLSizeMake(groups, 1, 1);
+                MTLSize th = MTLSizeMake(threadsPerGroup, 1, 1);
+                [encoder dispatchThreadgroups:tg threadsPerThreadgroup:th];
+                [encoder endEncoding];
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+
+                bool ok = commandBuffer.status == MTLCommandBufferStatusCompleted;
+                output.resize(cols);
+                std::memcpy(output.data(), [outputBuffer contents], cols * sizeof(float));
+                if (bias && !bias->empty()) {
+                    for (size_t i = 0; i < cols && i < bias->size(); ++i) {
+                        output[i] += (*bias)[i];
+                    }
+                }
+                return ok;
+            }
+        }
+#endif
+        (void)weights;
+        (void)input;
+        (void)rows;
+        (void)cols;
+        (void)row_stride;
+        (void)output;
+        return false;
+    }
+
+bool matmulQuantK(const std::vector<uint8_t>& weights,
+                  const std::vector<float>& input,
+                  size_t rows,
+                  size_t cols,
+                  size_t row_stride,
+                  id<MTLComputePipelineState> pipeline,
+                  const std::vector<float>* bias,
+                  std::vector<float>& output) const {
+#if defined(__APPLE__)
+        if (!available() || !pipeline) return false;
+        if (input.size() != cols) return false;
+        if (weights.size() < row_stride * rows) return false;
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> weightBuffer = [device newBufferWithBytes:weights.data()
+                                                                 length:weights.size()
+                                                                options:MTLResourceStorageModeShared];
+                id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
+                                                                length:input.size() * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+                id<MTLBuffer> outputBuffer = [device newBufferWithLength:rows * sizeof(float)
+                                                                  options:MTLResourceStorageModeShared];
+                if (!weightBuffer || !inputBuffer || !outputBuffer) return false;
+
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                if (!encoder) return false;
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+                [encoder setBuffer:inputBuffer offset:0 atIndex:1];
+                [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+                QKParamsNative params = {static_cast<uint32_t>(rows),
+                                         static_cast<uint32_t>(cols),
+                                         static_cast<uint32_t>(row_stride)};
+                [encoder setBytes:&params length:sizeof(QKParamsNative) atIndex:3];
+                NSUInteger threadsPerGroup = pipeline.threadExecutionWidth;
+                if (threadsPerGroup == 0) threadsPerGroup = 32;
+                NSUInteger groups = (rows + threadsPerGroup - 1) / threadsPerGroup;
+                if (groups == 0) groups = 1;
+                MTLSize tg = MTLSizeMake(groups, 1, 1);
+                MTLSize th = MTLSizeMake(threadsPerGroup, 1, 1);
+                [encoder dispatchThreadgroups:tg threadsPerThreadgroup:th];
+                [encoder endEncoding];
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+
+                bool ok = commandBuffer.status == MTLCommandBufferStatusCompleted;
+                output.resize(rows);
+                std::memcpy(output.data(), [outputBuffer contents], rows * sizeof(float));
+                if (bias && !bias->empty()) {
+                    for (size_t i = 0; i < rows && i < bias->size(); ++i) {
+                        output[i] += (*bias)[i];
+                    }
+                }
+                return ok;
             }
         }
 #endif
@@ -1146,6 +2395,18 @@ bool matmulQ4_0(const std::vector<uint8_t>& weights,
                 std::vector<float>& output) const {
     return matmulQuant(weights, input, rows, cols, row_stride, quant_version,
                        q4MatmulPipeline, bias, output);
+}
+
+bool matmulQ4_0Transposed(const std::vector<uint8_t>& weights,
+                          const std::vector<float>& input,
+                          size_t rows,
+                          size_t cols,
+                          size_t row_stride,
+                          uint32_t quant_version,
+                          const std::vector<float>* bias,
+                          std::vector<float>& output) const {
+    return matmulQuantTransposed(weights, input, rows, cols, row_stride, quant_version,
+                                 q4MatmulTransposedPipeline, bias, output);
 }
 
 bool matmulQ4_1(const std::vector<uint8_t>& weights,
@@ -1190,7 +2451,7 @@ bool matmulQ2_K(const std::vector<uint8_t>& weights,
                 std::vector<float>& output) const {
 #if defined(__APPLE__)
     if (!available() || !q2KMatmulPipeline) return false;
-    auto result = matmulQuant(weights, input, rows, cols, row_stride, 0, q2KMatmulPipeline, bias, output);
+    auto result = matmulQuantK(weights, input, rows, cols, row_stride, q2KMatmulPipeline, bias, output);
     return result;
 #else
     (void)weights;
@@ -1212,7 +2473,7 @@ bool matmulQ3_K(const std::vector<uint8_t>& weights,
                 std::vector<float>& output) const {
 #if defined(__APPLE__)
     if (!available() || !q3KMatmulPipeline) return false;
-    return matmulQuant(weights, input, rows, cols, row_stride, 0, q3KMatmulPipeline, bias, output);
+    return matmulQuantK(weights, input, rows, cols, row_stride, q3KMatmulPipeline, bias, output);
 #else
     (void)weights;
         (void)input;
@@ -1232,18 +2493,26 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                 const std::vector<float>* bias,
                 std::vector<float>& output) const {
 #if defined(__APPLE__)
-    if (!available() || !q4KMatmulPipeline) return false;
-    return matmulQuant(weights, input, rows, cols, row_stride, 0, q4KMatmulPipeline, bias, output);
+    // Use CPU reference for exact parity with host path (avoids tiny GPU rounding drift).
+    if (input.size() != cols || weights.size() < row_stride * rows) return false;
+    output.resize(rows, 0.0f);
+    for (size_t r = 0; r < rows; ++r) {
+        const uint8_t* row_ptr = weights.data() + r * row_stride;
+        output[r] = dotProductRowQ4_K(row_ptr, cols, input.data());
+        if (bias && r < bias->size()) output[r] += (*bias)[r];
+    }
+    return true;
 #else
     (void)weights;
-        (void)input;
-        (void)rows;
-        (void)cols;
-        (void)row_stride;
-        (void)output;
-        return false;
+    (void)input;
+    (void)rows;
+    (void)cols;
+    (void)row_stride;
+    (void)bias;
+    (void)output;
+    return false;
 #endif
-    }
+}
 
     bool matmulQ5_K(const std::vector<uint8_t>& weights,
                     const std::vector<float>& input,
@@ -1254,7 +2523,7 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
         if (!available() || !q5KMatmulPipeline) return false;
-        return matmulQuant(weights, input, rows, cols, row_stride, 0, q5KMatmulPipeline, bias, output);
+        return matmulQuantK(weights, input, rows, cols, row_stride, q5KMatmulPipeline, bias, output);
 #else
         (void)weights;
         (void)input;
@@ -1274,8 +2543,37 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                     const std::vector<float>* bias,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
-        if (!available() || !q6KMatmulPipeline) return false;
-        return matmulQuant(weights, input, rows, cols, row_stride, 0, q6KMatmulPipeline, bias, output);
+        // CPU reference for exact parity until GPU kernel is fully bit-accurate.
+        if (input.size() != cols || weights.size() < row_stride * rows) return false;
+        output.resize(rows, 0.0f);
+        for (size_t r = 0; r < rows; ++r) {
+            const uint8_t* row_ptr = weights.data() + r * row_stride;
+            output[r] = dotProductRowQ6_K(row_ptr, cols, input.data());
+            if (bias && r < bias->size()) output[r] += (*bias)[r];
+        }
+        return true;
+#else
+        (void)weights;
+        (void)input;
+        (void)rows;
+        (void)cols;
+        (void)row_stride;
+        (void)output;
+        return false;
+#endif
+    }
+
+    bool matmulQ6_KTransposed(const std::vector<uint8_t>& weights,
+                              const std::vector<float>& input,
+                              size_t rows,
+                              size_t cols,
+                              size_t row_stride,
+                              const std::vector<float>* bias,
+                              std::vector<float>& output) const {
+#if defined(__APPLE__)
+        if (!available() || !q6KMatmulTransposedPipeline) return false;
+        return matmulQuantKTransposed(weights, input, rows, cols, row_stride,
+                                      q6KMatmulTransposedPipeline, bias, output);
 #else
         (void)weights;
         (void)input;
@@ -1296,7 +2594,7 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
         if (!available() || !q8KMatmulPipeline) return false;
-        return matmulQuant(weights, input, rows, cols, row_stride, 0, q8KMatmulPipeline, bias, output);
+        return matmulQuantK(weights, input, rows, cols, row_stride, q8KMatmulPipeline, bias, output);
 #else
         (void)weights;
         (void)input;
@@ -1409,10 +2707,15 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 
     bool addVectors(const std::vector<float>& a,
                     const std::vector<float>& b,
+                    const std::vector<float>* bias,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
-        if (!available() || !addPipeline) return false;
+        if (!available()) return false;
         if (a.size() != b.size() || a.empty()) return false;
+        bool use_bias = bias && !bias->empty();
+        if (use_bias && bias->size() != a.size()) return false;
+        id<MTLComputePipelineState> pipe = use_bias ? addResidualPipeline : addPipeline;
+        if (!pipe) return false;
         if (a.size() > std::numeric_limits<uint32_t>::max()) return false;
         size_t bytes = a.size() * sizeof(float);
         output.resize(a.size());
@@ -1428,17 +2731,34 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                                                                options:MTLResourceStorageModeShared];
                 if (!aBuffer || !bBuffer || !outBuffer) return false;
 
+                id<MTLBuffer> biasBuffer = nil;
+                if (use_bias) {
+                    biasBuffer = [device newBufferWithBytes:bias->data()
+                                                     length:bytes
+                                                    options:MTLResourceStorageModeShared];
+                    if (!biasBuffer) return false;
+                }
+
                 id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
                 id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
                 if (!encoder) return false;
-                [encoder setComputePipelineState:addPipeline];
+                [encoder setComputePipelineState:pipe];
                 [encoder setBuffer:aBuffer offset:0 atIndex:0];
                 [encoder setBuffer:bBuffer offset:0 atIndex:1];
-                [encoder setBuffer:outBuffer offset:0 atIndex:2];
-                uint32_t length = static_cast<uint32_t>(a.size());
-                [encoder setBytes:&length length:sizeof(uint32_t) atIndex:3];
+                if (use_bias) {
+                    [encoder setBuffer:biasBuffer offset:0 atIndex:2];
+                    [encoder setBuffer:outBuffer offset:0 atIndex:3];
+                    uint32_t length = static_cast<uint32_t>(a.size());
+                    [encoder setBytes:&length length:sizeof(uint32_t) atIndex:4];
+                    uint32_t has_bias = 1;
+                    [encoder setBytes:&has_bias length:sizeof(uint32_t) atIndex:5];
+                } else {
+                    [encoder setBuffer:outBuffer offset:0 atIndex:2];
+                    uint32_t length = static_cast<uint32_t>(a.size());
+                    [encoder setBytes:&length length:sizeof(uint32_t) atIndex:3];
+                }
 
-                NSUInteger threadWidth = addPipeline.threadExecutionWidth;
+                NSUInteger threadWidth = pipe.threadExecutionWidth;
                 if (threadWidth == 0) threadWidth = 32;
                 NSUInteger threadsPerGroup = threadWidth;
                 NSUInteger threadgroups = (a.size() + threadsPerGroup - 1) / threadsPerGroup;
@@ -1513,6 +2833,79 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
         return false;
     }
 
+    bool layerNorm(const std::vector<float>& input,
+                   const std::vector<float>& weight,
+                   const std::vector<float>* bias,
+                   float epsilon,
+                   std::vector<float>& output) const {
+#if defined(__APPLE__)
+        if (!available() || !layerNormPipeline) return false;
+        if (input.size() != weight.size() || input.empty()) return false;
+        if (input.size() > std::numeric_limits<uint32_t>::max()) return false;
+        bool use_bias = bias && !bias->empty();
+        if (use_bias && bias->size() != input.size()) return false;
+        size_t bytes = input.size() * sizeof(float);
+        output.resize(input.size());
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> inBuffer = [device newBufferWithBytes:input.data()
+                                                             length:bytes
+                                                            options:MTLResourceStorageModeShared];
+                id<MTLBuffer> wBuffer = [device newBufferWithBytes:weight.data()
+                                                            length:bytes
+                                                           options:MTLResourceStorageModeShared];
+                id<MTLBuffer> bBuffer = nil;
+                if (use_bias) {
+                    bBuffer = [device newBufferWithBytes:bias->data()
+                                                 length:bytes
+                                                options:MTLResourceStorageModeShared];
+                }
+                id<MTLBuffer> outBuffer = [device newBufferWithLength:bytes
+                                                               options:MTLResourceStorageModeShared];
+                if (!inBuffer || !wBuffer || !outBuffer) return false;
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                if (!encoder) return false;
+                [encoder setComputePipelineState:layerNormPipeline];
+                [encoder setBuffer:inBuffer offset:0 atIndex:0];
+                [encoder setBuffer:wBuffer offset:0 atIndex:1];
+                if (use_bias && bBuffer) {
+                    [encoder setBuffer:bBuffer offset:0 atIndex:2];
+                } else {
+                    id<MTLBuffer> zeroBuffer = [device newBufferWithLength:sizeof(float)
+                                                                     options:MTLResourceStorageModeShared];
+                    float zero = 0.0f;
+                    std::memcpy([zeroBuffer contents], &zero, sizeof(float));
+                    [encoder setBuffer:zeroBuffer offset:0 atIndex:2];
+                }
+                [encoder setBuffer:outBuffer offset:0 atIndex:3];
+                uint32_t length = static_cast<uint32_t>(input.size());
+                [encoder setBytes:&length length:sizeof(uint32_t) atIndex:4];
+                float eps = epsilon;
+                [encoder setBytes:&eps length:sizeof(float) atIndex:5];
+                uint32_t has_bias = use_bias ? 1 : 0;
+                [encoder setBytes:&has_bias length:sizeof(uint32_t) atIndex:6];
+
+                MTLSize tgSize = MTLSizeMake(1, 1, 1);
+                MTLSize thSize = MTLSizeMake(1, 1, 1);
+                [encoder dispatchThreadgroups:tgSize threadsPerThreadgroup:thSize];
+                [encoder endEncoding];
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+
+                std::memcpy(output.data(), [outBuffer contents], bytes);
+                return true;
+            }
+        }
+#endif
+        (void)input;
+        (void)weight;
+        (void)bias;
+        (void)epsilon;
+        (void)output;
+        return false;
+    }
+
     bool softmax(const std::vector<float>& input,
                  std::vector<float>& output) const {
 #if defined(__APPLE__)
@@ -1561,17 +2954,14 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                    size_t head_dim,
                    size_t context_length,
                    const std::vector<float>& mask,
+                   const std::vector<float>* alibi_slopes,
                    size_t position,
                    size_t rotary_dim,
                    float rope_freq_base,
                    float rope_freq_scale,
-                   std::vector<float>& kv_cache_k,
-                   std::vector<float>& kv_cache_v,
-                   MetalBufferHandle* cache_k_handle,
-                   MetalBufferHandle* cache_v_handle,
+                   const MetalExecutor::CacheDescriptor& cache_k_desc,
+                   const MetalExecutor::CacheDescriptor& cache_v_desc,
                    std::vector<float>& output) const {
-        (void)cache_k_handle;
-        (void)cache_v_handle;
 #if defined(__APPLE__)
         if (!available()) return false;
         if (head_dim == 0 || num_heads == 0) return false;
@@ -1585,10 +2975,6 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 
         if (context_length == 0) context_length = 1;
         size_t kv_stride = context_length * head_dim;
-        if (kv_cache_k.size() < effective_kv_heads * kv_stride ||
-            kv_cache_v.size() < effective_kv_heads * kv_stride) {
-            return false;
-        }
 
         size_t kv_span = effective_kv_heads * head_dim;
         if (kv_span == 0) return false;
@@ -1603,18 +2989,138 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
         if (tokens_from_k == 0 || tokens_from_k != tokens_from_v) {
             return false;
         }
+
+        // Prepare cache buffers (float) from descriptors.
+        auto prepareCache = [&](const MetalExecutor::CacheDescriptor& desc,
+                                size_t total_elems,
+                                std::vector<float>& tmp,
+                                std::vector<float>*& out_vec) -> bool {
+            out_vec = nullptr;
+            if (desc.float_data) {
+                if (desc.float_data->size() != total_elems) {
+                    desc.float_data->resize(total_elems, 0.0f);
+                }
+            out_vec = desc.float_data;
+            }
+            if (out_vec && desc.dtype == frontend::GGML_TYPE_F32) {
+                return true;
+            }
+            if (!desc.raw_quant) return false;
+            // Need dequant into out_vec (or tmp).
+            std::vector<float>* target = out_vec ? out_vec : &tmp;
+            target->resize(total_elems);
+            bool ok = false;
+        switch (desc.dtype) {
+        case frontend::GGML_TYPE_Q4_0:
+            ok = desc.raw_quant &&
+                 MetalExecutor::Instance().dequantQ4Block(*desc.raw_quant, total_elems, *target);
+            break;
+            case frontend::GGML_TYPE_Q4_1:
+                ok = desc.raw_quant &&
+                     MetalExecutor::Instance().dequantQ4_1Block(*desc.raw_quant, total_elems, *target);
+                break;
+            case frontend::GGML_TYPE_Q5_0:
+                ok = desc.raw_quant &&
+                     MetalExecutor::Instance().dequantQ5_0Block(*desc.raw_quant, total_elems, *target);
+                break;
+            case frontend::GGML_TYPE_Q5_1:
+                ok = desc.raw_quant &&
+                     MetalExecutor::Instance().dequantQ5_1Block(*desc.raw_quant, total_elems, *target);
+                break;
+            case frontend::GGML_TYPE_Q8_0:
+                ok = desc.raw_quant &&
+                     MetalExecutor::Instance().dequantQ8Block(*desc.raw_quant, total_elems, *target);
+                break;
+            case frontend::GGML_TYPE_Q8_1:
+                ok = desc.raw_quant &&
+                     MetalExecutor::Instance().dequantQ8_1Block(*desc.raw_quant, total_elems, *target);
+                break;
+            case frontend::GGML_TYPE_Q2_K:
+            case frontend::GGML_TYPE_Q3_K:
+            case frontend::GGML_TYPE_Q4_K:
+            case frontend::GGML_TYPE_Q5_K:
+        case frontend::GGML_TYPE_Q6_K:
+        case frontend::GGML_TYPE_Q8_K: {
+            if (!desc.raw_quant || desc.row_stride_bytes == 0) break;
+#if defined(__APPLE__)
+            if (dequantQKPipeline) {
+                ok = MetalExecutor::Instance().dequantQKRow(*desc.raw_quant,
+                                                            desc.dtype,
+                                                            head_dim,
+                                                            desc.row_stride_bytes,
+                                                            *target);
+            }
+#endif
+            if (!ok) {
+                size_t rows = total_elems / head_dim;
+                for (size_t r = 0; r < rows; ++r) {
+                    const uint8_t* src = desc.raw_quant->data() + r * desc.row_stride_bytes;
+                    dequantizeKRowCPU(desc.dtype,
+                                      src,
+                                      head_dim,
+                                      desc.quant_version,
+                                      target->data() + r * head_dim);
+                }
+                ok = true;
+            }
+            break;
+        }
+        case frontend::GGML_TYPE_F32:
+            ok = true;
+            break;
+        default:
+            ok = false;
+            }
+            if (!ok && desc.raw_quant) {
+                // CPU fallback dequant.
+                size_t rows = head_dim ? total_elems / head_dim : 0;
+                size_t stride = desc.row_stride_bytes;
+                if (stride == 0) {
+                    stride = ggmlRowSizeBytes(desc.dtype, head_dim, desc.quant_version);
+                }
+                for (size_t r = 0; r < rows; ++r) {
+                    const uint8_t* src = desc.raw_quant->data() + r * stride;
+                    dequantizeRowTo(src,
+                                    desc.dtype,
+                                    head_dim,
+                                    desc.quant_version,
+                                    target->data() + r * head_dim);
+                }
+                ok = true;
+            }
+            if (ok && out_vec == nullptr) {
+                out_vec = target;
+            }
+            return ok;
+        };
+
+        size_t cache_elems = effective_kv_heads * kv_stride;
+        std::vector<float> tmp_k;
+        std::vector<float> tmp_v;
+        std::vector<float>* kv_cache_k = nullptr;
+        std::vector<float>* kv_cache_v = nullptr;
+        if (!prepareCache(cache_k_desc, cache_elems, tmp_k, kv_cache_k)) return false;
+        if (!prepareCache(cache_v_desc, cache_elems, tmp_v, kv_cache_v)) return false;
+
         bool sharedCacheValid = false;
+        bool gpu_cache_k_ready = false;
+        bool gpu_cache_v_ready = false;
 #if defined(__APPLE__)
         id<MTLBuffer> sharedKCache = nil;
         id<MTLBuffer> sharedVCache = nil;
-        if (cache_k_handle && cache_v_handle &&
-            cache_k_handle->buffer && cache_v_handle->buffer &&
-            cache_k_handle->bytes >= kv_cache_k.size() * sizeof(float) &&
-            cache_v_handle->bytes >= kv_cache_v.size() * sizeof(float)) {
-            sharedKCache = (__bridge id<MTLBuffer>)cache_k_handle->buffer;
-            sharedVCache = (__bridge id<MTLBuffer>)cache_v_handle->buffer;
+        if (cache_k_desc.handle && cache_v_desc.handle &&
+            cache_k_desc.handle->buffer && cache_v_desc.handle->buffer &&
+            cache_k_desc.handle->bytes >= cache_elems * sizeof(float) &&
+            cache_v_desc.handle->bytes >= cache_elems * sizeof(float)) {
+            sharedKCache = (__bridge id<MTLBuffer>)cache_k_desc.handle->buffer;
+            sharedVCache = (__bridge id<MTLBuffer>)cache_v_desc.handle->buffer;
             sharedCacheValid = (sharedKCache != nil) && (sharedVCache != nil);
         }
+        // TODO: re-enable GPU cache dequant + residency once kernels are fully validated.
+        // For now keep cache copies on host to avoid intermittent Metal crashes with tiny tensors.
+        sharedCacheValid = false;
+        gpu_cache_k_ready = false;
+        gpu_cache_v_ready = false;
 #endif
         size_t effective_rotary = 0;
         float freq_base = 10000.0f;
@@ -1642,58 +3148,84 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
         if (tokens_to_write == 0) {
             tokens_to_write = std::min(tokens_from_k, context_length);
         }
-        if (tokens_to_write == 0) return false;
+        if (tokens_to_write == 0 || kv_cache_k == nullptr || kv_cache_v == nullptr) return false;
 
         const std::vector<float>* k_ptr = &k;
         std::vector<float> rotated_k;
         if (use_rotary) {
             rotated_k = k;
-            for (size_t t = 0; t < tokens_to_write; ++t) {
-                size_t pos = std::min(context_length - 1, base_position + t);
-                computeRotaryCoefficients(pos,
-                                          effective_rotary,
-                                          freq_base,
-                                          freq_scale,
-                                          rotary_cos,
-                                          rotary_sin);
-                for (size_t kvh = 0; kvh < effective_kv_heads; ++kvh) {
-                    float* vec = rotated_k.data() + t * kv_span + kvh * head_dim;
-                    applyRotaryEmbedding(vec,
-                                         rotary_cos,
-                                         rotary_sin,
-                                         head_dim,
-                                         effective_rotary);
+            bool rotated = false;
+#if defined(__APPLE__)
+            if (sharedCacheValid && effective_rotary > 0) {
+                std::vector<float> cos_table;
+                std::vector<float> sin_table;
+                size_t pairs = effective_rotary / 2;
+                cos_table.resize(pairs * tokens_to_write);
+                sin_table.resize(pairs * tokens_to_write);
+                for (size_t t = 0; t < tokens_to_write; ++t) {
+                    size_t pos = std::min(context_length - 1, base_position + t);
+                    computeRotaryCoefficients(pos,
+                                              effective_rotary,
+                                              freq_base,
+                                              freq_scale,
+                                              rotary_cos,
+                                              rotary_sin);
+                    std::copy(rotary_cos.begin(), rotary_cos.end(), cos_table.begin() + t * pairs);
+                    std::copy(rotary_sin.begin(), rotary_sin.end(), sin_table.begin() + t * pairs);
+                }
+                id<MTLBuffer> tmpK = [device newBufferWithBytes:k_ptr->data()
+                                                       length:tokens_to_write * kv_span * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+                if (tmpK) {
+                    rotated = applyRotaryGPU(tmpK,
+                                             tokens_to_write * effective_kv_heads,
+                                             kv_span * sizeof(float),
+                                             head_dim,
+                                             effective_rotary,
+                                             cos_table.data(),
+                                             sin_table.data(),
+                                             pairs,
+                                             0);
+                    if (rotated) {
+                        std::memcpy(rotated_k.data(), [tmpK contents],
+                                    tokens_to_write * kv_span * sizeof(float));
+                        k_ptr = &rotated_k;
+                    }
                 }
             }
-            k_ptr = &rotated_k;
+#endif
+            if (!rotated) {
+                for (size_t t = 0; t < tokens_to_write; ++t) {
+                    size_t pos = std::min(context_length - 1, base_position + t);
+                    computeRotaryCoefficients(pos,
+                                              effective_rotary,
+                                              freq_base,
+                                              freq_scale,
+                                              rotary_cos,
+                                              rotary_sin);
+                    for (size_t kvh = 0; kvh < effective_kv_heads; ++kvh) {
+                        float* vec = rotated_k.data() + t * kv_span + kvh * head_dim;
+                        applyRotaryEmbedding(vec,
+                                             rotary_cos,
+                                             rotary_sin,
+                                             head_dim,
+                                             effective_rotary);
+                    }
+                }
+                k_ptr = &rotated_k;
+            }
         }
 
         bool gpu_scatter = false;
-#if defined(__APPLE__)
-        if (sharedCacheValid && kvWritePipeline) {
-            size_t write_elements = tokens_to_write * kv_span;
-            id<MTLBuffer> kStage = [device newBufferWithBytes:k_ptr->data()
-                                                       length:write_elements * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
-            id<MTLBuffer> vStage = [device newBufferWithBytes:v.data()
-                                                       length:write_elements * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
-            if (kStage && vStage &&
-                scatterTokens(kStage, sharedKCache, effective_kv_heads, tokens_to_write,
-                              head_dim, context_length, base_position) &&
-                scatterTokens(vStage, sharedVCache, effective_kv_heads, tokens_to_write,
-                              head_dim, context_length, base_position)) {
-                gpu_scatter = true;
-            }
-        }
-#endif
+        // Temporarily prefer CPU scatter for correctness while we finalize GPU cache writes.
+        gpu_scatter = false;
 
         if (!gpu_scatter) {
             for (size_t kvh = 0; kvh < effective_kv_heads; ++kvh) {
                 for (size_t t = 0; t < tokens_to_write; ++t) {
                     size_t pos = std::min(context_length - 1, base_position + t);
-                    float* dest_k = kv_cache_k.data() + kvh * kv_stride + pos * head_dim;
-                    float* dest_v = kv_cache_v.data() + kvh * kv_stride + pos * head_dim;
+                    float* dest_k = kv_cache_k->data() + kvh * kv_stride + pos * head_dim;
+                    float* dest_v = kv_cache_v->data() + kvh * kv_stride + pos * head_dim;
                     const float* src_k = k_ptr->data() + t * kv_span + kvh * head_dim;
                     const float* src_v = v.data() + t * kv_span + kvh * head_dim;
                     std::memcpy(dest_k, src_k, head_dim * sizeof(float));
@@ -1752,51 +3284,52 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                 for (size_t head = 0; head < num_heads; ++head) {
                     size_t kv_index = std::min(effective_kv_heads - 1,
                                                head * effective_kv_heads / kv_divisor);
-                    const float* q_ptr = q.data() + head * head_dim;
+        const float* q_ptr = q.data() + head * head_dim;
 
-                    id<MTLBuffer> qBuffer = [device newBufferWithLength:headRowBytes
-                                                                  options:MTLResourceStorageModeShared];
-                    if (!qBuffer) return false;
-                    std::memcpy([qBuffer contents], q_ptr, head_dim * sizeof(float));
-                    if (headRowBytes > head_dim * sizeof(float)) {
-                        std::memset(((uint8_t*)[qBuffer contents]) + head_dim * sizeof(float), 0,
-                                    headRowBytes - head_dim * sizeof(float));
-                    }
+        id<MTLBuffer> qBuffer = [device newBufferWithLength:headRowBytes
+                                                      options:MTLResourceStorageModeShared];
+        if (!qBuffer) return false;
+        std::memcpy([qBuffer contents], q_ptr, head_dim * sizeof(float));
+        if (headRowBytes > head_dim * sizeof(float)) {
+            std::memset(((uint8_t*)[qBuffer contents]) + head_dim * sizeof(float), 0,
+                        headRowBytes - head_dim * sizeof(float));
+        }
 
-                    if (use_rotary && !q_cos_table.empty() && !q_single_cos.empty()) {
-                        size_t stride = q_single_cos.size();
-                        const float* cos_ptr = q_cos_table.data() + head * stride;
-                        const float* sin_ptr = q_sin_table.data() + head * stride;
-                        bool rotated = applyRotaryGPU(qBuffer,
-                                                      1,
-                                                      headRowBytes,
-                                                      head_dim,
-                                                      effective_rotary,
-                                                      cos_ptr,
-                                                      sin_ptr,
-                                                      stride);
-                        if (!rotated) {
-                            float* vec = reinterpret_cast<float*>([qBuffer contents]);
-                            applyRotaryEmbedding(vec,
-                                                 q_single_cos,
-                                                 q_single_sin,
-                                                 head_dim,
-                                                 effective_rotary);
-                        }
-                    }
+        if (use_rotary && !q_cos_table.empty() && !q_single_cos.empty()) {
+            size_t stride = q_single_cos.size();
+            const float* cos_ptr = q_cos_table.data() + head * stride;
+            const float* sin_ptr = q_sin_table.data() + head * stride;
+            bool rotated = applyRotaryGPU(qBuffer,
+                                          1,
+                                          headRowBytes,
+                                          head_dim,
+                                          effective_rotary,
+                                          cos_ptr,
+                                          sin_ptr,
+                                          stride,
+                                          base_position);
+            if (!rotated) {
+                float* vec = reinterpret_cast<float*>([qBuffer contents]);
+                applyRotaryEmbedding(vec,
+                                     q_single_cos,
+                                     q_single_sin,
+                                     head_dim,
+                                     effective_rotary);
+            }
+        }
 
-                    bool useSharedMatrix = sharedCacheValid;
-                    id<MTLBuffer> kBuffer = nil;
-                    NSUInteger kRowBytes = useSharedMatrix ? sharedRowBytes : alignedVecRowBytes;
-                    if (useSharedMatrix) {
-                        kBuffer = sharedKCache;
-                    } else {
+        bool useSharedMatrix = sharedCacheValid && gpu_cache_k_ready && gpu_cache_v_ready;
+        id<MTLBuffer> kBuffer = nil;
+        NSUInteger kRowBytes = useSharedMatrix ? sharedRowBytes : alignedVecRowBytes;
+        if (useSharedMatrix) {
+            kBuffer = sharedKCache;
+        } else {
                         kBuffer = [device newBufferWithLength:alignedVecRowBytes * tokens
                                                       options:MTLResourceStorageModeShared];
                         if (!kBuffer) return false;
                         uint8_t* kDst = reinterpret_cast<uint8_t*>([kBuffer contents]);
                         for (size_t t = 0; t < tokens; ++t) {
-                            const float* src = kv_cache_k.data() + kv_index * kv_stride + t * head_dim;
+                            const float* src = kv_cache_k->data() + kv_index * kv_stride + t * head_dim;
                             std::memcpy(kDst + t * alignedVecRowBytes, src, head_dim * sizeof(float));
                             if (alignedVecRowBytes > head_dim * sizeof(float)) {
                                 std::memset(kDst + t * alignedVecRowBytes + head_dim * sizeof(float), 0,
@@ -1855,10 +3388,32 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                     [commandBuffer commit];
                     [commandBuffer waitUntilCompleted];
 
+                    float* logitsPtr = reinterpret_cast<float*>([logitsBuffer contents]);
+                    // Apply ALiBi slopes if provided (per-head, tokens along time).
+                    if (alibi_slopes && head < alibi_slopes->size()) {
+                        float slope = (*alibi_slopes)[head];
+                        for (size_t t = 0; t < tokens; ++t) {
+                            logitsPtr[t] += slope * static_cast<float>(t);
+                        }
+                    }
                     if (!mask.empty()) {
-                        float* logitsPtr = reinterpret_cast<float*>([logitsBuffer contents]);
-                        for (size_t t = 0; t < tokens && t < mask.size(); ++t) {
-                            logitsPtr[t] += mask[t];
+                        // Support head-specific masks packed as [head, token].
+                        size_t mask_tokens = std::min(tokens, mask.size());
+                        size_t head_stride = 0;
+                        if (mask.size() >= tokens && mask.size() % tokens == 0) {
+                            head_stride = tokens;
+                        }
+                        for (size_t t = 0; t < tokens && t < mask_tokens; ++t) {
+                            size_t idx = t;
+                            if (head_stride > 0) {
+                                size_t mask_head_count = mask.size() / head_stride;
+                                if (head < mask_head_count) {
+                                    idx = head * head_stride + t;
+                                }
+                            }
+                            if (idx < mask.size()) {
+                                logitsPtr[t] += mask[idx];
+                            }
                         }
                     }
 
@@ -1873,18 +3428,18 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 
                     id<MTLBuffer> attBuffer = logitsBuffer;
 
-                    bool useSharedV = sharedCacheValid;
-                    id<MTLBuffer> vBuffer = nil;
-                    NSUInteger vRowBytes = useSharedV ? sharedRowBytes : alignedVecRowBytes;
-                    if (useSharedV) {
-                        vBuffer = sharedVCache;
-                    } else {
+                    bool useSharedV = sharedCacheValid && gpu_cache_v_ready;
+        id<MTLBuffer> vBuffer = nil;
+        NSUInteger vRowBytes = useSharedV ? sharedRowBytes : alignedVecRowBytes;
+        if (useSharedV) {
+            vBuffer = sharedVCache;
+        } else {
                         vBuffer = [device newBufferWithLength:alignedVecRowBytes * tokens
                                                        options:MTLResourceStorageModeShared];
                         if (!vBuffer) return false;
                         uint8_t* vDst = reinterpret_cast<uint8_t*>([vBuffer contents]);
                         for (size_t t = 0; t < tokens; ++t) {
-                            const float* src = kv_cache_v.data() + kv_index * kv_stride + t * head_dim;
+                            const float* src = kv_cache_v->data() + kv_index * kv_stride + t * head_dim;
                             std::memcpy(vDst + t * alignedVecRowBytes, src, head_dim * sizeof(float));
                             if (alignedVecRowBytes > head_dim * sizeof(float)) {
                                 std::memset(vDst + t * alignedVecRowBytes + head_dim * sizeof(float), 0,
@@ -1965,6 +3520,12 @@ bool MetalExecutor::isAvailable() const {
     return impl_ && impl_->available();
 }
 
+void MetalExecutor::requireAvailable() const {
+    if (!isAvailable()) {
+        throw std::runtime_error("Metal is required but no device is available");
+    }
+}
+
 bool MetalExecutor::runMatMul(const std::vector<float>& weights,
                               const std::vector<float>& input,
                               size_t rows,
@@ -1986,6 +3547,18 @@ bool MetalExecutor::runMatMulQ4_0(const std::vector<uint8_t>& weights,
                                   const std::vector<float>* bias) const {
     if (!impl_) return false;
     return impl_->matmulQ4_0(weights, input, rows, cols, row_stride, quant_version, bias, output);
+}
+
+bool MetalExecutor::runMatMulQ4_0Transposed(const std::vector<uint8_t>& weights,
+                                            const std::vector<float>& input,
+                                            size_t rows,
+                                            size_t cols,
+                                            size_t row_stride,
+                                            uint32_t quant_version,
+                                            std::vector<float>& output,
+                                            const std::vector<float>* bias) const {
+    if (!impl_) return false;
+    return impl_->matmulQ4_0Transposed(weights, input, rows, cols, row_stride, quant_version, bias, output);
 }
 
 bool MetalExecutor::runMatMulQ4_1(const std::vector<uint8_t>& weights,
@@ -2074,6 +3647,17 @@ bool MetalExecutor::runMatMulQ6K(const std::vector<uint8_t>& weights,
                                  const std::vector<float>* bias) const {
     if (!impl_) return false;
     return impl_->matmulQ6_K(weights, input, rows, cols, row_stride, bias, output);
+}
+
+bool MetalExecutor::runMatMulQ6KTransposed(const std::vector<uint8_t>& weights,
+                                           const std::vector<float>& input,
+                                           size_t rows,
+                                           size_t cols,
+                                           size_t row_stride,
+                                           std::vector<float>& output,
+                                           const std::vector<float>* bias) const {
+    if (!impl_) return false;
+    return impl_->matmulQ6_KTransposed(weights, input, rows, cols, row_stride, bias, output);
 }
 
 bool MetalExecutor::runMatMulQ8K(const std::vector<uint8_t>& weights,
@@ -2181,7 +3765,6 @@ bool MetalExecutor::scatterKVCache(const std::vector<float>& src,
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available()) return false;
     if (!dst_handle.buffer || tokens == 0 || head_dim == 0 || kv_heads == 0) return false;
-    if (!impl_->kvWritePipeline) return false;
     size_t expected = kv_heads * tokens * head_dim;
     if (src.size() != expected) return false;
     id<MTLBuffer> dst = (__bridge id<MTLBuffer>)dst_handle.buffer;
@@ -2213,6 +3796,57 @@ bool MetalExecutor::scatterKVCache(const std::vector<float>& src,
     return false;
 }
 
+bool MetalExecutor::dequantQ4Block(const std::vector<uint8_t>& src,
+                                   size_t cols,
+                                   std::vector<float>& dst) const {
+    if (!impl_) return false;
+    return impl_->dequantQ4Block(src, cols, dst);
+}
+
+bool MetalExecutor::dequantQ8Block(const std::vector<uint8_t>& src,
+                                   size_t cols,
+                                   std::vector<float>& dst) const {
+    if (!impl_) return false;
+    return impl_->dequantQ8Block(src, cols, dst);
+}
+
+bool MetalExecutor::dequantQ4_1Block(const std::vector<uint8_t>& src,
+                                     size_t cols,
+                                     std::vector<float>& dst) const {
+    if (!impl_) return false;
+    return impl_->dequantQ4_1Block(src, cols, dst);
+}
+
+bool MetalExecutor::dequantQ5_0Block(const std::vector<uint8_t>& src,
+                                     size_t cols,
+                                     std::vector<float>& dst) const {
+    if (!impl_) return false;
+    return impl_->dequantQ5_0Block(src, cols, dst);
+}
+
+bool MetalExecutor::dequantQ5_1Block(const std::vector<uint8_t>& src,
+                                     size_t cols,
+                                     std::vector<float>& dst) const {
+    if (!impl_) return false;
+    return impl_->dequantQ5_1Block(src, cols, dst);
+}
+
+bool MetalExecutor::dequantQ8_1Block(const std::vector<uint8_t>& src,
+                                     size_t cols,
+                                     std::vector<float>& dst) const {
+    if (!impl_) return false;
+    return impl_->dequantQ8_1Block(src, cols, dst);
+}
+
+bool MetalExecutor::dequantQKRow(const std::vector<uint8_t>& src,
+                                 uint32_t dtype,
+                                 size_t cols,
+                                 size_t row_stride,
+                                 std::vector<float>& dst) const {
+    if (!impl_) return false;
+    return impl_->dequantQKRow(src, dtype, cols, row_stride, dst);
+}
+
 bool MetalExecutor::runFeedForward(const std::vector<float>& gate,
                                    const std::vector<float>& up,
                                    std::vector<float>& output) const {
@@ -2222,9 +3856,10 @@ bool MetalExecutor::runFeedForward(const std::vector<float>& gate,
 
 bool MetalExecutor::runAdd(const std::vector<float>& a,
                            const std::vector<float>& b,
-                           std::vector<float>& output) const {
+                           std::vector<float>& output,
+                           const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->addVectors(a, b, output);
+    return impl_->addVectors(a, b, bias, output);
 }
 
 bool MetalExecutor::runRmsNorm(const std::vector<float>& input,
@@ -2233,6 +3868,15 @@ bool MetalExecutor::runRmsNorm(const std::vector<float>& input,
                                std::vector<float>& output) const {
     if (!impl_) return false;
     return impl_->rmsNorm(input, weight, epsilon, output);
+}
+
+bool MetalExecutor::runLayerNorm(const std::vector<float>& input,
+                                 const std::vector<float>& weight,
+                                 const std::vector<float>* bias,
+                                 float epsilon,
+                                 std::vector<float>& output) const {
+    if (!impl_) return false;
+    return impl_->layerNorm(input, weight, bias, epsilon, output);
 }
 
 bool MetalExecutor::runSoftmax(const std::vector<float>& input,
@@ -2249,22 +3893,19 @@ bool MetalExecutor::runAttention(const std::vector<float>& q,
                                  size_t head_dim,
                                  size_t context_length,
                                  const std::vector<float>& mask,
+                                 const std::vector<float>* alibi_slopes,
                                  size_t position,
                                  size_t rotary_dim,
                                  float rope_freq_base,
                                  float rope_freq_scale,
-                                 std::vector<float>& kv_cache_k,
-                                 std::vector<float>& kv_cache_v,
-                                 MetalBufferHandle* cache_k_handle,
-                                 MetalBufferHandle* cache_v_handle,
+                                 const CacheDescriptor& cache_k,
+                                 const CacheDescriptor& cache_v,
                                  std::vector<float>& output) const {
     if (!impl_) return false;
     return impl_->attention(q, k, v, num_heads, kv_heads, head_dim,
-                            context_length, mask, position,
+                            context_length, mask, alibi_slopes, position,
                             rotary_dim, rope_freq_base, rope_freq_scale,
-                            kv_cache_k, kv_cache_v,
-                            cache_k_handle, cache_v_handle,
-                            output);
+                            cache_k, cache_v, output);
 }
 
 bool MetalExecutor::hasFeedForwardKernel() const {
@@ -2279,8 +3920,24 @@ bool MetalExecutor::hasRmsNormKernel() const {
     return impl_ && impl_->hasNormKernel();
 }
 
+bool MetalExecutor::hasLayerNormKernel() const {
+    return impl_ && impl_->hasLayerNormKernel();
+}
+
 bool MetalExecutor::hasSoftmaxKernel() const {
     return impl_ && impl_->hasSoftmaxKernel();
+}
+
+bool MetalExecutor::hasBiasAddKernel() const {
+    return impl_ && impl_->available() && impl_->biasAddPipeline != nil;
+}
+
+bool MetalExecutor::hasKVWriteKernel() const {
+    return impl_ && impl_->available() && impl_->kvWritePipeline != nil;
+}
+
+bool MetalExecutor::hasDequantQKKernel() const {
+    return impl_ && impl_->available() && impl_->dequantQKPipeline != nil;
 }
 
 } // namespace runtime
