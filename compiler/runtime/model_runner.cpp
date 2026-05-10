@@ -26,7 +26,8 @@ const std::vector<std::string> kHeadTensorCandidates = {
     "output.weight",
     "lm_head.weight",
     "model.output.weight",
-    "model.lm_head.weight"
+    "model.lm_head.weight",
+    "head.weight"
 };
 } // namespace
 
@@ -43,9 +44,14 @@ DryRunResult ModelRunner::dryRun(const RunConfig& config) const {
     const auto& loader_ref = loader();
 
     size_t layers = readSize(loader_ref, "llama.block_count", 0);
+    if (layers == 0) layers = readSize(loader_ref, "gemma.block_count", layers);
+    if (layers == 0) layers = readSize(loader_ref, "mistral.block_count", layers);
+
     size_t hidden = readSize(loader_ref, "llama.embedding_length", 0);
+    if (hidden == 0) hidden = readSize(loader_ref, "gemma.embedding_length", hidden);
+    if (hidden == 0) hidden = readSize(loader_ref, "mistral.embedding_length", hidden);
     if (layers == 0 || hidden == 0) {
-        throw std::runtime_error("Model metadata missing llama.block_count or llama.embedding_length");
+        throw std::runtime_error("Model metadata missing block_count or embedding_length");
     }
 
     result.num_layers = layers;
@@ -98,6 +104,13 @@ DryRunResult ModelRunner::dryRun(const RunConfig& config) const {
         ExecutionExecutor executor(result.plan,
                                    &BackendRegistry::Default(),
                                    &context);
+        if (std::getenv("MLC_VERBOSE")) {
+            fprintf(stderr,
+                    "[Run] executing plan with token=%llu pos=%zu (backend auto=%s)\n",
+                    (unsigned long long)config.token_id,
+                    config.sequence_position,
+                    MetalExecutor::Instance().isAvailable() ? "metal" : "cpu");
+        }
         auto exec_result = executor.run();
         result.execution_ran = true;
         result.execution_success = exec_result.success;

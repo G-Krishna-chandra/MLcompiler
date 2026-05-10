@@ -34,6 +34,10 @@ public:
     std::vector<float>* mutableTensor(const std::string& name);
     std::vector<std::string> tensorNames() const;
 
+    // Utilities to reason about tensor storage/shape.
+    size_t tensorElementCount(const ExecutionTensor& tensor) const;
+    void clearStateTensors();
+
     std::vector<float>& allocateTensor(const std::string& name,
                                        size_t elements,
                                        bool zero_initialize = true);

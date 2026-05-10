@@ -25,7 +25,8 @@ inline float fp16ToFloat(uint16_t h) {
             }
             h_sig &= 0x03FFu;
             mantissa = static_cast<uint32_t>(h_sig) << 13;
-            exp = 127 - 15 - exp;
+            // Subnormal values use exponent = 1 - bias, then adjust for shift count.
+            exp = 127 - 14 - exp;
         }
     } else if (h_exp == 0x7C00u) {
         exp = 255;

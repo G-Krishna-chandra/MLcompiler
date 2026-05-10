@@ -101,11 +101,29 @@ ExecOpType mapOp(ir::OpKind kind) {
 }
 
 BackendKind selectBackend(ExecOpType op,
-                          const ir::Node* node) {
+                          const ir::Node* node,
+                          const ModelConfig& config) {
     switch (op) {
         case ExecOpType::Embedding:
-        case ExecOpType::Attention:
-            return BackendKind::Metal;
+            // Small embeddings are fine on CPU; otherwise prefer Metal.
+            return (config.head_count * config.head_dim < 256) ? BackendKind::CPU : BackendKind::Metal;
+        case ExecOpType::Attention: {
+            bool is_familyspecial = (config.family == ArchitectureFamily::Gemma ||
+                                     config.family == ArchitectureFamily::Mistral);
+            // Gemma/Mistral: allow Metal when heads are reasonably wide or grouped-query is requested.
+            if (is_familyspecial) {
+                if (config.head_dim >= 64 || config.grouped_query_attention) {
+                    return BackendKind::Metal;
+                }
+                return BackendKind::CPU;
+            }
+            // Heuristic: push to Metal when head_dim is at least 64 or tokens are multi.
+            int64_t tokens = (node && !node->outputs.empty() && node->outputs[0])
+                                 ? (node->outputs[0]->shape.empty() ? 1 : node->outputs[0]->shape[0])
+                                 : 1;
+            if (config.head_dim >= 64 || tokens > 1) return BackendKind::Metal;
+            return BackendKind::CPU;
+        }
         case ExecOpType::MatMul:
         case ExecOpType::Linear: {
             if (!node || node->outputs.empty() || !node->outputs[0]) {
@@ -113,15 +131,67 @@ BackendKind selectBackend(ExecOpType op,
             }
             const auto& shape = node->outputs[0]->shape;
             int64_t rows = !shape.empty() ? shape[0] : 0;
-            return rows >= 128 ? BackendKind::Metal : BackendKind::CPU;
+            // Prefer Metal for mid/large rows; CPU for very small.
+            return rows >= 64 ? BackendKind::Metal : BackendKind::CPU;
         }
-        case ExecOpType::FeedForward:
+        case ExecOpType::FeedForward: {
+            // Prefer Metal when hidden is moderate/large or when using GeGLU (Gemma-style).
+            if (config.hidden_size >= 512) return BackendKind::Metal;
+            std::string act = config.activation;
+            std::transform(act.begin(), act.end(), act.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (act == "geglu" || act == "gelu") return BackendKind::Metal;
+            return BackendKind::CPU;
+        }
         case ExecOpType::Norm:
         case ExecOpType::Add:
             return BackendKind::Metal;
         default:
             return BackendKind::Auto;
     }
+}
+
+bool readBool(const frontend::GGUFLoader& loader,
+              const std::vector<std::string>& keys,
+              bool fallback) {
+    const auto& kv = loader.kvMetadata();
+    for (const auto& key : keys) {
+        auto it = kv.find(key);
+        if (it == kv.end()) continue;
+        if (it->second.type == frontend::GGUFValueType::BOOL) {
+            return std::get<bool>(it->second.data);
+        }
+    }
+    return fallback;
+}
+
+std::vector<float> generateAlibiSlopes(size_t heads) {
+    // From Fairseq/LLAMA-style ALiBi slopes generation
+    std::vector<float> slopes;
+    if (heads == 0) return slopes;
+    auto get_pow = [](int64_t a, int64_t b) {
+        double r = std::pow(static_cast<double>(a), 1.0 / static_cast<double>(b));
+        return r;
+    };
+    size_t closest_power_of_2 = 1;
+    while (closest_power_of_2 * 2 <= heads) closest_power_of_2 *= 2;
+    double m = get_pow(2, static_cast<int64_t>(closest_power_of_2));
+    double start = m;
+    slopes.reserve(heads);
+    for (size_t i = 0; i < closest_power_of_2; ++i) {
+        double slope = std::pow(m, static_cast<double>(i) / static_cast<double>(closest_power_of_2));
+        slopes.push_back(static_cast<float>(slope));
+    }
+    if (closest_power_of_2 < heads) {
+        double m2 = get_pow(2, static_cast<int64_t>(2 * closest_power_of_2));
+        size_t extra = heads - closest_power_of_2;
+        for (size_t i = 1; i <= extra; ++i) {
+            double slope = std::pow(m2, static_cast<double>(2 * i - 1) / static_cast<double>(2 * extra));
+            slopes.push_back(static_cast<float>(slope));
+        }
+    }
+    return slopes;
 }
 
 ArchitectureFamily detectFamily(const std::string& arch) {
@@ -134,6 +204,59 @@ ArchitectureFamily detectFamily(const std::string& arch) {
     if (lower.find("gemma") != std::string::npos) return ArchitectureFamily::Gemma;
     if (lower.find("mistral") != std::string::npos) return ArchitectureFamily::Mistral;
     return ArchitectureFamily::Unknown;
+}
+
+struct FamilyKeySet {
+    std::vector<std::string> head_count;
+    std::vector<std::string> kv_head_count;
+    std::vector<std::string> context_length;
+    std::vector<std::string> block_count;
+    std::vector<std::string> hidden_size;
+    std::vector<std::string> rope_dim;
+    std::vector<std::string> rope_freq_base;
+    std::vector<std::string> rope_freq_scale;
+    std::vector<std::string> vocab_size;
+};
+
+FamilyKeySet keySetForFamily(ArchitectureFamily family) {
+    FamilyKeySet ks;
+    switch (family) {
+    case ArchitectureFamily::Gemma:
+        ks.head_count = {"gemma.attention.head_count", "attention.head_count", "num_attention_heads"};
+        ks.kv_head_count = {"gemma.attention.head_count_kv", "attention.head_count_kv"};
+        ks.context_length = {"gemma.context_length", "context_length"};
+        ks.block_count = {"gemma.block_count", "block_count", "num_hidden_layers"};
+        ks.hidden_size = {"gemma.embedding_length", "embedding_length", "n_embd"};
+        ks.rope_dim = {"gemma.rope.dimension_count", "rope.dimension_count"};
+        ks.rope_freq_base = {"gemma.rope.freq_base", "rope.freq_base"};
+        ks.rope_freq_scale = {"gemma.rope.freq_scale", "rope.freq_scale"};
+        ks.vocab_size = {"gemma.vocab_size", "tokenizer.ggml.vocab_size", "vocab_size"};
+        break;
+    case ArchitectureFamily::Mistral:
+        ks.head_count = {"mistral.attention.head_count", "attention.head_count", "num_attention_heads"};
+        ks.kv_head_count = {"mistral.attention.head_count_kv", "attention.head_count_kv"};
+        ks.context_length = {"mistral.context_length", "context_length"};
+        ks.block_count = {"mistral.block_count", "block_count", "num_hidden_layers"};
+        ks.hidden_size = {"mistral.embedding_length", "embedding_length", "n_embd"};
+        ks.rope_dim = {"mistral.rope.dimension_count", "rope.dimension_count"};
+        ks.rope_freq_base = {"mistral.rope.freq_base", "rope.freq_base"};
+        ks.rope_freq_scale = {"mistral.rope.freq_scale", "rope.freq_scale"};
+        ks.vocab_size = {"mistral.vocab_size", "tokenizer.ggml.vocab_size", "vocab_size"};
+        break;
+    case ArchitectureFamily::Llama:
+    default:
+        ks.head_count = {"llama.attention.head_count", "attention.head_count", "num_attention_heads"};
+        ks.kv_head_count = {"llama.attention.head_count_kv", "attention.head_count_kv"};
+        ks.context_length = {"llama.context_length", "context_length"};
+        ks.block_count = {"llama.block_count", "llama.layers", "block_count", "n_layer", "num_hidden_layers"};
+        ks.hidden_size = {"llama.embedding_length", "llama.n_embd", "embedding_length", "n_embd"};
+        ks.rope_dim = {"llama.rope.dimension_count", "rope.dimension_count"};
+        ks.rope_freq_base = {"llama.rope.freq_base", "rope.freq_base"};
+        ks.rope_freq_scale = {"llama.rope.freq_scale", "rope.freq_scale"};
+        ks.vocab_size = {"general.vocab_size", "tokenizer.ggml.vocab_size", "vocab_size"};
+        break;
+    }
+    return ks;
 }
 
 void annotateTensor(const ir::Tensor* source,
@@ -225,44 +348,60 @@ void annotateNodeQuantization(ExecutionNode& node,
 
 } // namespace
 
-ExecutionGraph KernelScheduler::Schedule(const ir::Graph& graph,
-                                         const frontend::GGUFLoader& loader) {
-    ExecutionGraph exec;
+ModelConfig KernelScheduler::BuildModelConfig(const frontend::GGUFLoader& loader) {
     ModelConfig config;
-    config.num_layers = readSize(loader,
-                                 {"llama.block_count", "llama.layers", "n_layer"},
-                                 graph.nodes().size());
-    config.hidden_size = readSize(loader,
-                                  {"llama.embedding_length", "llama.n_embd", "n_embd"},
-                                  graph.tensors().empty() ? 0
-                                                          : std::abs(graph.tensors().front()->shape.empty()
-                                                                         ? 0
-                                                                         : graph.tensors().front()->shape[0]));
-    config.head_count = readSize(loader,
-                                 {"llama.attention.head_count", "attention.head_count"},
-                                 8);
-    config.kv_head_count = readSize(loader,
-                                    {"llama.attention.head_count_kv", "attention.head_count_kv"},
-                                    config.head_count);
-    config.context_length = readSize(loader,
-                                     {"llama.context_length", "context_length"},
-                                     128);
-    config.vocab_size = readSize(loader,
-                                 {"general.vocab_size", "tokenizer.ggml.vocab_size"},
-                                 0);
-    config.rotary_dim = readSize(loader,
-                                 {"llama.rope.dimension_count", "rope.dimension_count"},
-                                 0);
-    config.rope_freq_base = readFloat(loader,
-                                      {"llama.rope.freq_base", "rope.freq_base"},
-                                      10000.0f);
-    config.rope_freq_scale = readFloat(loader,
-                                       {"llama.rope.freq_scale", "rope.freq_scale"},
-                                       1.0f);
     config.architecture = readString(loader,
                                      {"general.architecture", "architecture"});
     config.family = detectFamily(config.architecture);
+    FamilyKeySet ks = keySetForFamily(config.family);
+    config.num_layers = readSize(loader, ks.block_count, 0);
+    config.hidden_size = readSize(loader, ks.hidden_size, 0);
+    config.head_count = readSize(loader, ks.head_count, 8);
+    config.kv_head_count = readSize(loader, ks.kv_head_count, config.head_count);
+    config.context_length = readSize(loader, ks.context_length, 128);
+    config.vocab_size = readSize(loader, ks.vocab_size, 0);
+    config.rotary_dim = readSize(loader, ks.rope_dim, 0);
+    config.rope_freq_base = readFloat(loader,
+                                      ks.rope_freq_base,
+                                      10000.0f);
+    config.rope_freq_scale = readFloat(loader,
+                                       ks.rope_freq_scale,
+                                       1.0f);
+    config.sliding_window = readSize(loader,
+                                     {"attention.sliding_window", "mistral.sliding_window"},
+                                     0);
+    config.activation = readString(loader,
+                                   {"activation_type", "model.activation_type"});
+    if (config.activation.empty() && config.family == ArchitectureFamily::Gemma) {
+        config.activation = "geglu";
+    } else if (config.activation.empty()) {
+        config.activation = "silu";
+    }
+    config.use_alibi = readBool(loader,
+                                {"attention.alibi", "alibi"},
+                                false);
+    if (config.use_alibi) {
+        config.alibi_slopes = generateAlibiSlopes(config.head_count > 0 ? config.head_count : 1);
+    }
     config.grouped_query_attention = config.kv_head_count > 0 && config.head_count > config.kv_head_count;
+    if (config.head_count > 0 && config.hidden_size > 0) {
+        config.head_dim = config.hidden_size / config.head_count;
+    }
+    return config;
+}
+
+ExecutionGraph KernelScheduler::Schedule(const ir::Graph& graph,
+                                         const frontend::GGUFLoader& loader) {
+    ExecutionGraph exec;
+    ModelConfig config = BuildModelConfig(loader);
+    if (config.num_layers == 0) {
+        config.num_layers = graph.nodes().size();
+    }
+    if (config.hidden_size == 0 && !graph.tensors().empty() && graph.tensors().front()) {
+        const auto* t = graph.tensors().front();
+        if (!t->shape.empty()) config.hidden_size = std::abs(t->shape[0]);
+        if (config.head_count > 0) config.head_dim = config.hidden_size / config.head_count;
+    }
     exec.setModelConfig(config);
 
     uint32_t quant_version = loader.quantizationVersion();
@@ -280,6 +419,11 @@ ExecutionGraph KernelScheduler::Schedule(const ir::Graph& graph,
     for (const ir::Node* node : graph.nodes()) {
         if (!node) continue;
         ExecOpType op = mapOp(node->kind);
+        if (op == ExecOpType::Unknown) {
+            // Skip utility nodes (e.g., reshape/token source) that do not map to runtime ops.
+            // Their tensors have already been registered above so downstream nodes can consume them.
+            continue;
+        }
         if (node->outputs.empty()) continue;
         std::vector<std::string> inputs;
         for (const ir::Tensor* input_tensor : node->activation_inputs) {
@@ -296,7 +440,7 @@ ExecutionGraph KernelScheduler::Schedule(const ir::Graph& graph,
             outputs.push_back(out->name);
         }
         if (outputs.empty()) continue;
-        BackendKind backend = selectBackend(op, node);
+        BackendKind backend = selectBackend(op, node, config);
         auto& exec_node = exec.addNode(node->name, op, inputs, outputs, backend);
         exec_node.attributes = node->attributes;
         for (const auto& [key, value] : node->metadata) {
@@ -317,6 +461,54 @@ ExecutionGraph KernelScheduler::Schedule(const ir::Graph& graph,
         if (op == ExecOpType::Attention) {
             exec_node.grouped_query = config.grouped_query_attention;
             exec_node.annotations["grouped_query"] = exec_node.grouped_query ? "true" : "false";
+
+            // Attach KV cache tensors (state) and core attention attributes.
+            std::string layer_tag;
+            auto it_layer = node->metadata.find("layer");
+            if (it_layer != node->metadata.end()) layer_tag = it_layer->second;
+            size_t layer_index = 0;
+            if (!layer_tag.empty()) {
+                try {
+                    layer_index = static_cast<size_t>(std::stoul(layer_tag));
+                } catch (...) {
+                    layer_index = 0;
+                }
+            }
+
+            size_t heads = config.head_count > 0 ? config.head_count : 1;
+            auto it_heads = node->metadata.find("heads");
+            if (it_heads != node->metadata.end()) {
+                try {
+                    heads = static_cast<size_t>(std::stoul(it_heads->second));
+                } catch (...) { /* keep default */ }
+            }
+            size_t kv_heads = config.kv_head_count > 0 ? config.kv_head_count : heads;
+            size_t head_dim = config.head_dim > 0 ? config.head_dim
+                                                  : (config.hidden_size > 0 && heads > 0
+                                                         ? config.hidden_size / heads
+                                                         : 1);
+            exec_node.attributes["heads"] = static_cast<float>(heads);
+            exec_node.attributes["kv_heads"] = static_cast<float>(kv_heads);
+            exec_node.attributes["head_dim"] = static_cast<float>(head_dim);
+
+            auto add_cache = [&](const std::string& base) -> std::string {
+                std::ostringstream oss;
+                oss << base << "." << layer_index;
+                std::string name = oss.str();
+                auto& t = exec.addTensor(name,
+                                         {static_cast<int64_t>(kv_heads),
+                                          static_cast<int64_t>(config.context_length),
+                                          static_cast<int64_t>(head_dim)},
+                                         ir::DataType::F32);
+                t.is_state = true;
+                t.metadata["role"] = "kv_cache";
+                t.metadata["layer"] = std::to_string(layer_index);
+                return name;
+            };
+            std::string cache_k = add_cache("kv_cache_k");
+            std::string cache_v = add_cache("kv_cache_v");
+            exec_node.annotations["kv_cache_k"] = cache_k;
+            exec_node.annotations["kv_cache_v"] = cache_v;
         }
 
         KernelSelectionQuery query = buildQuery(exec_node, backend, config);

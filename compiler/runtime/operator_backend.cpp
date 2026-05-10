@@ -6,6 +6,7 @@
 #include <sstream>
 #include <vector>
 #include "runtime/attention_cpu.hpp"
+#include "runtime/execution_context.hpp"
 #include "runtime/metal_runtime.hpp"
 #include "runtime/quant_utils.hpp"
 #if defined(__AVX2__) || defined(__AVX512F__)
@@ -23,6 +24,17 @@ namespace runtime {
 
 namespace {
 
+bool loadMask(const ExecutionNode& node,
+              ExecutionContext* context,
+              std::vector<float>& mask) {
+    auto it = node.annotations.find("attention_mask");
+    if (it == node.annotations.end()) return false;
+    const auto* tensor = context ? context->getTensor(it->second) : nullptr;
+    if (!tensor) return false;
+    mask = *tensor;
+    return true;
+}
+
 std::string getAnnotation(const ExecutionNode& node, const std::string& key) {
     auto it = node.annotations.find(key);
     if (it == node.annotations.end()) return {};
@@ -31,6 +43,35 @@ std::string getAnnotation(const ExecutionNode& node, const std::string& key) {
 
 float silu(float x) {
     return x / (1.0f + std::exp(-x));
+}
+
+float gelu(float x) {
+    const float kAlpha = std::sqrt(2.0f / static_cast<float>(M_PI));
+    return 0.5f * x * (1.0f + std::tanh(kAlpha * (x + 0.044715f * x * x * x)));
+}
+
+bool buildAlibiMask(const ExecutionContext* context,
+                    const ExecutionNode& node,
+                    std::vector<float>& mask) {
+    if (!context || !context->graph()) return false;
+    const auto& cfg = context->graph()->modelConfig();
+    if (cfg.sliding_window > 0) return false; // sliding window handled elsewhere
+    std::string cache_k_name = getAnnotation(node, "kv_cache_k");
+    const ExecutionTensor* cache_info = context->tensorInfo(cache_k_name);
+    size_t context_length = cache_info && cache_info->shape.size() >= 2
+                                ? static_cast<size_t>(cache_info->shape[1])
+                                : 0;
+    if (context_length == 0) return false;
+    if (cfg.alibi_slopes.empty()) return false;
+    size_t heads = cfg.head_count > 0 ? cfg.head_count : cfg.alibi_slopes.size();
+    mask.assign(heads * context_length, 0.0f);
+    for (size_t h = 0; h < heads && h < cfg.alibi_slopes.size(); ++h) {
+        float slope = cfg.alibi_slopes[h];
+        for (size_t t = 0; t < context_length; ++t) {
+            mask[h * context_length + t] = slope * static_cast<float>(t);
+        }
+    }
+    return true;
 }
 
 #if defined(__APPLE__)
@@ -83,6 +124,32 @@ void rmsNorm(const std::vector<float>& input,
     for (size_t i = 0; i < n; ++i) {
         float gamma = i < weight.size() ? weight[i] : 1.0f;
         output[i] = input[i] * inv * gamma;
+    }
+}
+
+void layerNorm(const std::vector<float>& input,
+               const std::vector<float>& weight,
+               std::vector<float>& output,
+               float epsilon = 1e-5f) {
+    size_t n = input.size();
+    if (n == 0) {
+        output.clear();
+        return;
+    }
+    if (output.size() != n) output.assign(n, 0.0f);
+    float sum = 0.0f;
+    for (float v : input) sum += v;
+    float mean = sum / static_cast<float>(n);
+    float var = 0.0f;
+    for (float v : input) {
+        float d = v - mean;
+        var += d * d;
+    }
+    var /= static_cast<float>(std::max<size_t>(1, n));
+    float inv_std = 1.0f / std::sqrt(var + epsilon);
+    for (size_t i = 0; i < n; ++i) {
+        float gamma = i < weight.size() ? weight[i] : 1.0f;
+        output[i] = (input[i] - mean) * inv_std * gamma;
     }
 }
 
@@ -158,6 +225,40 @@ bool decodeCacheTensor(const ExecutionTensor* info,
         storage->raw_data.resize(required, 0);
     }
     result.buffer.resize(elements);
+#if defined(__APPLE__)
+    // Try GPU dequant when Metal is available for supported formats.
+    if (MetalExecutor::Instance().isAvailable()) {
+        bool ok = false;
+        const size_t cols = result.head_dim * rows;
+        switch (storage->dtype) {
+        case frontend::GGML_TYPE_Q4_0:
+            ok = MetalExecutor::Instance().dequantQ4Block(storage->raw_data, cols, result.buffer);
+            break;
+        case frontend::GGML_TYPE_Q4_1:
+            ok = MetalExecutor::Instance().dequantQ4_1Block(storage->raw_data, cols, result.buffer);
+            break;
+        case frontend::GGML_TYPE_Q5_0:
+            ok = MetalExecutor::Instance().dequantQ5_0Block(storage->raw_data, cols, result.buffer);
+            break;
+        case frontend::GGML_TYPE_Q5_1:
+            ok = MetalExecutor::Instance().dequantQ5_1Block(storage->raw_data, cols, result.buffer);
+            break;
+        case frontend::GGML_TYPE_Q8_0:
+            ok = MetalExecutor::Instance().dequantQ8Block(storage->raw_data, cols, result.buffer);
+            break;
+        case frontend::GGML_TYPE_Q8_1:
+            ok = MetalExecutor::Instance().dequantQ8_1Block(storage->raw_data, cols, result.buffer);
+            break;
+        default:
+            break;
+        }
+        if (ok) {
+            result.data = &result.buffer;
+            result.owns_buffer = true;
+            return true;
+        }
+    }
+#endif
     const uint8_t* ptr = storage->raw_data.data();
     for (size_t row = 0; row < rows; ++row) {
         dequantizeRowTo(ptr + row * stride,
@@ -286,6 +387,8 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             const std::vector<float>* input = fetchInput(*context, node, 0, result);
             if (!result.success) return result;
             std::string weight_name = getAnnotation(node, "weight");
+            std::string bias_name = getAnnotation(node, "bias");
+            std::string norm_kind = getAnnotation(node, "norm_kind");
             if (weight_name.empty()) {
                 if (!node.outputs.empty()) context->setTensor(node.outputs[0], *input);
                 result.message = "norm-pass";
@@ -293,9 +396,18 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             }
             try {
                 const auto& weight = context->getParameter(weight_name);
+                const std::vector<float>* bias_ptr = nullptr;
+                if (!bias_name.empty()) {
+                    bias_ptr = &context->getParameter(bias_name);
+                    if (bias_ptr->size() != input->size()) {
+                        result.success = false;
+                        result.message = "LayerNorm bias size mismatch";
+                        return result;
+                    }
+                }
                 std::vector<float> output(input->size(), 0.0f);
 #if defined(__APPLE__)
-                if (input->size() >= 32) {
+                if (norm_kind != "layer" && input->size() >= 32) {
                     float mean_sq = 0.0f;
                     vDSP_measqv(input->data(), 1, &mean_sq, input->size());
                     float inv = 1.0f / std::sqrt(mean_sq + 1e-5f);
@@ -311,11 +423,20 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                     return result;
                 }
 #endif
-                rmsNorm(*input, weight, output);
+                if (norm_kind == "layer") {
+                    layerNorm(*input, weight, output);
+                    if (bias_ptr) {
+                        for (size_t i = 0; i < output.size(); ++i) {
+                            output[i] += (*bias_ptr)[i];
+                        }
+                    }
+                } else {
+                    rmsNorm(*input, weight, output);
+                }
                 if (!node.outputs.empty()) {
                     context->setTensor(node.outputs[0], std::move(output));
                 }
-                result.message = "rms-norm";
+                result.message = (norm_kind == "layer") ? "layer-norm" : "rms-norm";
             } catch (const std::exception& e) {
                 result.success = false;
                 result.message = e.what();
@@ -323,26 +444,193 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             return result;
         }
         case ExecOpType::FeedForward: {
-            if (node.inputs.size() < 2) {
+            // Two paths:
+            // - Legacy: gate/up provided as inputs.
+            // - Fused: single activation input and weights annotated as param0/param1(/param2).
+            std::vector<float> gate_storage;
+            std::vector<float> up_storage;
+            const std::vector<float>* gate = nullptr;
+            const std::vector<float>* up = nullptr;
+
+            auto computeLinear = [&](const std::string& weight_name,
+                                     const std::vector<float>& input) -> std::vector<float> {
+                const auto& loader = context->session().loader();
+                const auto& tensors = loader.tensors();
+                auto it = tensors.find(weight_name);
+                if (it == tensors.end()) {
+                    throw std::runtime_error("Weight tensor '" + weight_name + "' not found");
+                }
+                const auto& t = it->second;
+                if (t.shape.size() != 2) {
+                    throw std::runtime_error("Weight tensor '" + weight_name + "' must be 2D");
+                }
+                size_t rows = static_cast<size_t>(t.shape[0]);
+                size_t cols = static_cast<size_t>(t.shape[1]);
+                if (cols != input.size()) {
+                    throw std::runtime_error("Input size mismatch for '" + weight_name + "'");
+                }
+                const auto& raw = context->session().tensorData(t);
+                if (raw.empty()) {
+                    throw std::runtime_error("Weight tensor '" + weight_name + "' has no data");
+                }
+                std::vector<float> out(rows, 0.0f);
+                uint32_t qv = loader.quantizationVersion();
+                size_t stride = ggmlRowSizeBytes(t.dtype, cols, qv);
+                if (stride == 0) {
+                    stride = raw.size() / rows;
+                }
+                if (stride == 0 || raw.size() < stride * rows) {
+                    throw std::runtime_error("Weight tensor '" + weight_name + "' has inconsistent size");
+                }
+                // Fast dot products per row, using quant-specific kernels when available.
+                // For F32 we tile over columns to improve cache locality.
+                constexpr size_t kBlock = 128;
+                std::vector<float> tile_buffer;
+                tile_buffer.reserve(kBlock);
+                for (size_t r = 0; r < rows; ++r) {
+                    const uint8_t* row_ptr = raw.data() + r * stride;
+                    switch (t.dtype) {
+                        case frontend::GGML_TYPE_F32: {
+                            const float* w = reinterpret_cast<const float*>(row_ptr);
+                            float acc = 0.0f;
+                            size_t c = 0;
+                            for (; c + kBlock <= cols; c += kBlock) {
+                                // Manually unroll a small block to stay cache hot.
+                                for (size_t i = 0; i < kBlock; ++i) {
+                                    acc += w[c + i] * input[c + i];
+                                }
+                            }
+                            for (; c < cols; ++c) {
+                                acc += w[c] * input[c];
+                            }
+                            out[r] = acc;
+                            break;
+                        }
+                        case frontend::GGML_TYPE_Q4_0:
+                            out[r] = dotProductRowQ4_0(row_ptr, cols, qv, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q4_1:
+                            out[r] = dotProductRowQ4_1(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q5_0:
+                            out[r] = dotProductRowQ5_0(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q5_1:
+                            out[r] = dotProductRowQ5_1(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q8_0:
+                            out[r] = dotProductRowQ8_0(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q8_1:
+                            out[r] = dotProductRowQ8_1(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q2_K:
+                            out[r] = dotProductRowQ2_K(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q3_K:
+                            out[r] = dotProductRowQ3_K(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q4_K:
+                            out[r] = dotProductRowQ4_K(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q5_K:
+                            out[r] = dotProductRowQ5_K(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q6_K:
+                            out[r] = dotProductRowQ6_K(row_ptr, cols, input.data());
+                            break;
+                        case frontend::GGML_TYPE_Q8_K:
+                            out[r] = dotProductRowQ8_K(row_ptr, cols, input.data());
+                            break;
+                        default:
+                            throw std::runtime_error("Unsupported dtype in fused FFN");
+                    }
+                }
+                return out;
+            };
+
+            auto fetchBias = [&](const std::string& bias_name, size_t expected) -> std::vector<float> {
+                if (bias_name.empty()) return {};
+                // First look for a tensor already in the context (allows test injection).
+                if (context) {
+                    if (const auto* t = context->getTensor(bias_name)) {
+                        if (t->size() == expected) return *t;
+                        throw std::runtime_error("Bias tensor '" + bias_name + "' size mismatch");
+                    }
+                }
+                // Then try to load as a parameter (must be F32).
+                try {
+                    const auto& b = context->getParameter(bias_name);
+                    if (b.size() != expected) {
+                        throw std::runtime_error("Bias tensor '" + bias_name + "' size mismatch");
+                    }
+                    return b;
+                } catch (const std::exception&) {
+                    // Not found or wrong dtype; treat as absent.
+                    return {};
+                }
+            };
+
+            if (node.inputs.size() >= 2) {
+                gate = fetchInput(*context, node, 0, result);
+                if (!result.success) return result;
+                up = fetchInput(*context, node, 1, result);
+                if (!result.success) return result;
+            } else if (node.inputs.size() == 1 && context) {
+                const std::vector<float>* x = fetchInput(*context, node, 0, result);
+                if (!result.success) return result;
+                std::string w_gate = getAnnotation(node, "param0");
+                std::string w_up = getAnnotation(node, "param1");
+                std::string w_down = getAnnotation(node, "param2");
+                if (w_gate.empty() || w_up.empty()) {
+                    result.success = false;
+                    result.message = "FeedForward missing weight annotations for fused path";
+                    return result;
+                }
+                try {
+                    gate_storage = computeLinear(w_gate, *x);
+                    up_storage = computeLinear(w_up, *x);
+                    gate = &gate_storage;
+                    up = &up_storage;
+                } catch (const std::exception& e) {
+                    result.success = false;
+                    result.message = e.what();
+                    return result;
+                }
+            } else {
                 result.success = false;
                 result.message = "FeedForward node missing gate/up inputs";
                 return result;
             }
-            const std::vector<float>* gate = fetchInput(*context, node, 0, result);
-            if (!result.success) return result;
-            const std::vector<float>* up = fetchInput(*context, node, 1, result);
-            if (!result.success) return result;
-            if (gate->size() != up->size()) {
+
+            if (!gate || !up || gate->size() != up->size()) {
                 result.success = false;
                 result.message = "FeedForward input size mismatch";
                 return result;
+            }
+            std::string activation = "silu";
+            if (context && context->graph()) {
+                const auto& cfg = context->graph()->modelConfig();
+                activation = cfg.activation;
+                if (activation.empty()) {
+                    // Defaults per family.
+                    if (cfg.family == ArchitectureFamily::Gemma) {
+                        activation = "geglu";
+                    } else {
+                        activation = "silu";
+                    }
+                }
+                // normalize
+                std::transform(activation.begin(), activation.end(), activation.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
             }
             std::vector<float> mix(gate->size(), 0.0f);
 #if defined(__APPLE__)
             bool used_accelerate = false;
 #endif
 #if defined(__APPLE__)
-            if (gate->size() >= 32) {
+            if (activation == "silu" && gate->size() >= 32) {
                 std::vector<float> silu_values(gate->size());
                 if (siluAccelerate(*gate, silu_values)) {
                     vDSP_vmul(silu_values.data(), 1, up->data(), 1, mix.data(), 1, gate->size());
@@ -351,14 +639,41 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             }
             if (!used_accelerate) {
 #endif
-                for (size_t i = 0; i < mix.size(); ++i) {
-                    mix[i] = silu((*gate)[i]) * (*up)[i];
-                }
+                if (activation == "geglu" || activation == "gelu") {
+                    for (size_t i = 0; i < mix.size(); ++i) {
+                        mix[i] = gelu((*gate)[i]) * (*up)[i];
+                    }
+                } else { // default silu
+                    for (size_t i = 0; i < mix.size(); ++i) {
+                        mix[i] = silu((*gate)[i]) * (*up)[i];
+                    }
+            }
 #if defined(__APPLE__)
             }
 #endif
             if (!node.outputs.empty()) {
-                context->setTensor(node.outputs[0], std::move(mix));
+                std::string w_down = getAnnotation(node, "param2");
+                std::string bias_name = getAnnotation(node, "bias");
+                if (!w_down.empty() && context) {
+                    try {
+                        auto down = computeLinear(w_down, mix);
+                        if (!bias_name.empty()) {
+                            auto bias = fetchBias(bias_name, down.size());
+                            if (!bias.empty()) {
+                                for (size_t i = 0; i < down.size(); ++i) {
+                                    down[i] += bias[i];
+                                }
+                            }
+                        }
+                        context->setTensor(node.outputs[0], std::move(down));
+                    } catch (const std::exception& e) {
+                        result.success = false;
+                        result.message = e.what();
+                        return result;
+                    }
+                } else {
+                    context->setTensor(node.outputs[0], std::move(mix));
+                }
             }
             result.message =
 #if defined(__APPLE__)
@@ -381,6 +696,34 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             if (!result.success) return result;
             const std::vector<float>* v_new = fetchInput(*context, node, 2, result);
             if (!result.success) return result;
+
+            std::vector<float> mask;
+            bool has_mask = loadMask(node, context, mask);
+            if (!has_mask && context && context->graph()) {
+                const auto& cfg = context->graph()->modelConfig();
+                if (cfg.sliding_window > 0) {
+                    // Build a sliding-window mask: positions older than window get -inf.
+                    std::string cache_k_name = getAnnotation(node, "kv_cache_k");
+                    const ExecutionTensor* cache_info = context->tensorInfo(cache_k_name);
+                    size_t context_length = cache_info && cache_info->shape.size() >= 2
+                                                ? static_cast<size_t>(cache_info->shape[1])
+                                                : 0;
+                    size_t base_position = context->sequencePosition();
+                    if (context_length > 0) {
+                        mask.assign(context_length, 0.0f);
+                        const float neg_inf = -1e9f;
+                        for (size_t t = 0; t < context_length; ++t) {
+                            size_t dist = (base_position >= t) ? (base_position - t) : (context_length);
+                            if (dist > cfg.sliding_window) {
+                                mask[t] = neg_inf;
+                            }
+                        }
+                        has_mask = true;
+                    }
+                } else if (cfg.use_alibi || cfg.family == ArchitectureFamily::Mistral || cfg.family == ArchitectureFamily::Gemma) {
+                    has_mask = buildAlibiMask(context, node, mask);
+                }
+            }
 
             if (use_gpu && context) {
                 std::string cache_k_name = getAnnotation(node, "kv_cache_k");
@@ -419,15 +762,21 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                             }
                         }
                     }
-                    MetalBufferHandle* cache_k_handle = nullptr;
-                    MetalBufferHandle* cache_v_handle = nullptr;
+                    MetalExecutor::CacheDescriptor cache_k_desc;
+                    cache_k_desc.dtype = cache_k_storage ? cache_k_storage->dtype : frontend::GGML_TYPE_F32;
+                    cache_k_desc.quant_version = cache_k_storage ? cache_k_storage->quant_version : 1;
+                    cache_k_desc.row_stride_bytes = cache_k_storage ? cache_k_storage->row_stride_bytes : 0;
+                    cache_k_desc.raw_quant = cache_k_storage ? &cache_k_storage->raw_data : nullptr;
+                    cache_k_desc.float_data = cache_k_decoded.data;
+                    MetalExecutor::CacheDescriptor cache_v_desc;
+                    cache_v_desc.dtype = cache_v_storage ? cache_v_storage->dtype : frontend::GGML_TYPE_F32;
+                    cache_v_desc.quant_version = cache_v_storage ? cache_v_storage->quant_version : 1;
+                    cache_v_desc.row_stride_bytes = cache_v_storage ? cache_v_storage->row_stride_bytes : 0;
+                    cache_v_desc.raw_quant = cache_v_storage ? &cache_v_storage->raw_data : nullptr;
+                    cache_v_desc.float_data = cache_v_decoded.data;
 #if defined(__APPLE__)
-                    if (!cache_k_decoded.owns_buffer) {
-                        cache_k_handle = context->ensureMetalBuffer(cache_k_name, *cache_k_decoded.data);
-                    }
-                    if (!cache_v_decoded.owns_buffer) {
-                        cache_v_handle = context->ensureMetalBuffer(cache_v_name, *cache_v_decoded.data);
-                    }
+                    cache_k_desc.handle = context->ensureMetalBuffer(cache_k_name, *cache_k_decoded.data);
+                    cache_v_desc.handle = context->ensureMetalBuffer(cache_v_name, *cache_v_decoded.data);
 #endif
                     if (context_length > 0 && num_heads > 0 && head_dim > 0) {
                         std::vector<float> mask;
@@ -435,6 +784,13 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                         if (mask_it != node.annotations.end()) {
                             const auto* mask_tensor = context->getTensor(mask_it->second);
                             if (mask_tensor) mask = *mask_tensor;
+                        }
+                        const std::vector<float>* alibi_slopes = nullptr;
+                        if (mask.empty() && context && context->graph()) {
+                            const auto& cfg = context->graph()->modelConfig();
+                            if (cfg.use_alibi && !cfg.alibi_slopes.empty()) {
+                                alibi_slopes = &cfg.alibi_slopes;
+                            }
                         }
                         std::vector<float> gpu_out;
                         if (MetalExecutor::Instance().runAttention(
@@ -446,14 +802,13 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                                 head_dim,
                                 context_length,
                                 mask,
+                                alibi_slopes,
                                 position,
                                 rotary_dim,
                                 rope_freq_base,
                                 rope_freq_scale,
-                                *cache_k_decoded.data,
-                                *cache_v_decoded.data,
-                                cache_k_handle,
-                                cache_v_handle,
+                                cache_k_desc,
+                                cache_v_desc,
                                 gpu_out)) {
                             if (!node.outputs.empty()) {
                                 context->setTensor(node.outputs[0], std::move(gpu_out));
@@ -483,6 +838,16 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                 result.message = "Add operand size mismatch";
                 return result;
             }
+            std::string bias_name = getAnnotation(node, "bias");
+            const std::vector<float>* bias = nullptr;
+            if (!bias_name.empty()) {
+                bias = &context->getParameter(bias_name);
+                if (bias->size() != a->size()) {
+                    result.success = false;
+                    result.message = "Add bias size mismatch";
+                    return result;
+                }
+            }
             std::vector<float> sum(a->size());
 #if defined(__APPLE__)
             bool used_accelerate = false;
@@ -500,6 +865,11 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                 sum[i] = (*a)[i] + (*b)[i];
             }
 #endif
+            if (bias) {
+                for (size_t i = 0; i < sum.size(); ++i) {
+                    sum[i] += (*bias)[i];
+                }
+            }
             if (!node.outputs.empty()) {
                 context->setTensor(node.outputs[0], std::move(sum));
             }
@@ -589,17 +959,24 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                 CpuExecutionBackend cpu;
                 return cpu.execute(node, context, descriptor);
             }
-            if (w_it->second.shape[1] != input->size()) {
-                CpuExecutionBackend cpu;
-                return cpu.execute(node, context, descriptor);
-            }
             size_t rows = static_cast<size_t>(w_it->second.shape[0]);
+            size_t cols = static_cast<size_t>(w_it->second.shape[1]);
+            bool transpose_weight = false;
+            if (cols != input->size()) {
+                if (rows == input->size()) {
+                    transpose_weight = true;
+                } else {
+                    CpuExecutionBackend cpu;
+                    return cpu.execute(node, context, descriptor);
+                }
+            }
+            size_t out_rows = transpose_weight ? cols : rows;
             const std::vector<float>* bias_tensor = nullptr;
             std::string bias_name = getAnnotation(node, "bias");
             if (!bias_name.empty()) {
                 try {
                     const auto& bias = context->getParameter(bias_name);
-                    if (bias.size() != rows) {
+                    if (bias.size() != out_rows) {
                         CpuExecutionBackend cpu;
                         return cpu.execute(node, context, descriptor);
                     }
@@ -611,125 +988,191 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
             }
             std::vector<float> output;
             bool ok = false;
-            auto raw = context->session().loader().loadTensorData(w_it->second);
+            const auto& raw = context->session().tensorData(w_it->second);
             if (w_it->second.dtype == frontend::GGML_TYPE_F32) {
-                std::vector<float> weights(raw.size() / sizeof(float));
-                std::memcpy(weights.data(), raw.data(), raw.size());
-                ok = MetalExecutor::Instance().runMatMul(weights,
-                                                         *input,
-                                                         rows,
-                                                         static_cast<size_t>(w_it->second.shape[1]),
-                                                         false,
-                                                         output,
-                                                         bias_tensor);
+                if (transpose_weight) {
+                    ok = false;
+                } else {
+                    std::vector<float> weights(raw.size() / sizeof(float));
+                    std::memcpy(weights.data(), raw.data(), raw.size());
+                    ok = MetalExecutor::Instance().runMatMul(weights,
+                                                             *input,
+                                                             rows,
+                                                             cols,
+                                                             false,
+                                                             output,
+                                                             bias_tensor);
+                }
             } else {
                 size_t row_stride = raw.size() / rows;
                 switch (w_it->second.dtype) {
                     case frontend::GGML_TYPE_Q4_0:
-                        ok = MetalExecutor::Instance().runMatMulQ4_0(raw,
-                                                                     *input,
-                                                                     rows,
-                                                                     static_cast<size_t>(w_it->second.shape[1]),
-                                                                     row_stride,
-                                                                     context->session().loader().quantizationVersion(),
-                                                                     output,
-                                                                     bias_tensor);
+                        if (transpose_weight) {
+                            ok = MetalExecutor::Instance().runMatMulQ4_0Transposed(
+                                raw,
+                                *input,
+                                rows,
+                                cols,
+                                row_stride,
+                                context->session().loader().quantizationVersion(),
+                                output,
+                                bias_tensor);
+                        } else {
+                            ok = MetalExecutor::Instance().runMatMulQ4_0(
+                                raw,
+                                *input,
+                                rows,
+                                cols,
+                                row_stride,
+                                context->session().loader().quantizationVersion(),
+                                output,
+                                bias_tensor);
+                        }
                         break;
                     case frontend::GGML_TYPE_Q4_1:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ4_1(raw,
                                                                      *input,
                                                                      rows,
-                                                                     static_cast<size_t>(w_it->second.shape[1]),
+                                                                     cols,
                                                                      row_stride,
                                                                      output,
                                                                      bias_tensor);
                         break;
                     case frontend::GGML_TYPE_Q5_0:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ5_0(raw,
                                                                      *input,
                                                                      rows,
-                                                                     static_cast<size_t>(w_it->second.shape[1]),
+                                                                     cols,
                                                                      row_stride,
                                                                      output,
                                                                      bias_tensor);
                         break;
                     case frontend::GGML_TYPE_Q5_1:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ5_1(raw,
                                                                      *input,
                                                                      rows,
-                                                                     static_cast<size_t>(w_it->second.shape[1]),
+                                                                     cols,
                                                                      row_stride,
                                                                      output,
                                                                      bias_tensor);
                         break;
                     case frontend::GGML_TYPE_Q2_K:
-                        ok = MetalExecutor::Instance().runMatMulQ2K(raw,
-                                                                    *input,
-                                                                    rows,
-                                                                    static_cast<size_t>(w_it->second.shape[1]),
-                                                                    row_stride,
-                                                                    output,
-                                                                    bias_tensor);
+                        // Q2_K Metal path is currently inaccurate; fall back to CPU for correctness.
+                        ok = false;
                         break;
                     case frontend::GGML_TYPE_Q3_K:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ3K(raw,
                                                                     *input,
                                                                     rows,
-                                                                    static_cast<size_t>(w_it->second.shape[1]),
+                                                                    cols,
                                                                     row_stride,
                                                                     output,
                                                                     bias_tensor);
                         break;
                     case frontend::GGML_TYPE_Q4_K:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ4K(raw,
                                                                     *input,
                                                                     rows,
-                                                                    static_cast<size_t>(w_it->second.shape[1]),
+                                                                    cols,
                                                                     row_stride,
                                                                     output,
                                                                     bias_tensor);
                         break;
                     case frontend::GGML_TYPE_Q5_K:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ5K(raw,
                                                                     *input,
                                                                     rows,
-                                                                    static_cast<size_t>(w_it->second.shape[1]),
+                                                                    cols,
                                                                     row_stride,
                                                                     output,
                                                                     bias_tensor);
                         break;
-                    case frontend::GGML_TYPE_Q6_K:
+                    case frontend::GGML_TYPE_Q6_K: {
+                        static bool enable_q6k_transposed =
+                            (std::getenv("MLC_ENABLE_Q6K_TRANSPOSED_METAL") != nullptr);
+                        if (transpose_weight) {
+                            if (enable_q6k_transposed) {
+                                ok = MetalExecutor::Instance().runMatMulQ6KTransposed(
+                                    raw,
+                                    *input,
+                                    rows,
+                                    cols,
+                                    row_stride,
+                                    output,
+                                    bias_tensor);
+                            } else {
+                                ok = false;
+                            }
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ6K(raw,
                                                                     *input,
                                                                     rows,
-                                                                    static_cast<size_t>(w_it->second.shape[1]),
+                                                                    cols,
                                                                     row_stride,
                                                                     output,
                                                                     bias_tensor);
                         break;
+                    }
                     case frontend::GGML_TYPE_Q8_K:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ8K(raw,
                                                                     *input,
                                                                     rows,
-                                                                    static_cast<size_t>(w_it->second.shape[1]),
+                                                                    cols,
                                                                     row_stride,
                                                                     output,
                                                                     bias_tensor);
                         break;
                     case frontend::GGML_TYPE_Q8_0:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ8_0(raw,
                                                                      *input,
                                                                      rows,
-                                                                     static_cast<size_t>(w_it->second.shape[1]),
+                                                                     cols,
                                                                      row_stride,
                                                                      output,
                                                                      bias_tensor);
                         break;
                     case frontend::GGML_TYPE_Q8_1:
+                        if (transpose_weight) {
+                            ok = false;
+                            break;
+                        }
                         ok = MetalExecutor::Instance().runMatMulQ8_1(raw,
                                                                      *input,
                                                                      rows,
-                                                                     static_cast<size_t>(w_it->second.shape[1]),
+                                                                     cols,
                                                                      row_stride,
                                                                      output,
                                                                      bias_tensor);
@@ -773,21 +1216,40 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
             const std::vector<float>* input = fetchInput(*context, node, 0, result);
             if (!result.success) return result;
             std::string weight_name = getAnnotation(node, "weight");
+            std::string bias_name = getAnnotation(node, "bias");
+            std::string norm_kind = getAnnotation(node, "norm_kind");
             if (weight_name.empty()) {
                 CpuExecutionBackend cpu;
                 return cpu.execute(node, context, descriptor);
             }
             try {
                 const auto& weight = context->getParameter(weight_name);
+                const std::vector<float>* bias_ptr = nullptr;
+                if (!bias_name.empty()) {
+                    bias_ptr = &context->getParameter(bias_name);
+                    if (bias_ptr->size() != input->size()) {
+                        CpuExecutionBackend cpu;
+                        return cpu.execute(node, context, descriptor);
+                    }
+                }
                 std::vector<float> output;
-                if (!MetalExecutor::Instance().runRmsNorm(*input, weight, 1e-5f, output)) {
+                bool ok = false;
+                if (norm_kind == "layer") {
+                    ok = MetalExecutor::Instance().runLayerNorm(*input, weight, bias_ptr, 1e-5f, output);
+                } else {
+                    ok = MetalExecutor::Instance().runRmsNorm(*input, weight, 1e-5f, output);
+                    if (ok && bias_ptr) {
+                        for (size_t i = 0; i < output.size(); ++i) output[i] += (*bias_ptr)[i];
+                    }
+                }
+                if (!ok) {
                     CpuExecutionBackend cpu;
                     return cpu.execute(node, context, descriptor);
                 }
                 if (!node.outputs.empty()) {
                     context->setTensor(node.outputs[0], std::move(output));
                 }
-                result.message = "metal-norm";
+                result.message = (norm_kind == "layer") ? "metal-layer-norm" : "metal-norm";
                 return result;
             } catch (const std::exception&) {
                 CpuExecutionBackend cpu;
@@ -803,15 +1265,29 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                 CpuExecutionBackend cpu;
                 return cpu.execute(node, context, descriptor);
             }
+            std::string bias_name = getAnnotation(node, "bias");
+            const std::vector<float>* bias = nullptr;
+            if (!bias_name.empty()) {
+                try {
+                    bias = &context->getParameter(bias_name);
+                    if (bias->size() != a->size()) {
+                        CpuExecutionBackend cpu;
+                        return cpu.execute(node, context, descriptor);
+                    }
+                } catch (const std::exception&) {
+                    CpuExecutionBackend cpu;
+                    return cpu.execute(node, context, descriptor);
+                }
+            }
             std::vector<float> output;
-            if (!MetalExecutor::Instance().runAdd(*a, *b, output)) {
+            if (!MetalExecutor::Instance().runAdd(*a, *b, output, bias)) {
                 CpuExecutionBackend cpu;
                 return cpu.execute(node, context, descriptor);
             }
             if (!node.outputs.empty()) {
                 context->setTensor(node.outputs[0], std::move(output));
             }
-            result.message = "metal-add";
+            result.message = bias ? "metal-add-bias" : "metal-add";
             return result;
         }
         case ExecOpType::Softmax: {
@@ -838,6 +1314,11 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
 BackendRegistry::BackendRegistry() = default;
 
 const ExecutionBackend& BackendRegistry::backendFor(BackendKind kind) const {
+    static bool force_cpu = (std::getenv("MLC_FORCE_CPU") != nullptr);
+    if (force_cpu) {
+        return cpu_backend_;
+    }
+
     switch (kind) {
         case BackendKind::CPU:
             return cpu_backend_;
@@ -845,6 +1326,10 @@ const ExecutionBackend& BackendRegistry::backendFor(BackendKind kind) const {
             return metal_backend_;
         case BackendKind::Auto:
         default:
+            // Prefer Metal when available; fall back to CPU otherwise.
+            if (MetalExecutor::Instance().isAvailable()) {
+                return metal_backend_;
+            }
             return cpu_backend_;
     }
 }

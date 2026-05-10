@@ -190,17 +190,24 @@ inline size_t numBlocks(size_t cols, size_t block_elems) {
 
 void decodeV1(const uint8_t* src, size_t cols, float* dst) {
     const BlockQ4_0_V1* blocks = reinterpret_cast<const BlockQ4_0_V1*>(src);
-    size_t out = 0;
     size_t nb = numBlocks(cols);
-    for (size_t b = 0; b < nb && out < cols; ++b) {
+    for (size_t b = 0; b < nb; ++b) {
+        size_t block_base = b * QK4_0;
+        if (block_base >= cols) {
+            break;
+        }
         float d = fp16ToFloat(blocks[b].d);
-        for (size_t j = 0; j < QK4_0 / 2 && out < cols; ++j) {
+        for (size_t j = 0; j < QK4_0 / 2; ++j) {
             uint8_t byte = blocks[b].qs[j];
             int8_t lo = static_cast<int8_t>(byte & 0x0F) - 8;
             int8_t hi = static_cast<int8_t>((byte >> 4) & 0x0F) - 8;
-            dst[out++] = d * static_cast<float>(lo);
-            if (out < cols) {
-                dst[out++] = d * static_cast<float>(hi);
+            size_t i0 = block_base + j;
+            size_t i1 = block_base + j + QK4_0 / 2;
+            if (i0 < cols) {
+                dst[i0] = d * static_cast<float>(lo);
+            }
+            if (i1 < cols) {
+                dst[i1] = d * static_cast<float>(hi);
             }
         }
     }
@@ -237,17 +244,24 @@ float dotProductRowQ4_0(const uint8_t* src,
     (void)quant_version;
     const BlockQ4_0_V1* blocks = reinterpret_cast<const BlockQ4_0_V1*>(src);
     size_t nb = numBlocks(cols);
-    size_t idx = 0;
     float acc = 0.0f;
-    for (size_t b = 0; b < nb && idx < cols; ++b) {
+    for (size_t b = 0; b < nb; ++b) {
+        size_t block_base = b * QK4_0;
+        if (block_base >= cols) {
+            break;
+        }
         float d = fp16ToFloat(blocks[b].d);
-        for (size_t j = 0; j < QK4_0 / 2 && idx < cols; ++j) {
+        for (size_t j = 0; j < QK4_0 / 2; ++j) {
             uint8_t byte = blocks[b].qs[j];
             int8_t lo = static_cast<int8_t>(byte & 0x0F) - 8;
-            acc += d * static_cast<float>(lo) * vec[idx++];
-            if (idx < cols) {
-                int8_t hi = static_cast<int8_t>((byte >> 4) & 0x0F) - 8;
-                acc += d * static_cast<float>(hi) * vec[idx++];
+            int8_t hi = static_cast<int8_t>((byte >> 4) & 0x0F) - 8;
+            size_t i0 = block_base + j;
+            size_t i1 = block_base + j + QK4_0 / 2;
+            if (i0 < cols) {
+                acc += d * static_cast<float>(lo) * vec[i0];
+            }
+            if (i1 < cols) {
+                acc += d * static_cast<float>(hi) * vec[i1];
             }
         }
     }
@@ -267,24 +281,31 @@ void quantizeRowQ4_0(const float* src,
         const float* block = src + idx;
         size_t block_size = std::min<size_t>(QK4_0, cols - idx);
         float max_abs = 0.0f;
+        float max_val = 0.0f;
         for (size_t i = 0; i < block_size; ++i) {
-            max_abs = std::max(max_abs, std::fabs(block[i]));
+            float v = block[i];
+            float abs_v = std::fabs(v);
+            if (abs_v > max_abs) {
+                max_abs = abs_v;
+                max_val = v;
+            }
         }
-        float scale = max_abs / 7.0f;
-        if (scale == 0.0f) scale = 1e-8f;
+        float scale = max_val / -8.0f;
+        float inv_scale = (scale != 0.0f) ? (1.0f / scale) : 0.0f;
         uint16_t fp = floatToFp16(scale);
         uint8_t* block_out = out + b * row_stride;
         reinterpret_cast<uint16_t*>(block_out)[0] = fp;
         uint8_t* qs = block_out + 2;
-        for (size_t i = 0; i < block_size; i += 2) {
-            int8_t q0 = static_cast<int8_t>(std::round(block[i] / scale));
-            q0 = std::max<int8_t>(-8, std::min<int8_t>(7, q0));
-            int8_t q1 = 0;
-            if (i + 1 < block_size) {
-                q1 = static_cast<int8_t>(std::round(block[i + 1] / scale));
-                q1 = std::max<int8_t>(-8, std::min<int8_t>(7, q1));
-            }
-            qs[i / 2] = (static_cast<uint8_t>(q1 & 0xF) << 4) | (static_cast<uint8_t>(q0) & 0xF);
+        for (size_t j = 0; j < QK4_0 / 2; ++j) {
+            size_t i0 = j;
+            size_t i1 = j + QK4_0 / 2;
+            float x0 = (i0 < block_size) ? block[i0] * inv_scale : 0.0f;
+            float x1 = (i1 < block_size) ? block[i1] * inv_scale : 0.0f;
+            int qi0 = static_cast<int>(x0 + 8.5f);
+            int qi1 = static_cast<int>(x1 + 8.5f);
+            qi0 = clampValue(qi0, 0, 15);
+            qi1 = clampValue(qi1, 0, 15);
+            qs[j] = static_cast<uint8_t>((qi1 << 4) | qi0);
         }
         idx += block_size;
     }
@@ -297,18 +318,25 @@ size_t q4_1RowSize(size_t cols) {
 
 void dequantizeRowQ4_1(const uint8_t* src, size_t cols, float* dst) {
     const BlockQ4_1* blocks = reinterpret_cast<const BlockQ4_1*>(src);
-    size_t out = 0;
     size_t nb = (cols + QK4_1 - 1) / QK4_1;
-    for (size_t b = 0; b < nb && out < cols; ++b) {
+    for (size_t b = 0; b < nb; ++b) {
+        size_t block_base = b * QK4_1;
+        if (block_base >= cols) {
+            break;
+        }
         float d = fp16ToFloat(blocks[b].d);
         float m = fp16ToFloat(blocks[b].m);
-        for (size_t j = 0; j < QK4_1 / 2 && out < cols; ++j) {
+        for (size_t j = 0; j < QK4_1 / 2; ++j) {
             uint8_t byte = blocks[b].qs[j];
             int x0 = (byte & 0x0F);
             int x1 = (byte >> 4);
-            dst[out++] = x0 * d + m;
-            if (out < cols) {
-                dst[out++] = x1 * d + m;
+            size_t i0 = block_base + j;
+            size_t i1 = block_base + j + QK4_1 / 2;
+            if (i0 < cols) {
+                dst[i0] = x0 * d + m;
+            }
+            if (i1 < cols) {
+                dst[i1] = x1 * d + m;
             }
         }
     }
@@ -319,18 +347,25 @@ float dotProductRowQ4_1(const uint8_t* src,
                         const float* vec) {
     const BlockQ4_1* blocks = reinterpret_cast<const BlockQ4_1*>(src);
     size_t nb = (cols + QK4_1 - 1) / QK4_1;
-    size_t idx = 0;
     float acc = 0.0f;
-    for (size_t b = 0; b < nb && idx < cols; ++b) {
+    for (size_t b = 0; b < nb; ++b) {
+        size_t block_base = b * QK4_1;
+        if (block_base >= cols) {
+            break;
+        }
         float d = fp16ToFloat(blocks[b].d);
         float m = fp16ToFloat(blocks[b].m);
-        for (size_t j = 0; j < QK4_1 / 2 && idx < cols; ++j) {
+        for (size_t j = 0; j < QK4_1 / 2; ++j) {
             uint8_t byte = blocks[b].qs[j];
             int x0 = byte & 0x0F;
-            acc += (x0 * d + m) * vec[idx++];
-            if (idx < cols) {
-                int x1 = byte >> 4;
-                acc += (x1 * d + m) * vec[idx++];
+            int x1 = byte >> 4;
+            size_t i0 = block_base + j;
+            size_t i1 = block_base + j + QK4_1 / 2;
+            if (i0 < cols) {
+                acc += (x0 * d + m) * vec[i0];
+            }
+            if (i1 < cols) {
+                acc += (x1 * d + m) * vec[i1];
             }
         }
     }
@@ -360,21 +395,20 @@ void quantizeRowQ4_1(const float* src,
             maxv = std::max(maxv, v);
         }
         float d = (maxv - minv) / 15.0f;
-        if (d < kEpsilon) d = kEpsilon;
+        float inv_d = (d != 0.0f) ? (1.0f / d) : 0.0f;
         out[b].d = floatToFp16(d);
         out[b].m = floatToFp16(minv);
         std::memset(out[b].qs, 0, sizeof(out[b].qs));
-        for (size_t i = 0; i < block_size; i += 2) {
-            float v0 = (src[idx + i] - minv) / d;
-            uint8_t q0 = static_cast<uint8_t>(std::round(v0));
-            q0 = clampValue<uint8_t>(q0, 0, 15);
-            uint8_t q1 = 0;
-            if (i + 1 < block_size) {
-                float v1 = (src[idx + i + 1] - minv) / d;
-                q1 = static_cast<uint8_t>(std::round(v1));
-                q1 = clampValue<uint8_t>(q1, 0, 15);
-            }
-            out[b].qs[i / 2] = static_cast<uint8_t>((q1 << 4) | q0);
+        for (size_t j = 0; j < QK4_1 / 2; ++j) {
+            size_t i0 = j;
+            size_t i1 = j + QK4_1 / 2;
+            float x0 = (i0 < block_size) ? (src[idx + i0] - minv) * inv_d : 0.0f;
+            float x1 = (i1 < block_size) ? (src[idx + i1] - minv) * inv_d : 0.0f;
+            int qi0 = static_cast<int>(x0 + 0.5f);
+            int qi1 = static_cast<int>(x1 + 0.5f);
+            qi0 = clampValue(qi0, 0, 15);
+            qi1 = clampValue(qi1, 0, 15);
+            out[b].qs[j] = static_cast<uint8_t>((qi1 << 4) | qi0);
         }
         idx += block_size;
     }
@@ -387,21 +421,28 @@ size_t q5_0RowSize(size_t cols) {
 
 void dequantizeRowQ5_0(const uint8_t* src, size_t cols, float* dst) {
     const BlockQ5_0* blocks = reinterpret_cast<const BlockQ5_0*>(src);
-    size_t out = 0;
     size_t nb = (cols + QK5_0 - 1) / QK5_0;
-    for (size_t b = 0; b < nb && out < cols; ++b) {
+    for (size_t b = 0; b < nb; ++b) {
+        size_t block_base = b * QK5_0;
+        if (block_base >= cols) {
+            break;
+        }
         float d = fp16ToFloat(blocks[b].d);
         uint32_t qh;
         std::memcpy(&qh, blocks[b].qh, sizeof(qh));
-        for (size_t j = 0; j < QK5_0 / 2 && out < cols; ++j) {
+        for (size_t j = 0; j < QK5_0 / 2; ++j) {
             uint8_t byte = blocks[b].qs[j];
-            uint8_t xh0 = ((qh >> (j + 0)) << 4) & 0x10;
-            uint8_t xh1 = ((qh >> (j + 12))     ) & 0x10;
+            uint8_t xh0 = static_cast<uint8_t>(((qh >> (j + 0)) & 0x1) << 4);
+            uint8_t xh1 = static_cast<uint8_t>(((qh >> (j + QK5_0 / 2)) & 0x1) << 4);
             int x0 = (byte & 0x0F) | xh0;
             int x1 = (byte >> 4) | xh1;
-            dst[out++] = (x0 - 16) * d;
-            if (out < cols) {
-                dst[out++] = (x1 - 16) * d;
+            size_t i0 = block_base + j;
+            size_t i1 = block_base + j + QK5_0 / 2;
+            if (i0 < cols) {
+                dst[i0] = (x0 - 16) * d;
+            }
+            if (i1 < cols) {
+                dst[i1] = (x1 - 16) * d;
             }
         }
     }
@@ -411,22 +452,29 @@ float dotProductRowQ5_0(const uint8_t* src,
                         size_t cols,
                         const float* vec) {
     const BlockQ5_0* blocks = reinterpret_cast<const BlockQ5_0*>(src);
-    size_t idx = 0;
     size_t nb = (cols + QK5_0 - 1) / QK5_0;
     float acc = 0.0f;
-    for (size_t b = 0; b < nb && idx < cols; ++b) {
+    for (size_t b = 0; b < nb; ++b) {
+        size_t block_base = b * QK5_0;
+        if (block_base >= cols) {
+            break;
+        }
         float d = fp16ToFloat(blocks[b].d);
         uint32_t qh;
         std::memcpy(&qh, blocks[b].qh, sizeof(qh));
-        for (size_t j = 0; j < QK5_0 / 2 && idx < cols; ++j) {
+        for (size_t j = 0; j < QK5_0 / 2; ++j) {
             uint8_t byte = blocks[b].qs[j];
-            uint8_t xh0 = ((qh >> (j + 0)) << 4) & 0x10;
-            uint8_t xh1 = ((qh >> (j + 12))     ) & 0x10;
+            uint8_t xh0 = static_cast<uint8_t>(((qh >> (j + 0)) & 0x1) << 4);
+            uint8_t xh1 = static_cast<uint8_t>(((qh >> (j + QK5_0 / 2)) & 0x1) << 4);
             int x0 = ((byte & 0x0F) | xh0) - 16;
-            acc += static_cast<float>(x0) * d * vec[idx++];
-            if (idx < cols) {
-                int x1 = ((byte >> 4) | xh1) - 16;
-                acc += static_cast<float>(x1) * d * vec[idx++];
+            int x1 = ((byte >> 4) | xh1) - 16;
+            size_t i0 = block_base + j;
+            size_t i1 = block_base + j + QK5_0 / 2;
+            if (i0 < cols) {
+                acc += static_cast<float>(x0) * d * vec[i0];
+            }
+            if (i1 < cols) {
+                acc += static_cast<float>(x1) * d * vec[i1];
             }
         }
     }
@@ -443,28 +491,34 @@ void quantizeRowQ5_0(const float* src,
     for (size_t b = 0; b < blocks; ++b) {
         size_t block_size = std::min(QK5_0, cols - idx);
         float max_abs = 0.0f;
+        float max_val = 0.0f;
         for (size_t i = 0; i < block_size; ++i) {
-            max_abs = std::max(max_abs, std::fabs(src[idx + i]));
+            float v = src[idx + i];
+            float abs_v = std::fabs(v);
+            if (abs_v > max_abs) {
+                max_abs = abs_v;
+                max_val = v;
+            }
         }
-        float d = max_abs / 16.0f;
-        if (d < kEpsilon) d = kEpsilon;
+        float d = max_val / -16.0f;
+        float inv_d = (d != 0.0f) ? (1.0f / d) : 0.0f;
         out[b].d = floatToFp16(d);
         std::memset(out[b].qs, 0, sizeof(out[b].qs));
         uint32_t qh = 0;
         for (size_t j = 0; j < QK5_0 / 2; ++j) {
             size_t i0 = j;
             size_t i1 = j + QK5_0 / 2;
-            float v0 = (i0 < block_size) ? src[idx + i0] / d : 0.0f;
-            float v1 = (i1 < block_size) ? src[idx + i1] / d : 0.0f;
-            int qi0 = static_cast<int>(std::round(v0)) + 16;
-            int qi1 = static_cast<int>(std::round(v1)) + 16;
+            float x0 = (i0 < block_size) ? src[idx + i0] * inv_d : 0.0f;
+            float x1 = (i1 < block_size) ? src[idx + i1] * inv_d : 0.0f;
+            int qi0 = static_cast<int>(x0 + 16.5f);
+            int qi1 = static_cast<int>(x1 + 16.5f);
             qi0 = clampValue(qi0, 0, 31);
             qi1 = clampValue(qi1, 0, 31);
             uint8_t nib0 = static_cast<uint8_t>(qi0 & 0x0F);
             uint8_t nib1 = static_cast<uint8_t>(qi1 & 0x0F);
             out[b].qs[j] = static_cast<uint8_t>(nib0 | (nib1 << 4));
-            if (qi0 & 0x10) qh |= (1u << (j + 0));
-            if (qi1 & 0x10) qh |= (1u << (j + QK5_0 / 2));
+            qh |= ((qi0 & 0x10u) >> 4) << (j + 0);
+            qh |= ((qi1 & 0x10u) >> 4) << (j + QK5_0 / 2);
         }
         std::memcpy(out[b].qh, &qh, sizeof(qh));
         idx += block_size;
@@ -478,22 +532,29 @@ size_t q5_1RowSize(size_t cols) {
 
 void dequantizeRowQ5_1(const uint8_t* src, size_t cols, float* dst) {
     const BlockQ5_1* blocks = reinterpret_cast<const BlockQ5_1*>(src);
-    size_t out = 0;
     size_t nb = (cols + QK5_1 - 1) / QK5_1;
-    for (size_t b = 0; b < nb && out < cols; ++b) {
+    for (size_t b = 0; b < nb; ++b) {
+        size_t block_base = b * QK5_1;
+        if (block_base >= cols) {
+            break;
+        }
         float d = fp16ToFloat(blocks[b].d);
         float m = fp16ToFloat(blocks[b].m);
         uint32_t qh;
         std::memcpy(&qh, blocks[b].qh, sizeof(qh));
-        for (size_t j = 0; j < QK5_1 / 2 && out < cols; ++j) {
+        for (size_t j = 0; j < QK5_1 / 2; ++j) {
             uint8_t byte = blocks[b].qs[j];
-            uint8_t xh0 = ((qh >> (j + 0)) << 4) & 0x10;
-            uint8_t xh1 = ((qh >> (j + 12))     ) & 0x10;
+            uint8_t xh0 = static_cast<uint8_t>(((qh >> (j + 0)) & 0x1) << 4);
+            uint8_t xh1 = static_cast<uint8_t>(((qh >> (j + QK5_1 / 2)) & 0x1) << 4);
             int x0 = ((byte & 0x0F) | xh0);
             int x1 = ((byte >> 4) | xh1);
-            dst[out++] = x0 * d + m;
-            if (out < cols) {
-                dst[out++] = x1 * d + m;
+            size_t i0 = block_base + j;
+            size_t i1 = block_base + j + QK5_1 / 2;
+            if (i0 < cols) {
+                dst[i0] = x0 * d + m;
+            }
+            if (i1 < cols) {
+                dst[i1] = x1 * d + m;
             }
         }
     }
@@ -503,23 +564,30 @@ float dotProductRowQ5_1(const uint8_t* src,
                         size_t cols,
                         const float* vec) {
     const BlockQ5_1* blocks = reinterpret_cast<const BlockQ5_1*>(src);
-    size_t idx = 0;
     size_t nb = (cols + QK5_1 - 1) / QK5_1;
     float acc = 0.0f;
-    for (size_t b = 0; b < nb && idx < cols; ++b) {
+    for (size_t b = 0; b < nb; ++b) {
+        size_t block_base = b * QK5_1;
+        if (block_base >= cols) {
+            break;
+        }
         float d = fp16ToFloat(blocks[b].d);
         float m = fp16ToFloat(blocks[b].m);
         uint32_t qh;
         std::memcpy(&qh, blocks[b].qh, sizeof(qh));
-        for (size_t j = 0; j < QK5_1 / 2 && idx < cols; ++j) {
+        for (size_t j = 0; j < QK5_1 / 2; ++j) {
             uint8_t byte = blocks[b].qs[j];
-            uint8_t xh0 = ((qh >> (j + 0)) << 4) & 0x10;
-            uint8_t xh1 = ((qh >> (j + 12))     ) & 0x10;
+            uint8_t xh0 = static_cast<uint8_t>(((qh >> (j + 0)) & 0x1) << 4);
+            uint8_t xh1 = static_cast<uint8_t>(((qh >> (j + QK5_1 / 2)) & 0x1) << 4);
             int x0 = ((byte & 0x0F) | xh0);
-            acc += (x0 * d + m) * vec[idx++];
-            if (idx < cols) {
-                int x1 = ((byte >> 4) | xh1);
-                acc += (x1 * d + m) * vec[idx++];
+            int x1 = ((byte >> 4) | xh1);
+            size_t i0 = block_base + j;
+            size_t i1 = block_base + j + QK5_1 / 2;
+            if (i0 < cols) {
+                acc += (x0 * d + m) * vec[i0];
+            }
+            if (i1 < cols) {
+                acc += (x1 * d + m) * vec[i1];
             }
         }
     }
@@ -550,7 +618,7 @@ void quantizeRowQ5_1(const float* src,
             maxv = std::max(maxv, v);
         }
         float d = (maxv - minv) / 31.0f;
-        if (d < kEpsilon) d = kEpsilon;
+        float inv_d = (d != 0.0f) ? (1.0f / d) : 0.0f;
         out[b].d = floatToFp16(d);
         out[b].m = floatToFp16(minv);
         std::memset(out[b].qs, 0, sizeof(out[b].qs));
@@ -558,15 +626,17 @@ void quantizeRowQ5_1(const float* src,
         for (size_t j = 0; j < QK5_1 / 2; ++j) {
             size_t i0 = j;
             size_t i1 = j + QK5_1 / 2;
-            float v0 = (i0 < block_size) ? (src[idx + i0] - minv) / d : 0.0f;
-            float v1 = (i1 < block_size) ? (src[idx + i1] - minv) / d : 0.0f;
-            int qi0 = clampValue(static_cast<int>(std::round(v0)), 0, 31);
-            int qi1 = clampValue(static_cast<int>(std::round(v1)), 0, 31);
+            float x0 = (i0 < block_size) ? (src[idx + i0] - minv) * inv_d : 0.0f;
+            float x1 = (i1 < block_size) ? (src[idx + i1] - minv) * inv_d : 0.0f;
+            int qi0 = static_cast<int>(x0 + 0.5f);
+            int qi1 = static_cast<int>(x1 + 0.5f);
+            qi0 = clampValue(qi0, 0, 31);
+            qi1 = clampValue(qi1, 0, 31);
             uint8_t nib0 = static_cast<uint8_t>(qi0 & 0x0F);
             uint8_t nib1 = static_cast<uint8_t>(qi1 & 0x0F);
             out[b].qs[j] = static_cast<uint8_t>(nib0 | (nib1 << 4));
-            if (qi0 & 0x10) qh |= (1u << (j + 0));
-            if (qi1 & 0x10) qh |= (1u << (j + QK5_1 / 2));
+            qh |= ((qi0 & 0x10u) >> 4) << (j + 0);
+            qh |= ((qi1 & 0x10u) >> 4) << (j + QK5_1 / 2);
         }
         std::memcpy(out[b].qh, &qh, sizeof(qh));
         idx += block_size;
@@ -1132,35 +1202,17 @@ void dequantizeRowQ4_K(const uint8_t* src, size_t cols, float* dst) {
 float dotProductRowQ4_K(const uint8_t* src,
                         size_t cols,
                         const float* vec) {
-    const BlockQ4_K* blocks = reinterpret_cast<const BlockQ4_K*>(src);
     size_t nb = numBlocks(cols, QK_K);
     float acc = 0.0f;
-    for (size_t b = 0; b < nb; ++b) {
-        float d = fp16ToFloat(blocks[b].d);
-        float min = fp16ToFloat(blocks[b].dmin);
-        const uint8_t* scales = blocks[b].scales;
-        const uint8_t* qs = blocks[b].qs;
-        size_t base = b * QK_K;
-        size_t end = std::min(cols, base + QK_K);
-        size_t out = base;
-        for (size_t n = 0; n < QK_K && out < end; n += 32) {
-            uint8_t sc = scales[n / 32];
-            uint8_t sc2 = scales[n / 32 + 8];
-            float dl = d * static_cast<float>(sc & 0xF);
-            float ml = min * static_cast<float>(sc >> 4);
-            for (int l = 0; l < 16 && out < end; ++l) {
-                uint8_t val = (qs[n / 2 + l] & 0x0F);
-                float vf = dl * static_cast<float>(val) - ml;
-                acc += vf * vec[out++];
-            }
-            dl = d * static_cast<float>(sc2 & 0xF);
-            ml = min * static_cast<float>(sc2 >> 4);
-            for (int l = 0; l < 16 && out < end; ++l) {
-                uint8_t val = ((qs[n / 2 + l] >> 4) & 0x0F);
-                float vf = dl * static_cast<float>(val) - ml;
-                acc += vf * vec[out++];
-            }
+    size_t offset = 0;
+    std::array<float, QK_K> tmp{};
+    for (size_t b = 0; b < nb && offset < cols; ++b) {
+        size_t block_cols = std::min(QK_K, cols - offset);
+        dequantizeRowQ4_K(src + b * BLOCK_Q4_K, block_cols, tmp.data());
+        for (size_t i = 0; i < block_cols; ++i) {
+            acc += tmp[i] * vec[offset + i];
         }
+        offset += block_cols;
     }
     return acc;
 }
@@ -1294,38 +1346,17 @@ void dequantizeRowQ5_K(const uint8_t* src, size_t cols, float* dst) {
 float dotProductRowQ5_K(const uint8_t* src,
                         size_t cols,
                         const float* vec) {
-    const BlockQ5_K* blocks = reinterpret_cast<const BlockQ5_K*>(src);
     size_t nb = numBlocks(cols, QK_K);
     float acc = 0.0f;
-    for (size_t b = 0; b < nb; ++b) {
-        float d = fp16ToFloat(blocks[b].d);
-        float min = fp16ToFloat(blocks[b].dmin);
-        const uint8_t* scales = blocks[b].scales;
-        const uint8_t* qs = blocks[b].qs;
-        const uint8_t* qh = blocks[b].qh;
-        size_t base = b * QK_K;
-        size_t end = std::min(cols, base + QK_K);
-        size_t out = base;
-        for (size_t n = 0; n < QK_K && out < end; n += 32) {
-            uint8_t sc = scales[n / 32];
-            uint8_t sc2 = scales[n / 32 + 8];
-            float dl = d * static_cast<float>(sc & 0xF);
-            float ml = min * static_cast<float>(sc >> 4);
-            for (int l = 0; l < 16 && out < end; ++l) {
-                uint8_t vh = ((qh[n / 8 + l / 8] >> (l % 8)) & 1) << 4;
-                uint8_t val = (qs[n / 2 + l] & 0x0F) | vh;
-                float vf = dl * static_cast<float>(val - 16) - ml;
-                acc += vf * vec[out++];
-            }
-            dl = d * static_cast<float>(sc2 & 0xF);
-            ml = min * static_cast<float>(sc2 >> 4);
-            for (int l = 0; l < 16 && out < end; ++l) {
-                uint8_t vh = ((qh[n / 8 + l / 8 + 4] >> (l % 8)) & 1) << 4;
-                uint8_t val = ((qs[n / 2 + l] >> 4) & 0x0F) | vh;
-                float vf = dl * static_cast<float>(val - 16) - ml;
-                acc += vf * vec[out++];
-            }
+    size_t offset = 0;
+    std::array<float, QK_K> tmp{};
+    for (size_t b = 0; b < nb && offset < cols; ++b) {
+        size_t block_cols = std::min(QK_K, cols - offset);
+        dequantizeRowQ5_K(src + b * BLOCK_Q5_K, block_cols, tmp.data());
+        for (size_t i = 0; i < block_cols; ++i) {
+            acc += tmp[i] * vec[offset + i];
         }
+        offset += block_cols;
     }
     return acc;
 }
@@ -1539,30 +1570,17 @@ float dotProductRowQ8_K(const uint8_t* src,
 float dotProductRowQ6_K(const uint8_t* src,
                         size_t cols,
                         const float* vec) {
-    const BlockQ6_K* blocks = reinterpret_cast<const BlockQ6_K*>(src);
     size_t nb = numBlocks(cols, QK_K);
     float acc = 0.0f;
-    for (size_t b = 0; b < nb; ++b) {
-        float d = fp16ToFloat(blocks[b].d);
-        const uint8_t* ql = blocks[b].ql;
-        const uint8_t* qh = blocks[b].qh;
-        const int8_t* scales = blocks[b].scales;
-        size_t base = b * QK_K;
-        size_t end = std::min(cols, base + QK_K);
-        size_t out = base;
-        for (size_t i = 0; i < QK_K / 16 && out < end; ++i) {
-            int8_t sc = scales[i];
-            float dl = d * static_cast<float>(sc);
-            for (size_t j = 0; j < 16 && out < end; ++j) {
-                size_t idx = i * 16 + j;
-                int bit = (idx & 1) ? (ql[idx / 2] >> 4) : (ql[idx / 2] & 0xF);
-                int high = (qh[idx / 4] >> (2 * (idx % 4))) & 0x3;
-                int val = bit | (high << 4);
-                if (val > 31) val -= 64;
-                float vf = dl * static_cast<float>(val);
-                acc += vf * vec[out++];
-            }
+    size_t offset = 0;
+    std::array<float, QK_K> tmp{};
+    for (size_t b = 0; b < nb && offset < cols; ++b) {
+        size_t block_cols = std::min(QK_K, cols - offset);
+        dequantizeRowQ6_K(src + b * BLOCK_Q6_K, block_cols, tmp.data());
+        for (size_t i = 0; i < block_cols; ++i) {
+            acc += tmp[i] * vec[offset + i];
         }
+        offset += block_cols;
     }
     return acc;
 }

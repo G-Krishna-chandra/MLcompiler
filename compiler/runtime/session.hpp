@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "frontends/gguf_loader.hpp"
 
@@ -21,8 +22,12 @@ public:
     std::vector<float> getEmbedding(const std::string& tensor_name,
                                     uint64_t token_id) const;
 
+    // Returns cached raw tensor bytes.
+    const std::vector<uint8_t>& tensorData(const mlc::frontend::GGUFTensorInfo& tensor) const;
+
 private:
     mlc::frontend::GGUFLoader loader_;
+    mutable std::unordered_map<std::string, std::vector<uint8_t>> raw_tensor_cache_;
 };
 
 } // namespace runtime

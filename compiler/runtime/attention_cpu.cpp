@@ -5,7 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
-#if defined(__AVX2__) || defined(__AVX512F__)
+#if defined(__AVX2__) || defined(__AVX512F__) || defined(__AMX_TILE)
 #include <immintrin.h>
 #endif
 
@@ -50,6 +50,18 @@ void applyRotaryToBuffer(float* data,
     }
 }
 
+#if defined(__AMX_TILE) && defined(__x86_64__)
+#include <cpuid.h>
+bool cpuSupportsAMX() {
+    unsigned int eax, ebx, ecx, edx;
+    if (!__get_cpuid_count(7, 1, &eax, &ebx, &ecx, &edx)) return false;
+    // AMX-TILE (bit 24 of EDX) and AMX-BF16 (bit 22 of EDX)
+    bool tile = (edx & (1u << 24)) != 0;
+    bool bf16 = (edx & (1u << 22)) != 0;
+    return tile && bf16;
+}
+#endif
+
 #if defined(__AVX512F__)
 float dotProductSimd(const float* lhs, const float* rhs, size_t dim) {
     __m512 acc = _mm512_setzero_ps();
@@ -93,12 +105,75 @@ float dotProductScalar(const float* lhs, const float* rhs, size_t dim) {
 }
 
 float dotProduct(const float* lhs, const float* rhs, size_t dim) {
+#if defined(__AMX_TILE) && defined(__x86_64__)
+    // Guarded AMX path (BF16 tiles). Fallback to AVX/Scalar when not supported at runtime.
+    if (cpuSupportsAMX() && dim >= 16) {
+        // For simplicity, process in 16-wide chunks using AVX512 FMA as a portable fast path.
+        // (Tile APIs require BF16 packing; we avoid that overhead here while keeping the guard.)
+        // This keeps the structure ready for a full AMX BF16 implementation without changing call sites.
+        return dotProductSimd(lhs, rhs, dim);
+    }
+#endif
 #if defined(__AVX2__) || defined(__AVX512F__)
     return dotProductSimd(lhs, rhs, dim);
 #else
     return dotProductScalar(lhs, rhs, dim);
 #endif
 }
+
+// Forward declare accumulateScaled for AMX helper.
+void accumulateScaled(const float* src, float scale, float* dst, size_t dim);
+
+#if defined(__AMX_TILE) && defined(__x86_64__)
+inline bool useAMX(size_t dim) {
+    return cpuSupportsAMX() && dim >= 16;
+}
+inline void accumulateScaledAMX(const float* src, float scale, float* dst, size_t dim) {
+    // Placeholder for AMX BF16 path; currently use existing accumulateScaled while keeping the hook.
+    accumulateScaled(src, scale, dst, dim);
+}
+#else
+inline bool useAMX(size_t) { return false; }
+inline void accumulateScaledAMX(const float* src, float scale, float* dst, size_t dim) {
+    accumulateScaled(src, scale, dst, dim);
+}
+#endif
+
+#if defined(__AVX512F__)
+void accumulateScaled(const float* src, float scale, float* dst, size_t dim) {
+    __m512 vscale = _mm512_set1_ps(scale);
+    size_t i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        __m512 s = _mm512_loadu_ps(src + i);
+        __m512 d = _mm512_loadu_ps(dst + i);
+        d = _mm512_fmadd_ps(s, vscale, d);
+        _mm512_storeu_ps(dst + i, d);
+    }
+    for (; i < dim; ++i) {
+        dst[i] += scale * src[i];
+    }
+}
+#elif defined(__AVX2__)
+void accumulateScaled(const float* src, float scale, float* dst, size_t dim) {
+    __m256 vscale = _mm256_set1_ps(scale);
+    size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 s = _mm256_loadu_ps(src + i);
+        __m256 d = _mm256_loadu_ps(dst + i);
+        d = _mm256_fmadd_ps(s, vscale, d);
+        _mm256_storeu_ps(dst + i, d);
+    }
+    for (; i < dim; ++i) {
+        dst[i] += scale * src[i];
+    }
+}
+#else
+void accumulateScaled(const float* src, float scale, float* dst, size_t dim) {
+    for (size_t i = 0; i < dim; ++i) {
+        dst[i] += scale * src[i];
+    }
+}
+#endif
 
 struct CacheAccessor {
     TensorStorage* storage;
@@ -237,7 +312,8 @@ BackendExecutionResult RunAttentionCPU(const ExecutionNode& node,
     size_t tokens_q = q.size() / (num_heads * head_dim);
     size_t tokens_k = k_new.size() / kv_span;
     size_t tokens_v = v_new.size() / kv_span;
-    size_t tokens_available = std::min({tokens_q, tokens_k, tokens_v});
+    size_t tokens_write = std::min(tokens_k, tokens_v);
+    size_t tokens_available = std::min(tokens_q, tokens_write);
     if (tokens_available == 0) tokens_available = 1;
 
     const ExecutionTensor* cache_info = nullptr;
@@ -259,6 +335,7 @@ BackendExecutionResult RunAttentionCPU(const ExecutionNode& node,
         base_position = context_length - 1;
     }
     tokens_available = std::min(tokens_available, context_length - base_position);
+    tokens_write = std::min(tokens_write, context_length - base_position);
     if (tokens_available == 0) tokens_available = 1;
 
     TensorStorage* cache_k_storage = context->tensorStorage(cache_k_name);
@@ -287,36 +364,77 @@ BackendExecutionResult RunAttentionCPU(const ExecutionNode& node,
 
     std::vector<float> mask;
     bool apply_mask = loadMask(node, context, mask);
+    if (!apply_mask && context && context->graph()) {
+        const auto& cfg = context->graph()->modelConfig();
+        if (cfg.sliding_window > 0) {
+            std::string cache_k_name = node.annotations.count("kv_cache_k") ? node.annotations.at("kv_cache_k") : "";
+            const ExecutionTensor* cache_info = context->tensorInfo(cache_k_name);
+            size_t ctxt_len = cache_info && cache_info->shape.size() >= 2
+                                  ? static_cast<size_t>(cache_info->shape[1])
+                                  : 0;
+            size_t base_pos = context->sequencePosition();
+            if (ctxt_len > 0) {
+                mask.assign(ctxt_len, 0.0f);
+                const float neg_inf = -1e9f;
+                for (size_t t = 0; t < ctxt_len; ++t) {
+                    size_t dist = (base_pos >= t) ? (base_pos - t) : (ctxt_len);
+                    if (dist > cfg.sliding_window) {
+                        mask[t] = neg_inf;
+                    }
+                }
+                apply_mask = true;
+            }
+        }
+    }
 
     std::vector<float> output(tokens_available * num_heads * head_dim, 0.0f);
     std::vector<float> decoded_row(head_dim, 0.0f);
     std::vector<float> logits;
     std::vector<float> attention;
     std::vector<float> accum(head_dim, 0.0f);
+    std::vector<float> rotated_k(kv_heads * head_dim, 0.0f);
 
-    for (size_t token_idx = 0; token_idx < tokens_available; ++token_idx) {
-        const float* q_ptr = q.data() + token_idx * num_heads * head_dim;
+    // First, write all provided K/V rows into cache.
+    for (size_t token_idx = 0; token_idx < tokens_write; ++token_idx) {
         const float* k_ptr = k_new.data() + token_idx * kv_span;
         const float* v_ptr = v_new.data() + token_idx * kv_span;
-
-        std::vector<float> q_rotated;
-        std::vector<float> k_rotated;
-        const float* q_data = q_ptr;
-        const float* k_data = k_ptr;
         size_t position = std::min(context_length - 1, base_position + token_idx);
+        const float* k_data = k_ptr;
         if (use_rotary) {
-            q_rotated = rotateVector(q_ptr, num_heads * head_dim, head_dim, rotary_dim, position, rope_freq_base, rope_freq_scale);
-            k_rotated = rotateVector(k_ptr, kv_heads * head_dim, head_dim, rotary_dim, position, rope_freq_base, rope_freq_scale);
-            q_data = q_rotated.data();
-            k_data = k_rotated.data();
+            auto rotated = rotateVector(k_ptr,
+                                        kv_heads * head_dim,
+                                        head_dim,
+                                        rotary_dim,
+                                        position,
+                                        rope_freq_base,
+                                        rope_freq_scale);
+            std::copy(rotated.begin(), rotated.end(), rotated_k.begin());
+            k_data = rotated_k.data();
         }
-
         for (size_t kv = 0; kv < kv_heads; ++kv) {
             cache_k.writeRow(kv, position, k_data + kv * head_dim);
             cache_v.writeRow(kv, position, v_ptr + kv * head_dim);
         }
+    }
 
-        size_t tokens_in_cache = std::min(context_length, position + 1);
+    // Then compute attention for query tokens.
+    for (size_t token_idx = 0; token_idx < tokens_available; ++token_idx) {
+        const float* q_ptr = q.data() + token_idx * num_heads * head_dim;
+        std::vector<float> q_rotated;
+        const float* q_data = q_ptr;
+        size_t position = std::min(context_length - 1, base_position + token_idx);
+        if (use_rotary) {
+            q_rotated = rotateVector(q_ptr,
+                                     num_heads * head_dim,
+                                     head_dim,
+                                     rotary_dim,
+                                     position,
+                                     rope_freq_base,
+                                     rope_freq_scale);
+            q_data = q_rotated.data();
+        }
+
+        size_t tokens_in_cache = std::min(context_length, base_position + tokens_write);
         logits.assign(tokens_in_cache, 0.0f);
         attention.assign(tokens_in_cache, 0.0f);
         float inv_sqrt = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -326,18 +444,25 @@ BackendExecutionResult RunAttentionCPU(const ExecutionNode& node,
             const float* q_head = q_data + head * head_dim;
             for (size_t t = 0; t < tokens_in_cache; ++t) {
                 cache_k.readRow(kv_index, t, decoded_row);
-                logits[t] = dotProduct(q_head, decoded_row.data(), head_dim) * inv_sqrt;
-                if (apply_mask && t < mask.size()) {
-                    logits[t] += mask[t];
+                float l = dotProduct(q_head, decoded_row.data(), head_dim) * inv_sqrt;
+                // Apply ALiBi per-head slopes if present (mask packed as head-major).
+                if (apply_mask) {
+                    size_t idx = mask.size() == tokens_in_cache ? t : head * tokens_in_cache + t;
+                    if (idx < mask.size()) {
+                        l += mask[idx];
+                    }
                 }
+                logits[t] = l;
             }
             softmax(logits);
             attention.assign(logits.begin(), logits.end());
             std::fill(accum.begin(), accum.end(), 0.0f);
             for (size_t t = 0; t < tokens_in_cache; ++t) {
                 cache_v.readRow(kv_index, t, decoded_row);
-                for (size_t d = 0; d < head_dim; ++d) {
-                    accum[d] += attention[t] * decoded_row[d];
+                if (useAMX(head_dim)) {
+                    accumulateScaledAMX(decoded_row.data(), attention[t], accum.data(), head_dim);
+                } else {
+                    accumulateScaled(decoded_row.data(), attention[t], accum.data(), head_dim);
                 }
             }
             size_t out_index = token_idx * num_heads * head_dim + head * head_dim;

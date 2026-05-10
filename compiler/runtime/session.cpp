@@ -167,6 +167,16 @@ Session::Session(const std::string& gguf_path) : loader_(gguf_path) {
     }
 }
 
+const std::vector<uint8_t>& Session::tensorData(const frontend::GGUFTensorInfo& tensor) const {
+    auto it = raw_tensor_cache_.find(tensor.name);
+    if (it != raw_tensor_cache_.end()) {
+        return it->second;
+    }
+    auto data = loader_.loadTensorData(tensor);
+    auto inserted = raw_tensor_cache_.emplace(tensor.name, std::move(data));
+    return inserted.first->second;
+}
+
 std::vector<float> Session::runLinear(const std::string& tensor_name,
                                       const std::vector<float>& input) const {
     const auto& tensors = loader_.tensors();
@@ -180,15 +190,16 @@ std::vector<float> Session::runLinear(const std::string& tensor_name,
         throw std::runtime_error("Tensor '" + tensor_name + "' is not 2D");
     }
 
-    uint64_t rows = tensor.shape[0];
-    uint64_t cols = tensor.shape[1];
+    // GGUF stores tensor shapes in ggml order: ne0 (columns), ne1 (rows).
+    uint64_t cols = tensor.shape[0];
+    uint64_t rows = tensor.shape[1];
     bool matches_cols = input.size() == cols;
     bool matches_rows = input.size() == rows;
     if (!matches_cols && !matches_rows) {
         throw std::runtime_error("Input vector size mismatch for tensor '" + tensor_name + "'");
     }
 
-    auto data = loader_.loadTensorData(tensor);
+    const auto& data = tensorData(tensor);
     if (rows == 0 || cols == 0) {
         throw std::runtime_error("Tensor '" + tensor_name + "' has zero dimensions");
     }
@@ -371,10 +382,11 @@ std::vector<float> Session::getEmbedding(const std::string& tensor_name,
         throw std::runtime_error("Tensor '" + tensor_name + "' is not 2D");
     }
 
-    uint64_t rows = tensor.shape[0];
-    uint64_t cols = tensor.shape[1];
+    // GGUF stores tensor shapes in ggml order: ne0 (columns), ne1 (rows).
+    uint64_t cols = tensor.shape[0];
+    uint64_t rows = tensor.shape[1];
 
-    auto data = loader_.loadTensorData(tensor);
+    const auto& data = tensorData(tensor);
     if (rows == 0 || cols == 0) {
         throw std::runtime_error("Tensor '" + tensor_name + "' has zero dimensions");
     }

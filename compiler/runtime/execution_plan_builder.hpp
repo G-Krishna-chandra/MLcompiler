@@ -2,6 +2,7 @@
 
 #include "runtime/execution_graph.hpp"
 #include "frontends/gguf_loader.hpp"
+#include "frontends/ggml_types.hpp"
 
 namespace mlc {
 namespace runtime {
@@ -10,6 +11,8 @@ class ExecutionPlanBuilder {
 public:
     static ExecutionGraph BuildFromLoader(const frontend::GGUFLoader& loader);
     static ExecutionGraph BuildToy(size_t num_layers, size_t hidden_size);
+    // Exposed for tests to build a plan from a pre-filled ModelConfig.
+    static ExecutionGraph BuildForTests(const ModelConfig& config);
 
 private:
     static ExecutionGraph Build(const ModelConfig& config);
@@ -21,6 +24,12 @@ private:
     static size_t findSizeByKeywords(const frontend::GGUFLoader& loader,
                                      const std::vector<std::string>& keywords);
     static size_t inferVocabFromTokens(const frontend::GGUFLoader& loader);
+    static bool dtypeSupportedForLinear(uint32_t dtype);
+    static bool tensorMatchesHidden(const frontend::GGUFTensorInfo& info, size_t hidden);
+    static std::string selectHeadTensor(const frontend::GGUFLoader& loader, size_t hidden_size);
+    static std::string selectHeadBias(const frontend::GGUFLoader& loader,
+                                      const std::string& weight_name,
+                                      size_t hidden_size);
 };
 
 } // namespace runtime

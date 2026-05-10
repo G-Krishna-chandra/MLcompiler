@@ -81,12 +81,19 @@ struct ModelConfig {
     size_t kv_head_count = 0;
     size_t head_dim = 0;
     size_t context_length = 0;
+    std::string head_weight_name;
+    std::string head_bias_name;
     std::string architecture;
     ArchitectureFamily family = ArchitectureFamily::Unknown;
     size_t rotary_dim = 0;
     float rope_freq_base = 10000.0f;
     float rope_freq_scale = 1.0f;
     bool grouped_query_attention = false;
+    // Optional hints for family-specific behavior.
+    size_t sliding_window = 0;
+    std::string activation; // e.g., "gelu", "silu", "geglu"
+    bool use_alibi = false;
+    std::vector<float> alibi_slopes;
 };
 
 class ExecutionGraph {

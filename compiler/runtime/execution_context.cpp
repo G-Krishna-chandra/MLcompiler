@@ -88,15 +88,13 @@ const TensorStorage* ExecutionContext::tensorStorage(const std::string& name) co
     return &it->second;
 }
 
-namespace {
-size_t tensorElementCount(const ExecutionTensor& tensor) {
+size_t ExecutionContext::tensorElementCount(const ExecutionTensor& tensor) const {
     if (tensor.shape.empty()) return 0;
     size_t total = 1;
     for (int64_t dim : tensor.shape) {
         total *= static_cast<size_t>(std::max<int64_t>(1, dim));
     }
     return total;
-}
 }
 
 void ExecutionContext::ensureStateTensor(const ExecutionTensor& tensor_info) {
@@ -125,6 +123,28 @@ void ExecutionContext::ensureStateTensor(const ExecutionTensor& tensor_info) {
     tensors_[tensor_info.name] = std::move(storage);
 }
 
+void ExecutionContext::clearStateTensors() {
+    if (!graph_) return;
+    for (const auto& kv : graph_->tensors()) {
+        const ExecutionTensor& info = kv.second;
+        if (!info.is_state) continue;
+        ensureStateTensor(info);
+        auto* storage = tensorStorage(info.name);
+        if (!storage) continue;
+        if (!storage->float_data.empty()) {
+            std::fill(storage->float_data.begin(), storage->float_data.end(), 0.0f);
+        } else if (!storage->raw_data.empty()) {
+            std::fill(storage->raw_data.begin(), storage->raw_data.end(), 0);
+        } else if (storage->row_stride_bytes > 0) {
+            size_t bytes = tensorElementCount(info) * storage->row_stride_bytes;
+            storage->raw_data.assign(bytes, 0);
+        }
+#if defined(__APPLE__)
+        invalidateMetalBuffer(info.name);
+#endif
+    }
+}
+
 const std::vector<float>& ExecutionContext::getParameter(const std::string& tensor_name) const {
     auto it = parameter_cache_.find(tensor_name);
     if (it != parameter_cache_.end()) return it->second.float_data;
@@ -137,7 +157,7 @@ const std::vector<float>& ExecutionContext::getParameter(const std::string& tens
     if (tensor_it->second.dtype != frontend::GGML_TYPE_F32) {
         throw std::runtime_error("Parameter tensor '" + tensor_name + "' must be F32 for direct access");
     }
-    auto raw = session_.loader().loadTensorData(tensor_it->second);
+    const auto& raw = session_.tensorData(tensor_it->second);
     if (raw.empty()) {
         return parameter_cache_.emplace(tensor_name,
                                         TensorStorage::FromFloatVector(std::vector<float>{}))

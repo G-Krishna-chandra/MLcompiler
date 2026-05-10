@@ -10,6 +10,12 @@ namespace {
 int scoreKernel(const KernelDescriptor& kernel,
                 const KernelSelectionQuery& query) {
     int score = 0;
+
+    static bool force_cpu = (std::getenv("MLC_FORCE_CPU") != nullptr);
+    if (force_cpu && kernel.backend != BackendKind::CPU) {
+        return std::numeric_limits<int>::min();
+    }
+
     if (kernel.backend == query.preferred_backend) {
         score += 40;
     } else if (query.preferred_backend == BackendKind::Auto) {

@@ -9,6 +9,9 @@ namespace runtime {
 
 class KernelScheduler {
 public:
+    // Build a model configuration from GGUF metadata without scheduling.
+    static ModelConfig BuildModelConfig(const frontend::GGUFLoader& loader);
+
     static ExecutionGraph Schedule(const ir::Graph& graph,
                                    const frontend::GGUFLoader& loader);
 };
