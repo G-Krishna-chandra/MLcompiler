@@ -27,7 +27,8 @@ TEST(ExecutionGraphTest, SimpleTopologicalOrder) {
 TEST(ExecutionPlanBuilderTest, ToyPlanGeneratesLayers) {
     auto graph = ExecutionPlanBuilder::BuildToy(3, 4096);
     ASSERT_FALSE(graph.nodes().empty());
-    EXPECT_EQ(graph.nodes().size(), 1 + 3 * 2 + 2); // embedding + 3*(attn+ffn) + norm + head
+    // embedding + 3 * (norm+attn+add+norm+ffn+add) + norm + head
+    EXPECT_EQ(graph.nodes().size(), 1 + 3 * 6 + 2);
 
     auto order = graph.topologicalOrder();
     EXPECT_EQ(order.size(), graph.nodes().size());
@@ -70,4 +71,54 @@ TEST(ExecutionExecutorTest, SimulatesPlanInTopoOrder) {
         }
     }
     EXPECT_TRUE(found_attn);
+}
+
+TEST(ExecutionPlanBuilderTest, GemmaDefaultsGeGLUActivation) {
+    ModelConfig cfg;
+    cfg.num_layers = 1;
+    cfg.hidden_size = 8;
+    cfg.head_count = 2;
+    cfg.kv_head_count = 2;
+    cfg.head_dim = 4;
+    cfg.context_length = 8;
+    cfg.vocab_size = 16;
+    cfg.family = ArchitectureFamily::Gemma;
+    // leave activation empty to force default
+    auto graph = ExecutionPlanBuilder::BuildForTests(cfg);
+    const auto& nodes = graph.nodes();
+    bool found_ffn = false;
+    for (const auto& n : nodes) {
+        if (n.op == ExecOpType::FeedForward) {
+            auto it = n.annotations.find("activation");
+            ASSERT_NE(it, n.annotations.end());
+            EXPECT_EQ(it->second, "geglu");
+            found_ffn = true;
+        }
+    }
+    EXPECT_TRUE(found_ffn);
+}
+
+TEST(ExecutionPlanBuilderTest, MistralGroupedQueryAndSlidingWindowPropagate) {
+    ModelConfig cfg;
+    cfg.num_layers = 1;
+    cfg.hidden_size = 16;
+    cfg.head_count = 8;
+    cfg.kv_head_count = 4; // grouped-query
+    cfg.head_dim = 4;
+    cfg.context_length = 64;
+    cfg.vocab_size = 32;
+    cfg.family = ArchitectureFamily::Mistral;
+    cfg.sliding_window = 32;
+    auto graph = ExecutionPlanBuilder::BuildForTests(cfg);
+    EXPECT_EQ(graph.modelConfig().sliding_window, 32u);
+    bool found_gqa = false;
+    for (const auto& n : graph.nodes()) {
+        if (n.op == ExecOpType::Attention) {
+            auto it = n.annotations.find("grouped_query");
+            ASSERT_NE(it, n.annotations.end());
+            EXPECT_EQ(it->second, "true");
+            found_gqa = true;
+        }
+    }
+    EXPECT_TRUE(found_gqa);
 }

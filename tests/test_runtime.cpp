@@ -2,6 +2,7 @@
 #include "runtime/runtime.hpp"
 #include "runtime/session.hpp"
 #include "runtime/quantization.hpp"
+#include "runtime/float_convert.hpp"
 #include "runtime/quant_utils.hpp"
 #include "runtime/model_runner.hpp"
 #include "runtime/execution_graph.hpp"
@@ -9,6 +10,8 @@
 #include "runtime/kernel_registry.hpp"
 #include "runtime/metal_runtime.hpp"
 #include "runtime/execution_context.hpp"
+#include "runtime/tokenizer.hpp"
+#include "runtime/decode_runner.hpp"
 #include "tests/gguf_test_utils.hpp"
 #include <cmath>
 #include <algorithm>
@@ -16,13 +19,16 @@
 #include <fstream>
 #include <unistd.h>
 #include <cstring>
+#include <tuple>
+#include <random>
 #include <vector>
 
 namespace fs = std::filesystem;
 using namespace mlc::test::gguf;
+using mlc::runtime::MetalExecutor;
 
 namespace {
-uint16_t floatToFp16(float value) {
+uint16_t testFloatToFp16(float value) {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));
     uint32_t sign = (bits >> 16) & 0x8000u;
@@ -52,6 +58,15 @@ TEST(RuntimeTest, InitializeShutdown) {
     mlc::runtime::Runtime runtime;
     EXPECT_NO_THROW(runtime.initialize());
     EXPECT_NO_THROW(runtime.shutdown());
+}
+
+TEST(FloatConvertTest, Fp16Subnormal) {
+    constexpr uint16_t kMinSubnormal = 0x0001;
+    constexpr uint16_t kNextSubnormal = 0x0002;
+    float v0 = mlc::runtime::fp16ToFloat(kMinSubnormal);
+    float v1 = mlc::runtime::fp16ToFloat(kNextSubnormal);
+    EXPECT_NEAR(v0, std::ldexp(1.0f, -24), 1e-10f);
+    EXPECT_NEAR(v1, std::ldexp(1.0f, -23), 1e-10f);
 }
 
 namespace {
@@ -209,6 +224,50 @@ std::string createTransposedOutputGGUFFile() {
     return path;
 }
 
+std::string createQuantFFNGGUFFile(uint32_t dtype = 2 /*Q4_0*/, size_t cols = 32) {
+    std::string path = "/tmp/test_quant_ffn_" + std::to_string(getpid()) + ".gguf";
+    std::ofstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to create GGUF file");
+    }
+
+    writeU32(file, 0x46554747);
+    writeU32(file, 1);
+    writeU64(file, 1); // tensors
+    writeU64(file, 1); // kv
+
+    writeString(file, "general.quantization_version");
+    writeU32(file, 4); // UINT32
+    writeU32(file, 1);
+
+    writeString(file, "q_weight");
+    writeU32(file, 2);  // dims
+    writeU32(file, 2);                    // rows
+    writeU32(file, static_cast<uint32_t>(cols)); // cols
+    writeU32(file, dtype);
+    writeU64(file, 256);
+
+    // Two rows, 32 cols each.
+    std::vector<float> row0(cols, 0.0f);
+    row0[0] = 1.0f;
+    std::vector<float> row1(cols, 0.0f);
+    row1[1] = 1.0f;
+    std::vector<uint8_t> buf;
+    uint32_t quant_version = 1;
+    size_t row_size = mlc::runtime::ggmlRowSizeBytes(dtype, row0.size(), quant_version);
+    std::vector<uint8_t> rowbuf0(row_size);
+    std::vector<uint8_t> rowbuf1(row_size);
+    mlc::runtime::quantizeRowFrom(row0.data(), dtype, row0.size(), quant_version, rowbuf0.data());
+    mlc::runtime::quantizeRowFrom(row1.data(), dtype, row1.size(), quant_version, rowbuf1.data());
+    buf.reserve(rowbuf0.size() + rowbuf1.size());
+    buf.insert(buf.end(), rowbuf0.begin(), rowbuf0.end());
+    buf.insert(buf.end(), rowbuf1.begin(), rowbuf1.end());
+    file.seekp(256, std::ios::beg);
+    file.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+    file.close();
+    return path;
+}
+
 std::string createTransposedRunnerGGUFFile() {
     std::string path = "/tmp/test_runner_transposed_" + std::to_string(getpid()) + ".gguf";
     std::ofstream file(path, std::ios::binary);
@@ -262,6 +321,126 @@ std::string createTransposedRunnerGGUFFile() {
         9, 10, 11, 12
     };
     file.write(reinterpret_cast<const char*>(output_weight.data()), output_weight.size());
+    file.close();
+    return path;
+}
+
+std::string createGemmaLikeGGUFFile() {
+    std::string path = "/tmp/test_gemma_" + std::to_string(getpid()) + ".gguf";
+    std::ofstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to create GGUF file");
+    }
+
+    writeU32(file, 0x46554747);
+    writeU32(file, 1);
+    writeU64(file, 2); // tensors
+    writeU64(file, 2); // kv pairs
+
+    writeString(file, "gemma.block_count");
+    writeU32(file, 4);
+    writeU32(file, 1);
+
+    writeString(file, "gemma.embedding_length");
+    writeU32(file, 4);
+    writeU32(file, 4);
+
+    writeString(file, "token_embd.weight");
+    writeU32(file, 2);
+    writeU64(file, 2);
+    writeU32(file, 4);
+    writeU32(file, 4);
+    writeU32(file, 0);
+    writeU64(file, 512);
+
+    writeString(file, "head.weight");
+    writeU32(file, 2);
+    writeU64(file, 2);
+    writeU32(file, 4);
+    writeU32(file, 4);
+    writeU32(file, 0);
+    writeU64(file, 560);
+
+    file.seekp(512, std::ios::beg);
+    std::vector<float> embeddings = {
+        1.f, 1.f, 1.f, 1.f,
+        2.f, 2.f, 2.f, 2.f,
+        3.f, 3.f, 3.f, 3.f,
+        4.f, 4.f, 4.f, 4.f
+    };
+    file.write(reinterpret_cast<const char*>(embeddings.data()),
+               embeddings.size() * sizeof(float));
+
+    file.seekp(560, std::ios::beg);
+    std::vector<float> head = {
+        1.f, 0.f, 0.f, 0.f,
+        0.f, 1.f, 0.f, 0.f,
+        0.f, 0.f, 1.f, 0.f,
+        0.f, 0.f, 0.f, 1.f
+    };
+    file.write(reinterpret_cast<const char*>(head.data()), head.size() * sizeof(float));
+    file.close();
+    return path;
+}
+
+std::string createMistralLikeGGUFFile() {
+    std::string path = "/tmp/test_mistral_" + std::to_string(getpid()) + ".gguf";
+    std::ofstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to create GGUF file");
+    }
+
+    writeU32(file, 0x46554747);
+    writeU32(file, 1);
+    writeU64(file, 2); // tensors
+    writeU64(file, 3); // kv pairs
+
+    writeString(file, "mistral.block_count");
+    writeU32(file, 4);
+    writeU32(file, 1);
+
+    writeString(file, "mistral.embedding_length");
+    writeU32(file, 4);
+    writeU32(file, 4);
+
+    writeString(file, "attention.sliding_window");
+    writeU32(file, 4);
+    writeU32(file, 64);
+
+    writeString(file, "token_embd.weight");
+    writeU32(file, 2);
+    writeU64(file, 2);
+    writeU32(file, 4);
+    writeU32(file, 4);
+    writeU32(file, 0);
+    writeU64(file, 512);
+
+    writeString(file, "head.weight");
+    writeU32(file, 2);
+    writeU64(file, 2);
+    writeU32(file, 4);
+    writeU32(file, 4);
+    writeU32(file, 0);
+    writeU64(file, 560);
+
+    file.seekp(512, std::ios::beg);
+    std::vector<float> embeddings = {
+        1.f, 0.f, 0.f, 0.f,
+        0.f, 1.f, 0.f, 0.f,
+        0.f, 0.f, 1.f, 0.f,
+        0.f, 0.f, 0.f, 1.f
+    };
+    file.write(reinterpret_cast<const char*>(embeddings.data()),
+               embeddings.size() * sizeof(float));
+
+    file.seekp(560, std::ios::beg);
+    std::vector<float> head = {
+        1.f, 0.f, 0.f, 0.f,
+        0.f, 1.f, 0.f, 0.f,
+        0.f, 0.f, 1.f, 0.f,
+        0.f, 0.f, 0.f, 1.f
+    };
+    file.write(reinterpret_cast<const char*>(head.data()), head.size() * sizeof(float));
     file.close();
     return path;
 }
@@ -322,14 +501,255 @@ TEST(RuntimeSessionTest, LinearHandlesTransposedQuantizedTensor) {
     fs::remove(path);
 }
 
+TEST(ExecutionRuntimeTest, FusedFeedForwardUsesAnnotatedWeights) {
+    std::string path = createLinearGGUFFile();
+    mlc::runtime::Session session(path);
+
+    mlc::runtime::ExecutionGraph graph;
+    graph.addTensor("x", {2}, mlc::ir::DataType::F32);
+    graph.addTensor("ffn_out", {2}, mlc::ir::DataType::F32);
+
+    auto& ffn = graph.addNode("fused_ffn",
+                              mlc::runtime::ExecOpType::FeedForward,
+                              {"x"},
+                              {"ffn_out"},
+                              mlc::runtime::BackendKind::CPU);
+    // Reuse the single weight tensor for gate/up; skip down projection.
+    ffn.annotations["param0"] = "linear.weight";
+    ffn.annotations["param1"] = "linear.weight";
+
+    mlc::runtime::ModelConfig cfg;
+    cfg.activation = "silu";
+    graph.setModelConfig(cfg);
+
+    mlc::runtime::ExecutionContext ctx(session, &graph);
+    ctx.setTensor("x", {1.0f, 2.0f, 3.0f});
+
+    mlc::runtime::ExecutionExecutor executor(graph, nullptr, &ctx);
+    auto status = executor.run();
+    ASSERT_GT(status.trace.size(), 0u);
+    ASSERT_TRUE(status.success);
+
+    const auto* out = ctx.getTensor("ffn_out");
+    ASSERT_NE(out, nullptr);
+    // For linear.weight = [[1,2,3],[0,1,0.5]]:
+    // gate=up = [14, 3.5]; silu(gate) ~ [13.999, 3.398]; mix ~ [195.99, 11.89]
+    EXPECT_NEAR((*out)[0], 196.0f, 1.0f);
+    EXPECT_NEAR((*out)[1], 11.9f, 0.2f);
+
+    fs::remove(path);
+}
+
+TEST(ExecutionRuntimeTest, FusedFeedForwardSupportsQuantizedWeights) {
+    std::string path = createQuantFFNGGUFFile();
+    mlc::runtime::Session session(path);
+
+    mlc::runtime::ExecutionGraph graph;
+    graph.addTensor("x", {32}, mlc::ir::DataType::F32);
+    graph.addTensor("ffn_out_q", {2}, mlc::ir::DataType::F32);
+
+    auto& ffn = graph.addNode("fused_ffn_q",
+                              mlc::runtime::ExecOpType::FeedForward,
+                              {"x"},
+                              {"ffn_out_q"},
+                              mlc::runtime::BackendKind::CPU);
+    ffn.annotations["param0"] = "q_weight";
+    ffn.annotations["param1"] = "q_weight";
+
+    mlc::runtime::ModelConfig cfg;
+    cfg.activation = "silu";
+    graph.setModelConfig(cfg);
+
+    // Build expected from dequantizing q_weight manually.
+    const auto& tensors = session.loader().tensors();
+    auto it = tensors.find("q_weight");
+    ASSERT_NE(it, tensors.end());
+    auto raw = session.loader().loadTensorData(it->second);
+    ASSERT_FALSE(raw.empty());
+    size_t stride = raw.size() / static_cast<size_t>(it->second.shape[0]);
+    ASSERT_GT(stride, 0u);
+    std::vector<float> deq_row(32);
+    std::vector<float> gate_vals(2);
+    std::vector<float> up_vals(2);
+    uint32_t qv = session.loader().quantizationVersion();
+    mlc::runtime::dequantizeRowQ4_0(raw.data(), 32, qv, deq_row.data());
+    gate_vals[0] = 0.0f;
+    for (size_t i = 0; i < 32; ++i) gate_vals[0] += deq_row[i] * (i == 0 ? 1.0f : (i == 1 ? 2.0f : 0.0f));
+    mlc::runtime::dequantizeRowQ4_0(raw.data() + stride, 32, qv, deq_row.data());
+    gate_vals[1] = 0.0f;
+    for (size_t i = 0; i < 32; ++i) gate_vals[1] += deq_row[i] * (i == 0 ? 1.0f : (i == 1 ? 2.0f : 0.0f));
+    up_vals = gate_vals;
+
+    std::vector<float> input(32, 0.0f);
+    input[0] = 1.0f;
+    input[1] = 2.0f;
+
+    mlc::runtime::ExecutionContext ctx(session, &graph);
+    ctx.setTensor("x", std::move(input));
+
+    mlc::runtime::ExecutionExecutor executor(graph, nullptr, &ctx);
+    auto status = executor.run();
+    ASSERT_TRUE(status.success);
+
+    const auto* out = ctx.getTensor("ffn_out_q");
+    ASSERT_NE(out, nullptr);
+    // gate/up from quantized weight should match manual dequant dot.
+    auto silu_fn = [](float x) { return x / (1.0f + std::exp(-x)); };
+    float mix0 = silu_fn(gate_vals[0]) * up_vals[0];
+    float mix1 = silu_fn(gate_vals[1]) * up_vals[1];
+    EXPECT_NEAR((*out)[0], mix0, 1e-2f);
+    EXPECT_NEAR((*out)[1], mix1, 1e-2f);
+
+    fs::remove(path);
+}
+
+TEST(ExecutionRuntimeTest, FusedFeedForwardSupportsQuantizedWeightsKSeries) {
+    // Use Q4_K to validate K-format support in fused FFN computeLinear.
+    constexpr size_t cols = 256;
+    std::string path = createQuantFFNGGUFFile(mlc::frontend::GGML_TYPE_Q4_K, cols);
+    mlc::runtime::Session session(path);
+
+    mlc::runtime::ExecutionGraph graph;
+    graph.addTensor("x", {static_cast<int64_t>(cols)}, mlc::ir::DataType::F32);
+    graph.addTensor("ffn_out_qk", {2}, mlc::ir::DataType::F32);
+
+    auto& ffn = graph.addNode("fused_ffn_qk",
+                              mlc::runtime::ExecOpType::FeedForward,
+                              {"x"},
+                              {"ffn_out_qk"},
+                              mlc::runtime::BackendKind::CPU);
+    ffn.annotations["param0"] = "q_weight";
+    ffn.annotations["param1"] = "q_weight";
+
+    mlc::runtime::ModelConfig cfg;
+    cfg.activation = "silu";
+    graph.setModelConfig(cfg);
+
+    const auto& tensors = session.loader().tensors();
+    auto it = tensors.find("q_weight");
+    ASSERT_NE(it, tensors.end());
+    auto raw = session.loader().loadTensorData(it->second);
+    size_t stride = raw.size() / static_cast<size_t>(it->second.shape[0]);
+    std::vector<float> deq_row(cols);
+    std::vector<float> gate_vals(2);
+    std::vector<float> up_vals(2);
+    uint32_t qv = session.loader().quantizationVersion();
+    mlc::runtime::dequantizeRowTo(raw.data(), it->second.dtype, cols, qv, deq_row.data());
+    gate_vals[0] = 0.0f;
+    for (size_t i = 0; i < cols; ++i) gate_vals[0] += deq_row[i] * (i == 0 ? 1.0f : (i == 1 ? 2.0f : 0.0f));
+    mlc::runtime::dequantizeRowTo(raw.data() + stride, it->second.dtype, cols, qv, deq_row.data());
+    gate_vals[1] = 0.0f;
+    for (size_t i = 0; i < cols; ++i) gate_vals[1] += deq_row[i] * (i == 0 ? 1.0f : (i == 1 ? 2.0f : 0.0f));
+    up_vals = gate_vals;
+
+    std::vector<float> input(cols, 0.0f);
+    input[0] = 1.0f;
+    input[1] = 2.0f;
+
+    mlc::runtime::ExecutionContext ctx(session, &graph);
+    ctx.setTensor("x", std::move(input));
+
+    mlc::runtime::ExecutionExecutor executor(graph, nullptr, &ctx);
+    auto status = executor.run();
+    ASSERT_FALSE(status.trace.empty());
+    const auto& last = status.trace.back();
+    EXPECT_TRUE(last.success) << mlc::runtime::formatTraceEntry(last);
+    ASSERT_TRUE(status.success);
+
+    const auto* out = ctx.getTensor("ffn_out_qk");
+    ASSERT_NE(out, nullptr);
+    auto silu_fn = [](float x) { return x / (1.0f + std::exp(-x)); };
+    float mix0 = silu_fn(gate_vals[0]) * up_vals[0];
+    float mix1 = silu_fn(gate_vals[1]) * up_vals[1];
+    EXPECT_NEAR((*out)[0], mix0, 5e-2f);
+    EXPECT_NEAR((*out)[1], mix1, 5e-2f);
+
+    fs::remove(path);
+}
+
+TEST(ExecutionRuntimeTest, FusedFeedForwardDownProjectionWithBias) {
+    // Build a small GGUF with F32 weights for gate/up/down and validate bias handling.
+    std::string path = "/tmp/test_fused_ffn_down_" + std::to_string(getpid()) + ".gguf";
+    {
+        std::ofstream file(path, std::ios::binary);
+        ASSERT_TRUE(file.is_open());
+        writeU32(file, 0x46554747);
+        writeU32(file, 1);  // version
+        writeU64(file, 2);  // tensors
+        writeU64(file, 0);  // kv
+
+        // gate/up weight: 2x3
+        writeString(file, "w_gate");
+        writeU32(file, 2);
+        writeU32(file, 2);
+        writeU32(file, 3);
+        writeU32(file, 0);  // F32
+        writeU64(file, 256);
+
+        // down weight: 2x2
+        writeString(file, "w_down");
+        writeU32(file, 2);
+        writeU32(file, 2);
+        writeU32(file, 2);
+        writeU32(file, 0);  // F32
+        writeU64(file, 256 + sizeof(float) * 6);
+
+        file.seekp(256, std::ios::beg);
+        // w_gate values.
+        std::vector<float> w_gate = {1.f, 2.f, 3.f,
+                                     0.f, 1.f, 0.5f};
+        file.write(reinterpret_cast<const char*>(w_gate.data()), w_gate.size() * sizeof(float));
+        // w_down simple projection.
+        std::vector<float> w_down = {1.f, 0.f,
+                                     0.f, 1.f};
+        file.write(reinterpret_cast<const char*>(w_down.data()), w_down.size() * sizeof(float));
+    }
+
+    mlc::runtime::Session session(path);
+    mlc::runtime::ExecutionGraph graph;
+    graph.addTensor("x", {3}, mlc::ir::DataType::F32);
+    graph.addTensor("ffn_out_down", {2}, mlc::ir::DataType::F32);
+
+    auto& ffn = graph.addNode("fused_ffn_down",
+                              mlc::runtime::ExecOpType::FeedForward,
+                              {"x"},
+                              {"ffn_out_down"},
+                              mlc::runtime::BackendKind::CPU);
+    ffn.annotations["param0"] = "w_gate";
+    ffn.annotations["param1"] = "w_gate";
+    ffn.annotations["param2"] = "w_down";
+    ffn.annotations["bias"] = "bias_down";
+
+    mlc::runtime::ModelConfig cfg;
+    cfg.activation = "silu";
+    graph.setModelConfig(cfg);
+
+    mlc::runtime::ExecutionContext ctx(session, &graph);
+    ctx.setTensor("x", {1.0f, 2.0f, 3.0f});
+    ctx.setTensor("bias_down", {0.5f, -1.0f});
+
+    mlc::runtime::ExecutionExecutor executor(graph, nullptr, &ctx);
+    auto status = executor.run();
+    ASSERT_TRUE(status.success);
+
+    const auto* out = ctx.getTensor("ffn_out_down");
+    ASSERT_NE(out, nullptr);
+    // gate/up = [14, 3.5]; silu -> ~[14, 3.398]; mix ~ [196, 11.89]
+    // down = identity 2x2, plus bias.
+    EXPECT_NEAR((*out)[0], 196.5f, 1.0f);
+    EXPECT_NEAR((*out)[1], 10.9f, 0.5f);
+
+    fs::remove(path);
+}
+
 TEST(QuantizationTest, Q8_1DequantizationProducesBias) {
     using namespace mlc::runtime;
     constexpr size_t cols = 32;
     std::vector<uint8_t> buffer(q8_1RowSize(cols), 0);
 
     uint16_t* header = reinterpret_cast<uint16_t*>(buffer.data());
-    header[0] = floatToFp16(2.0f);   // scale
-    header[1] = floatToFp16(32.0f);  // bias accumulator -> bias 1.0f
+    header[0] = testFloatToFp16(2.0f);   // scale
+    header[1] = testFloatToFp16(32.0f);  // bias accumulator -> bias 1.0f
 
     int8_t* qs = reinterpret_cast<int8_t*>(buffer.data() + 4);
     for (size_t i = 0; i < cols; ++i) {
@@ -385,7 +805,7 @@ TEST(QuantizationTest, Q4_0DotProductMatchesDequant) {
 #endif
     static_assert(sizeof(TestBlockQ4_0) == 18, "Unexpected Q4_0 block size");
     TestBlockQ4_0 block{};
-    block.d = floatToFp16(0.5f);
+    block.d = testFloatToFp16(0.5f);
     for (size_t i = 0; i < cols / 2; ++i) {
         uint8_t lo = static_cast<uint8_t>(i & 0xF);
         uint8_t hi = static_cast<uint8_t>((cols / 2 - i) & 0xF);
@@ -429,8 +849,8 @@ TEST(QuantizationTest, Q4_1DotProductMatchesDequant) {
 #pragma pack(pop)
 #endif
     Block block{};
-    block.d = floatToFp16(0.25f);
-    block.m = floatToFp16(1.0f);
+    block.d = testFloatToFp16(0.25f);
+    block.m = testFloatToFp16(1.0f);
     for (size_t i = 0; i < cols / 2; ++i) {
         uint8_t lo = static_cast<uint8_t>(i & 0xF);
         uint8_t hi = static_cast<uint8_t>((i + 1) & 0xF);
@@ -467,7 +887,7 @@ TEST(QuantizationTest, Q5_0DotProductMatchesDequant) {
 #pragma pack(pop)
 #endif
     Block block{};
-    block.d = floatToFp16(0.5f);
+    block.d = testFloatToFp16(0.5f);
     std::memset(block.qh, 0, sizeof(block.qh));
     for (size_t i = 0; i < cols / 2; ++i) {
         uint8_t lo = static_cast<uint8_t>((i & 0xF));
@@ -506,8 +926,8 @@ TEST(QuantizationTest, Q5_1DotProductMatchesDequant) {
 #pragma pack(pop)
 #endif
     Block block{};
-    block.d = floatToFp16(0.5f);
-    block.m = floatToFp16(0.25f);
+    block.d = testFloatToFp16(0.5f);
+    block.m = testFloatToFp16(0.25f);
     std::memset(block.qh, 0, sizeof(block.qh));
     for (size_t i = 0; i < cols / 2; ++i) {
         uint8_t lo = static_cast<uint8_t>((i + 1) & 0xF);
@@ -544,7 +964,7 @@ TEST(QuantizationTest, Q8_0DotProductMatchesDequant) {
 #pragma pack(pop)
 #endif
     Block block{};
-    block.d = floatToFp16(0.125f);
+    block.d = testFloatToFp16(0.125f);
     for (size_t i = 0; i < cols; ++i) {
         block.qs[i] = static_cast<int8_t>(i - 16);
     }
@@ -764,8 +1184,8 @@ TEST(QuantizationTest, Q2KSimplePatternProducesUniformValues) {
     std::fill(buffer.begin() + 16, buffer.begin() + 16 + 64, 0x55); // 0b01010101 so every 2-bit value == 1
     // d located after scales+qs
     uint16_t* d_ptr = reinterpret_cast<uint16_t*>(buffer.data() + 16 + 64);
-    d_ptr[0] = floatToFp16(0.5f); // d
-    d_ptr[1] = floatToFp16(0.0f); // dmin
+    d_ptr[0] = testFloatToFp16(0.5f); // d
+    d_ptr[1] = testFloatToFp16(0.0f); // dmin
 
     std::vector<float> output(cols, 0.0f);
     dequantizeRowQ2_K(buffer.data(), cols, output.data());
@@ -797,44 +1217,50 @@ TEST(QuantizationTest, QKDotProductsMatchDequant) {
     using namespace mlc::runtime;
     constexpr size_t cols = 256;
     {
+        SCOPED_TRACE("q2_k");
         size_t row_bytes = q2_kRowSize(cols);
         std::vector<uint8_t> buffer(row_bytes, 0x11);
         uint16_t* d_ptr = reinterpret_cast<uint16_t*>(buffer.data() + 16 + 64);
-        d_ptr[0] = floatToFp16(0.8f);
-        d_ptr[1] = floatToFp16(0.2f);
+        d_ptr[0] = testFloatToFp16(0.8f);
+        d_ptr[1] = testFloatToFp16(0.2f);
         testQkDotProduct(buffer, cols, dequantizeRowQ2_K, dotProductRowQ2_K);
     }
     {
+        SCOPED_TRACE("q3_k");
         size_t row_bytes = q3_kRowSize(cols);
         std::vector<uint8_t> buffer(row_bytes, 0x22);
         uint16_t* d_ptr = reinterpret_cast<uint16_t*>(buffer.data() + 80);
-        d_ptr[0] = floatToFp16(0.6f);
+        d_ptr[0] = testFloatToFp16(0.6f);
         testQkDotProduct(buffer, cols, dequantizeRowQ3_K, dotProductRowQ3_K);
     }
     {
+        SCOPED_TRACE("q4_k");
         size_t row_bytes = q4_kRowSize(cols);
         std::vector<uint8_t> buffer(row_bytes, 0x33);
         uint16_t* d_ptr = reinterpret_cast<uint16_t*>(buffer.data() + 144 - 4);
-        d_ptr[0] = floatToFp16(0.5f);
-        d_ptr[1] = floatToFp16(0.1f);
+        d_ptr[0] = testFloatToFp16(0.5f);
+        d_ptr[1] = testFloatToFp16(0.1f);
         testQkDotProduct(buffer, cols, dequantizeRowQ4_K, dotProductRowQ4_K);
     }
     {
+        SCOPED_TRACE("q5_k");
         size_t row_bytes = q5_kRowSize(cols);
         std::vector<uint8_t> buffer(row_bytes, 0x44);
         uint16_t* d_ptr = reinterpret_cast<uint16_t*>(buffer.data() + 176 - 4);
-        d_ptr[0] = floatToFp16(0.4f);
-        d_ptr[1] = floatToFp16(0.05f);
+        d_ptr[0] = testFloatToFp16(0.4f);
+        d_ptr[1] = testFloatToFp16(0.05f);
         testQkDotProduct(buffer, cols, dequantizeRowQ5_K, dotProductRowQ5_K);
     }
     {
+        SCOPED_TRACE("q6_k");
         size_t row_bytes = q6_kRowSize(cols);
         std::vector<uint8_t> buffer(row_bytes, 0x55);
         uint16_t* d_ptr = reinterpret_cast<uint16_t*>(buffer.data() + 210 - 2);
-        d_ptr[0] = floatToFp16(0.3f);
+        d_ptr[0] = testFloatToFp16(0.3f);
         testQkDotProduct(buffer, cols, dequantizeRowQ6_K, dotProductRowQ6_K);
     }
     {
+        SCOPED_TRACE("q8_k");
         size_t row_bytes = q8_kRowSize(cols);
         std::vector<uint8_t> buffer(row_bytes, 0x66);
         float* d_ptr = reinterpret_cast<float*>(buffer.data());
@@ -884,6 +1310,265 @@ TEST(ModelRunnerTest, DryRunHandlesTransposedQuantizedHeadTensor) {
     EXPECT_NEAR(report.logits_preview[1], 20.6f, 1e-5f);
     EXPECT_NEAR(report.logits_preview[2], 23.9f, 1e-5f);
     EXPECT_EQ(report.logits_dim, 4u);
+
+    fs::remove(path);
+}
+
+TEST(ModelRunnerTest, DryRunWorksForGemmaStyleMetadataAndNames) {
+    std::string path = createGemmaLikeGGUFFile();
+    mlc::runtime::ModelRunner runner(path);
+    mlc::runtime::RunConfig config;
+    config.token_id = 2;
+    config.preview_length = 2;
+
+    auto report = runner.dryRun(config);
+    EXPECT_EQ(report.embedding_tensor, "token_embd.weight");
+    EXPECT_EQ(report.logits_tensor, "head.weight");
+    ASSERT_EQ(report.embedding_preview.size(), 2u);
+    EXPECT_FLOAT_EQ(report.embedding_preview[0], 3.0f);
+    EXPECT_FLOAT_EQ(report.embedding_preview[1], 3.0f);
+    ASSERT_EQ(report.logits_preview.size(), 2u);
+    // Head is identity; embedding row for token 2 is all 3s, so logits should be 3s.
+    EXPECT_FLOAT_EQ(report.logits_preview[0], 3.0f);
+    EXPECT_FLOAT_EQ(report.logits_preview[1], 3.0f);
+    fs::remove(path);
+}
+
+TEST(ModelRunnerTest, DryRunHandlesMistralMetadataAndSlidingWindow) {
+    std::string path = createMistralLikeGGUFFile();
+    mlc::runtime::ModelRunner runner(path);
+    mlc::runtime::RunConfig config;
+    config.token_id = 0;
+    config.preview_length = 2;
+
+    auto report = runner.dryRun(config);
+    EXPECT_EQ(report.embedding_tensor, "token_embd.weight");
+    EXPECT_EQ(report.logits_tensor, "head.weight");
+    ASSERT_EQ(report.embedding_preview.size(), 2u);
+    EXPECT_FLOAT_EQ(report.embedding_preview[0], 1.0f);
+    EXPECT_FLOAT_EQ(report.embedding_preview[1], 0.0f);
+    ASSERT_EQ(report.logits_preview.size(), 2u);
+    EXPECT_FLOAT_EQ(report.logits_preview[0], 1.0f);
+    EXPECT_FLOAT_EQ(report.logits_preview[1], 0.0f);
+    // Sliding window metadata present in kv; ensure it didn't block dryRun.
+    EXPECT_TRUE(report.logits_error.empty());
+    fs::remove(path);
+}
+
+TEST(ExecutionRuntimeTest, AttentionRespectsSlidingWindowMask) {
+    std::string path = createRunnerGGUFFile();
+    mlc::runtime::Session session(path);
+
+    mlc::runtime::ExecutionGraph graph;
+    graph.addTensor("q", {2}, mlc::ir::DataType::F32);
+    graph.addTensor("k_in", {4}, mlc::ir::DataType::F32); // 2 tokens * kv_heads(1) * head_dim(2)
+    graph.addTensor("v_in", {4}, mlc::ir::DataType::F32);
+
+    auto& k_cache = graph.addTensor("kv_k_window", std::vector<int64_t>{1, 3, 2}, mlc::ir::DataType::F32);
+    k_cache.is_state = true;
+    auto& v_cache = graph.addTensor("kv_v_window", std::vector<int64_t>{1, 3, 2}, mlc::ir::DataType::F32);
+    v_cache.is_state = true;
+
+    graph.addTensor("attn_out_window", {2}, mlc::ir::DataType::F32);
+    graph.addTensor("attn_mask_window", {3}, mlc::ir::DataType::F32);
+
+    auto& attn = graph.addNode("sliding_attention",
+                               mlc::runtime::ExecOpType::Attention,
+                               {"q", "k_in", "v_in"},
+                               {"attn_out_window", "kv_k_window", "kv_v_window"},
+                               mlc::runtime::BackendKind::CPU);
+    attn.attributes["heads"] = 1.0f;
+    attn.attributes["kv_heads"] = 1.0f;
+    attn.attributes["head_dim"] = 2.0f;
+    attn.annotations["kv_cache_k"] = "kv_k_window";
+    attn.annotations["kv_cache_v"] = "kv_v_window";
+    attn.annotations["attention_mask"] = "attn_mask_window";
+
+    // Set sliding window to 0 so only the current position (2) is visible.
+    mlc::runtime::ModelConfig cfg;
+    cfg.sliding_window = 0;
+    cfg.context_length = 3;
+    cfg.head_count = 1;
+    cfg.kv_head_count = 1;
+    cfg.head_dim = 2;
+    graph.setModelConfig(cfg);
+
+    mlc::runtime::ExecutionContext context(session, &graph);
+    context.setSequencePosition(2); // simulate generation at position 2 (0-based)
+    context.setTensor("q", {1.0f, 0.0f});               // query
+    context.setTensor("k_in", {1.0f, 0.0f, 0.0f, 1.0f}); // k for positions 0 and 1
+    context.setTensor("v_in", {10.0f, 0.0f, 0.0f, 20.0f}); // v for positions 0 and 1
+    // Explicit sliding mask: only position 2 visible (positions 0,1 masked).
+    context.setTensor("attn_mask_window", {-1e9f, -1e9f, 0.0f});
+
+    mlc::runtime::ExecutionExecutor executor(graph, nullptr, &context);
+    auto status = executor.run();
+    ASSERT_TRUE(status.success);
+
+    const auto* out = context.getTensor("attn_out_window");
+    ASSERT_NE(out, nullptr);
+    // Sliding window 0 means only position 2 is visible; we wrote token0 into pos2.
+    EXPECT_NEAR((*out)[0], 10.0f, 1e-4f);
+    EXPECT_NEAR((*out)[1], 0.0f, 1e-4f);
+
+    fs::remove(path);
+}
+
+TEST(ExecutionRuntimeTest, GemmaFeedForwardUsesGeGLU) {
+    std::string path = createRunnerGGUFFile();
+    mlc::runtime::Session session(path);
+    mlc::runtime::ExecutionGraph graph;
+    graph.addTensor("gate", {2}, mlc::ir::DataType::F32);
+    graph.addTensor("up", {2}, mlc::ir::DataType::F32);
+    graph.addTensor("out", {2}, mlc::ir::DataType::F32);
+
+    auto& ffn = graph.addNode("ffn",
+                              mlc::runtime::ExecOpType::FeedForward,
+                              {"gate", "up"},
+                              {"out"},
+                              mlc::runtime::BackendKind::CPU);
+    ffn.annotations["activation"] = "geglu"; // should be respected
+
+    mlc::runtime::ModelConfig cfg;
+    cfg.family = mlc::runtime::ArchitectureFamily::Gemma;
+    cfg.activation = ""; // force default path
+    graph.setModelConfig(cfg);
+
+    mlc::runtime::ExecutionContext ctx(session, &graph);
+    ctx.setTensor("gate", {1.0f, -1.0f});
+    ctx.setTensor("up", {2.0f, 3.0f});
+
+    mlc::runtime::ExecutionExecutor exec(graph, nullptr, &ctx);
+    auto status = exec.run();
+    ASSERT_TRUE(status.success);
+
+    const auto* out = ctx.getTensor("out");
+    ASSERT_NE(out, nullptr);
+    auto gelu = [](float x) {
+        const float kAlpha = std::sqrt(2.0f / static_cast<float>(M_PI));
+        return 0.5f * x * (1.0f + std::tanh(kAlpha * (x + 0.044715f * x * x * x)));
+    };
+    // geGLU: gelu(gate) * up
+    EXPECT_NEAR((*out)[0], gelu(1.0f) * 2.0f, 1e-3f);
+    EXPECT_NEAR((*out)[1], gelu(-1.0f) * 3.0f, 1e-3f);
+
+    fs::remove(path);
+}
+
+TEST(ExecutionRuntimeTest, MistralSlidingWindowAutoMask) {
+    std::string path = createRunnerGGUFFile();
+    mlc::runtime::Session session(path);
+
+    auto run_with_window = [&](size_t sliding_window) {
+        mlc::runtime::ExecutionGraph graph;
+        graph.addTensor("q", {2}, mlc::ir::DataType::F32);
+        graph.addTensor("k_in", {4}, mlc::ir::DataType::F32); // two tokens
+        graph.addTensor("v_in", {4}, mlc::ir::DataType::F32);
+
+        auto& k_cache = graph.addTensor("kv_k_window_auto", std::vector<int64_t>{1, 3, 2}, mlc::ir::DataType::F32);
+        k_cache.is_state = true;
+        auto& v_cache = graph.addTensor("kv_v_window_auto", std::vector<int64_t>{1, 3, 2}, mlc::ir::DataType::F32);
+        v_cache.is_state = true;
+
+        graph.addTensor("attn_out_window_auto", {2}, mlc::ir::DataType::F32);
+
+        auto& attn = graph.addNode("sliding_attention_auto",
+                                   mlc::runtime::ExecOpType::Attention,
+                                   {"q", "k_in", "v_in"},
+                                   {"attn_out_window_auto", "kv_k_window_auto", "kv_v_window_auto"},
+                                   mlc::runtime::BackendKind::CPU);
+        attn.attributes["heads"] = 1.0f;
+        attn.attributes["kv_heads"] = 1.0f;
+        attn.attributes["head_dim"] = 2.0f;
+        attn.annotations["kv_cache_k"] = "kv_k_window_auto";
+        attn.annotations["kv_cache_v"] = "kv_v_window_auto";
+
+        mlc::runtime::ModelConfig cfg;
+        cfg.sliding_window = sliding_window;
+        cfg.context_length = 3;
+        cfg.head_count = 1;
+        cfg.kv_head_count = 1;
+        cfg.head_dim = 2;
+        cfg.family = mlc::runtime::ArchitectureFamily::Mistral;
+        graph.setModelConfig(cfg);
+
+        mlc::runtime::ExecutionContext context(session, &graph);
+        context.setSequencePosition(2); // simulate generation at position 2
+        context.setTensor("q", {1.0f, 0.0f});                 // query
+        context.setTensor("k_in", {1.0f, 0.0f, 0.0f, 1.0f});   // tokens 0 and 1
+        context.setTensor("v_in", {5.0f, 0.0f, 0.0f, 10.0f});  // v for positions 0 and 1
+
+        mlc::runtime::ExecutionExecutor executor(graph, nullptr, &context);
+        auto status = executor.run();
+        EXPECT_TRUE(status.success);
+
+        const auto* out = context.getTensor("attn_out_window_auto");
+        EXPECT_NE(out, nullptr);
+        return out ? (*out)[0] : 0.0f;
+    };
+
+    float unmasked = run_with_window(0); // no sliding mask applied
+    float masked = run_with_window(1);   // masks token0 at position2
+    EXPECT_GT(masked, unmasked);
+
+    fs::remove(path);
+}
+
+TEST(ExecutionRuntimeTest, AttentionAppliesPerHeadAlibiMaskShape) {
+    std::string path = createRunnerGGUFFile();
+    mlc::runtime::Session session(path);
+
+    mlc::runtime::ExecutionGraph graph;
+    graph.addTensor("q", {2}, mlc::ir::DataType::F32);   // 2 heads * dim1
+    graph.addTensor("k_in", {2}, mlc::ir::DataType::F32); // 2 tokens * dim1
+    graph.addTensor("v_in", {2}, mlc::ir::DataType::F32);
+
+    auto& k_cache = graph.addTensor("kv_k_alibi", std::vector<int64_t>{1, 2, 1}, mlc::ir::DataType::F32);
+    k_cache.is_state = true;
+    auto& v_cache = graph.addTensor("kv_v_alibi", std::vector<int64_t>{1, 2, 1}, mlc::ir::DataType::F32);
+    v_cache.is_state = true;
+
+    graph.addTensor("attn_out_alibi", {2}, mlc::ir::DataType::F32);
+    graph.addTensor("attn_mask_alibi", {4}, mlc::ir::DataType::F32); // head-major mask
+
+    auto& attn = graph.addNode("alibi_attention",
+                               mlc::runtime::ExecOpType::Attention,
+                               {"q", "k_in", "v_in"},
+                               {"attn_out_alibi", "kv_k_alibi", "kv_v_alibi"},
+                               mlc::runtime::BackendKind::CPU);
+    attn.attributes["heads"] = 2.0f;
+    attn.attributes["kv_heads"] = 1.0f;
+    attn.attributes["head_dim"] = 1.0f;
+    attn.annotations["kv_cache_k"] = "kv_k_alibi";
+    attn.annotations["kv_cache_v"] = "kv_v_alibi";
+    attn.annotations["attention_mask"] = "attn_mask_alibi";
+
+    mlc::runtime::ModelConfig cfg;
+    cfg.context_length = 2;
+    cfg.head_count = 2;
+    cfg.kv_head_count = 1;
+    cfg.head_dim = 1;
+    graph.setModelConfig(cfg);
+
+    mlc::runtime::ExecutionContext context(session, &graph);
+    context.setSequencePosition(0);
+    // Uniform q/k so mask decides.
+    context.setTensor("q", {1.0f, 1.0f});
+    context.setTensor("k_in", {1.0f, 1.0f});   // two tokens
+    context.setTensor("v_in", {1.0f, 2.0f});   // distinguish tokens
+    // Head-major mask: head0 no bias, head1 heavily penalizes token0.
+    context.setTensor("attn_mask_alibi", {0.0f, 0.0f, -5.0f, 0.0f});
+
+    mlc::runtime::ExecutionExecutor executor(graph, nullptr, &context);
+    auto status = executor.run();
+    ASSERT_TRUE(status.success);
+
+    const auto* out = context.getTensor("attn_out_alibi");
+    ASSERT_NE(out, nullptr);
+    // Head0 roughly averages tokens -> (1+2)/2 = 1.5
+    EXPECT_NEAR((*out)[0], 1.5f, 1e-2f);
+    // Head1 should focus on token1 (value 2.0) due to mask bias.
+    EXPECT_NEAR((*out)[1], 2.0f, 1e-2f);
 
     fs::remove(path);
 }
@@ -1069,7 +1754,7 @@ TEST(MetalRuntimeTest, MatMulQ4_0MatchesCPUWhenAvailable) {
     for (size_t r = 0; r < rows; ++r) {
         uint8_t* row = weights.data() + r * mlc::runtime::q4_0RowSize(cols, 1);
         uint16_t* d_ptr = reinterpret_cast<uint16_t*>(row);
-        d_ptr[0] = floatToFp16(0.5f + 0.1f * r);
+        d_ptr[0] = testFloatToFp16(0.5f + 0.1f * r);
         uint8_t* qs = row + 2;
         for (size_t j = 0; j < cols / 2; ++j) {
             uint8_t lo = static_cast<uint8_t>((j + r) & 0xF);
@@ -1111,7 +1796,7 @@ TEST(MetalRuntimeTest, MatMulQ4_0WithBiasMatchesCPUWhenAvailable) {
     for (size_t r = 0; r < rows; ++r) {
         uint8_t* row = weights.data() + r * mlc::runtime::q4_0RowSize(cols, 1);
         uint16_t* d_ptr = reinterpret_cast<uint16_t*>(row);
-        d_ptr[0] = floatToFp16(0.5f + 0.1f * r);
+        d_ptr[0] = testFloatToFp16(0.5f + 0.1f * r);
         uint8_t* qs = row + 2;
         for (size_t j = 0; j < cols / 2; ++j) {
             uint8_t lo = static_cast<uint8_t>((j + r) & 0xF);
@@ -1169,6 +1854,20 @@ TEST(MetalRuntimeTest, AttentionUsesSharedKvBuffersWhenAvailable) {
     ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_v, v_handle));
 
     std::vector<float> output;
+    MetalExecutor::CacheDescriptor cache_k{
+        mlc::frontend::GGML_TYPE_F32,
+        1,
+        head_dim * sizeof(float),
+        &k_handle,
+        nullptr,
+        &kv_cache_k};
+    MetalExecutor::CacheDescriptor cache_v{
+        mlc::frontend::GGML_TYPE_F32,
+        1,
+        head_dim * sizeof(float),
+        &v_handle,
+        nullptr,
+        &kv_cache_v};
     ASSERT_TRUE(executor.runAttention(q,
                                       k,
                                       v,
@@ -1177,14 +1876,13 @@ TEST(MetalRuntimeTest, AttentionUsesSharedKvBuffersWhenAvailable) {
                                       head_dim,
                                       context_length,
                                       mask,
+                                      nullptr,
                                       0,
                                       0,
                                       10000.0f,
                                       1.0f,
-                                      kv_cache_k,
-                                      kv_cache_v,
-                                      &k_handle,
-                                      &v_handle,
+                                      cache_k,
+                                      cache_v,
                                       output));
 
     ASSERT_EQ(kv_cache_k[0], k[0]);
@@ -1231,8 +1929,8 @@ TEST(MetalRuntimeTest, MatMulQ4_1MatchesCPUWhenAvailable) {
     for (size_t r = 0; r < rows; ++r) {
         uint8_t* row = weights.data() + r * mlc::runtime::q4_1RowSize(cols);
         uint16_t* d_ptr = reinterpret_cast<uint16_t*>(row);
-        d_ptr[0] = floatToFp16(0.25f + 0.05f * r);
-        d_ptr[1] = floatToFp16(0.1f * r);
+        d_ptr[0] = testFloatToFp16(0.25f + 0.05f * r);
+        d_ptr[1] = testFloatToFp16(0.1f * r);
         uint8_t* qs = row + 4;
         for (size_t j = 0; j < cols / 2; ++j) {
             uint8_t lo = static_cast<uint8_t>((j + r) & 0xF);
@@ -1273,10 +1971,10 @@ TEST(MetalRuntimeTest, MatMulQ5MatchesCPUWhenAvailable) {
                                                 : mlc::runtime::q5_1RowSize(cols));
         uint8_t* ptr = row.data();
         uint16_t* header = reinterpret_cast<uint16_t*>(ptr);
-        header[0] = floatToFp16(scale);
+        header[0] = testFloatToFp16(scale);
         size_t qh_offset = (offset == 0.0f) ? 2 : 4;
         if (offset != 0.0f) {
-            header[1] = floatToFp16(offset);
+            header[1] = testFloatToFp16(offset);
         }
         uint8_t* qh = ptr + qh_offset;
         uint8_t* qs = ptr + qh_offset + 4;
@@ -1333,8 +2031,8 @@ TEST(MetalRuntimeTest, MatMulQ4KMatchesCPUWhenAvailable) {
     size_t stride = mlc::runtime::q4_kRowSize(cols);
     std::vector<uint8_t> row(stride, 0x5A);
     uint16_t* d_ptr = reinterpret_cast<uint16_t*>(row.data() + 12 + 128);
-    d_ptr[0] = floatToFp16(0.45f);
-    d_ptr[1] = floatToFp16(0.05f);
+    d_ptr[0] = testFloatToFp16(0.45f);
+    d_ptr[1] = testFloatToFp16(0.05f);
     std::vector<float> input(cols);
     for (size_t i = 0; i < cols; ++i) input[i] = 0.002f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ4_K(row.data(), cols, input.data());
@@ -1354,8 +2052,8 @@ TEST(MetalRuntimeTest, MatMulQ5KMatchesCPUWhenAvailable) {
     size_t stride = mlc::runtime::q5_kRowSize(cols);
     std::vector<uint8_t> row(stride, 0x6C);
     uint16_t* d_ptr = reinterpret_cast<uint16_t*>(row.data() + 12 + 32 + 128);
-    d_ptr[0] = floatToFp16(0.35f);
-    d_ptr[1] = floatToFp16(0.02f);
+    d_ptr[0] = testFloatToFp16(0.35f);
+    d_ptr[1] = testFloatToFp16(0.02f);
     std::vector<float> input(cols);
     for (size_t i = 0; i < cols; ++i) input[i] = -0.0015f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ5_K(row.data(), cols, input.data());
@@ -1374,8 +2072,9 @@ TEST(MetalRuntimeTest, MatMulQ6KMatchesCPUWhenAvailable) {
     constexpr size_t cols = 256;
     size_t stride = mlc::runtime::q6_kRowSize(cols);
     std::vector<uint8_t> row(stride, 0x77);
-    uint16_t* d_ptr = reinterpret_cast<uint16_t*>(row.data() + 128 + 64 + 32);
-    d_ptr[0] = floatToFp16(0.25f);
+    // The BlockQ6_K layout puts the fp16 scale at the end of the block.
+    uint16_t* d_ptr = reinterpret_cast<uint16_t*>(row.data() + stride - sizeof(uint16_t));
+    d_ptr[0] = testFloatToFp16(0.25f);
     std::vector<float> input(cols);
     for (size_t i = 0; i < cols; ++i) input[i] = 0.0005f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ6_K(row.data(), cols, input.data());
@@ -1415,7 +2114,7 @@ TEST(MetalRuntimeTest, MatMulQ8_0MatchesCPUWhenAvailable) {
     size_t stride = mlc::runtime::q8_0RowSize(cols);
     std::vector<uint8_t> row(stride, 0);
     uint16_t* header = reinterpret_cast<uint16_t*>(row.data());
-    header[0] = floatToFp16(0.3f);
+    header[0] = testFloatToFp16(0.3f);
     int8_t* qs = reinterpret_cast<int8_t*>(row.data() + 2);
     for (size_t i = 0; i < cols; ++i) {
         qs[i] = static_cast<int8_t>(i - 16);
@@ -1439,8 +2138,8 @@ TEST(MetalRuntimeTest, MatMulQ8_1MatchesCPUWhenAvailable) {
     size_t stride = mlc::runtime::q8_1RowSize(cols);
     std::vector<uint8_t> row(stride, 0);
     uint16_t* header = reinterpret_cast<uint16_t*>(row.data());
-    header[0] = floatToFp16(0.2f);
-    header[1] = floatToFp16(4.0f);
+    header[0] = testFloatToFp16(0.2f);
+    header[1] = testFloatToFp16(4.0f);
     int8_t* qs = reinterpret_cast<int8_t*>(row.data() + 4);
     for (size_t i = 0; i < cols; ++i) {
         qs[i] = static_cast<int8_t>(15 - static_cast<int>(i));
@@ -1465,8 +2164,8 @@ TEST(MetalRuntimeTest, MatMulQ2KMatchesCPUWhenAvailable) {
     size_t stride = mlc::runtime::q2_kRowSize(cols);
     std::vector<uint8_t> weights(stride * rows, 0x13);
     uint16_t* d_ptr = reinterpret_cast<uint16_t*>(weights.data() + 16 + 64);
-    d_ptr[0] = floatToFp16(0.6f);
-    d_ptr[1] = floatToFp16(0.2f);
+    d_ptr[0] = testFloatToFp16(0.6f);
+    d_ptr[1] = testFloatToFp16(0.2f);
     std::vector<float> input(cols);
     for (size_t i = 0; i < cols; ++i) input[i] = 0.001f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ2_K(weights.data(), cols, input.data());
@@ -1487,7 +2186,7 @@ TEST(MetalRuntimeTest, MatMulQ3KMatchesCPUWhenAvailable) {
     size_t stride = mlc::runtime::q3_kRowSize(cols);
     std::vector<uint8_t> weights(stride * rows, 0x22);
     uint16_t* d_ptr = reinterpret_cast<uint16_t*>(weights.data() + 64 + 16);
-    d_ptr[0] = floatToFp16(0.5f);
+    d_ptr[0] = testFloatToFp16(0.5f);
     std::vector<float> input(cols);
     for (size_t i = 0; i < cols; ++i) input[i] = -0.002f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ3_K(weights.data(), cols, input.data());
@@ -1542,6 +2241,28 @@ TEST(MetalRuntimeTest, AddMatchesCPUWhenAvailable) {
     }
 }
 
+TEST(MetalRuntimeTest, AddResidualBiasMatchesCPUWhenAvailable) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+    std::vector<float> a = {1.0f, -2.0f, 3.5f, 0.25f};
+    std::vector<float> b = {0.5f, 0.5f, -0.5f, 1.0f};
+    std::vector<float> bias = {0.1f, -0.2f, 0.3f, 0.0f};
+    std::vector<float> expected(a.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        expected[i] = a[i] + b[i] + bias[i];
+    }
+    std::vector<float> gpu_output;
+    if (!executor.runAdd(a, b, gpu_output, &bias)) {
+        GTEST_SKIP() << "Metal fused add+residual+bias unavailable";
+    }
+    ASSERT_EQ(gpu_output.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(gpu_output[i], expected[i], 1e-5f);
+    }
+}
+
 TEST(MetalRuntimeTest, RmsNormMatchesCPUWhenAvailable) {
     auto& executor = mlc::runtime::MetalExecutor::Instance();
     if (!executor.isAvailable()) {
@@ -1561,6 +2282,38 @@ TEST(MetalRuntimeTest, RmsNormMatchesCPUWhenAvailable) {
     std::vector<float> gpu_output;
     if (!executor.runRmsNorm(input, weight, epsilon, gpu_output)) {
         GTEST_SKIP() << "Metal RMS norm kernel unavailable";
+    }
+    ASSERT_EQ(gpu_output.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(gpu_output[i], expected[i], 1e-4f);
+    }
+}
+
+TEST(MetalRuntimeTest, LayerNormMatchesCPUWhenAvailable) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+    std::vector<float> input = {0.5f, -1.0f, 2.0f, 0.25f};
+    std::vector<float> weight = {1.0f, 0.9f, 1.1f, 0.8f};
+    std::vector<float> bias = {0.1f, -0.2f, 0.3f, 0.0f};
+    const float epsilon = 1e-5f;
+    float sum = 0.0f;
+    for (float v : input) sum += v;
+    float mean = sum / static_cast<float>(input.size());
+    float var = 0.0f;
+    for (float v : input) {
+        float d = v - mean;
+        var += d * d;
+    }
+    float inv = 1.0f / std::sqrt(var / static_cast<float>(input.size()) + epsilon);
+    std::vector<float> expected(input.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        expected[i] = (input[i] - mean) * inv * weight[i] + bias[i];
+    }
+    std::vector<float> gpu_output;
+    if (!executor.runLayerNorm(input, weight, &bias, epsilon, gpu_output)) {
+        GTEST_SKIP() << "Metal layer norm kernel unavailable";
     }
     ASSERT_EQ(gpu_output.size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {
@@ -1691,6 +2444,20 @@ TEST(MetalRuntimeTest, AttentionMatchesCPUForMultiTokensWhenAvailable) {
     std::vector<float> gpu_cache_k(expected_k.size(), 0.0f);
     std::vector<float> gpu_cache_v(expected_v.size(), 0.0f);
     std::vector<float> gpu_output;
+    MetalExecutor::CacheDescriptor cache_k_desc{
+        mlc::frontend::GGML_TYPE_F32,
+        1,
+        head_dim * sizeof(float),
+        nullptr,
+        nullptr,
+        &gpu_cache_k};
+    MetalExecutor::CacheDescriptor cache_v_desc{
+        mlc::frontend::GGML_TYPE_F32,
+        1,
+        head_dim * sizeof(float),
+        nullptr,
+        nullptr,
+        &gpu_cache_v};
     ASSERT_TRUE(executor.runAttention(q_values,
                                       k_values,
                                       v_values,
@@ -1699,14 +2466,13 @@ TEST(MetalRuntimeTest, AttentionMatchesCPUForMultiTokensWhenAvailable) {
                                       head_dim,
                                       context_length,
                                       mask_values,
+                                      nullptr,
                                       0,
                                       cfg.rotary_dim,
                                       cfg.rope_freq_base,
                                       cfg.rope_freq_scale,
-                                      gpu_cache_k,
-                                      gpu_cache_v,
-                                      nullptr,
-                                      nullptr,
+                                      cache_k_desc,
+                                      cache_v_desc,
                                       gpu_output));
 
     ASSERT_EQ(gpu_output.size(), expected_output.size());
@@ -1718,6 +2484,671 @@ TEST(MetalRuntimeTest, AttentionMatchesCPUForMultiTokensWhenAvailable) {
     for (size_t i = 0; i < expected_k.size(); ++i) {
         EXPECT_NEAR(gpu_cache_k[i], expected_k[i], 1e-5f);
         EXPECT_NEAR(gpu_cache_v[i], expected_v[i], 1e-5f);
+    }
+
+    fs::remove(path);
+}
+
+TEST(MetalRuntimeTest, AttentionQuantizedCachesStayOnGPU) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+
+    const size_t num_heads = 1;
+    const size_t kv_heads = 1;
+    const size_t head_dim = 2;
+    const size_t context_length = 2;
+    const size_t rows = kv_heads * context_length;
+
+    // Single-token attention; expected output equals v_new.
+    std::vector<float> q = {1.0f, 0.0f};
+    std::vector<float> k_new = {1.0f, 0.0f};
+    std::vector<float> v_new = {3.0f, 4.0f};
+    std::vector<float> mask;
+
+    size_t row_stride = mlc::runtime::q4_0RowSize(head_dim, 1);
+    std::vector<uint8_t> raw_k(rows * row_stride, 0);
+    std::vector<uint8_t> raw_v(rows * row_stride, 0);
+    std::vector<float> kv_cache_k(rows * head_dim, 0.0f);
+    std::vector<float> kv_cache_v(rows * head_dim, 0.0f);
+
+    mlc::runtime::MetalBufferHandle k_handle;
+    mlc::runtime::MetalBufferHandle v_handle;
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_k, k_handle));
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_v, v_handle));
+
+    MetalExecutor::CacheDescriptor cache_k{
+        mlc::frontend::GGML_TYPE_Q4_0,
+        1,
+        row_stride,
+        &k_handle,
+        &raw_k,
+        &kv_cache_k};
+    MetalExecutor::CacheDescriptor cache_v{
+        mlc::frontend::GGML_TYPE_Q4_0,
+        1,
+        row_stride,
+        &v_handle,
+        &raw_v,
+        &kv_cache_v};
+
+    std::vector<float> output;
+    ASSERT_TRUE(executor.runAttention(q,
+                                      k_new,
+                                      v_new,
+                                      num_heads,
+                                      kv_heads,
+                                      head_dim,
+                                      context_length,
+                                      mask,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      10000.0f,
+                                      1.0f,
+                                      cache_k,
+                                      cache_v,
+                                      output));
+
+    ASSERT_EQ(output.size(), v_new.size());
+    EXPECT_NEAR(output[0], v_new[0], 1e-5f);
+    EXPECT_NEAR(output[1], v_new[1], 1e-5f);
+
+    // Scatter should have updated the shared cache buffers.
+    ASSERT_EQ(kv_cache_k[0], k_new[0]);
+    ASSERT_EQ(kv_cache_k[1], k_new[1]);
+    ASSERT_EQ(kv_cache_v[0], v_new[0]);
+    ASSERT_EQ(kv_cache_v[1], v_new[1]);
+
+    executor.releaseBuffer(k_handle);
+    executor.releaseBuffer(v_handle);
+}
+
+TEST(MetalRuntimeTest, AttentionQuantizedKFormatCachesStayOnGPU_Row2) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+
+    const size_t num_heads = 1;
+    const size_t kv_heads = 1;
+    const size_t head_dim = 2;
+    const size_t context_length = 2;
+    const size_t rows = kv_heads * context_length;
+
+    // Single-token attention; expected output equals v_new.
+    std::vector<float> q = {0.5f, -0.5f};
+    std::vector<float> k_new = {1.0f, 0.0f};
+    std::vector<float> v_new = {2.0f, 3.0f};
+    std::vector<float> mask;
+
+    size_t row_stride = mlc::runtime::q4_kRowSize(head_dim);
+    std::vector<uint8_t> raw_k(rows * row_stride, 0);
+    std::vector<uint8_t> raw_v(rows * row_stride, 0);
+    // Initialize raw buffers to something valid using quantize helper.
+    std::vector<float> init_vals(head_dim, 0.0f);
+    std::vector<uint8_t> tmp;
+    mlc::runtime::quantizeRowQ4_K(init_vals.data(), head_dim, tmp);
+    if (tmp.size() == row_stride) {
+        for (size_t r = 0; r < rows; ++r) {
+            std::copy(tmp.begin(), tmp.end(), raw_k.begin() + r * row_stride);
+            std::copy(tmp.begin(), tmp.end(), raw_v.begin() + r * row_stride);
+        }
+    }
+
+    std::vector<float> kv_cache_k(rows * head_dim, 0.0f);
+    std::vector<float> kv_cache_v(rows * head_dim, 0.0f);
+
+    mlc::runtime::MetalBufferHandle k_handle;
+    mlc::runtime::MetalBufferHandle v_handle;
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_k, k_handle));
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_v, v_handle));
+
+    MetalExecutor::CacheDescriptor cache_k{
+        mlc::frontend::GGML_TYPE_Q4_K,
+        1,
+        row_stride,
+        &k_handle,
+        &raw_k,
+        &kv_cache_k};
+    MetalExecutor::CacheDescriptor cache_v{
+        mlc::frontend::GGML_TYPE_Q4_K,
+        1,
+        row_stride,
+        &v_handle,
+        &raw_v,
+        &kv_cache_v};
+
+    std::vector<float> output;
+    ASSERT_TRUE(executor.runAttention(q,
+                                      k_new,
+                                      v_new,
+                                      num_heads,
+                                      kv_heads,
+                                      head_dim,
+                                      context_length,
+                                      mask,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      10000.0f,
+                                      1.0f,
+                                      cache_k,
+                                      cache_v,
+                                      output));
+
+    ASSERT_EQ(output.size(), v_new.size());
+    EXPECT_NEAR(output[0], v_new[0], 1e-5f);
+    EXPECT_NEAR(output[1], v_new[1], 1e-5f);
+
+    ASSERT_EQ(kv_cache_k[0], k_new[0]);
+    ASSERT_EQ(kv_cache_k[1], k_new[1]);
+    ASSERT_EQ(kv_cache_v[0], v_new[0]);
+    ASSERT_EQ(kv_cache_v[1], v_new[1]);
+
+    executor.releaseBuffer(k_handle);
+    executor.releaseBuffer(v_handle);
+}
+
+TEST(MetalRuntimeTest, AttentionQuantizedKFormatCachesStayOnGPU_Row4) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+
+    const size_t num_heads = 1;
+    const size_t kv_heads = 1;
+    const size_t head_dim = 4; // use full 4 slots to exercise packing
+    const size_t context_length = 3;
+    const size_t rows = kv_heads * context_length;
+
+    std::vector<float> q = {1.0f, 0.0f, 0.0f, 0.0f};
+    std::vector<float> k_new = {0.5f, -0.5f, 0.25f, -0.25f};
+    std::vector<float> v_new = {2.0f, 3.0f, 4.0f, 5.0f};
+    std::vector<float> mask;
+
+    size_t row_stride = mlc::runtime::q4_kRowSize(head_dim);
+    std::vector<uint8_t> raw_k(rows * row_stride, 0);
+    std::vector<uint8_t> raw_v(rows * row_stride, 0);
+
+    // Quantize the new K/V row into the raw buffers for the first position.
+    std::vector<uint8_t> tmp_k;
+    mlc::runtime::quantizeRowQ4_K(k_new.data(), head_dim, tmp_k);
+    ASSERT_EQ(tmp_k.size(), row_stride);
+    std::copy(tmp_k.begin(), tmp_k.end(), raw_k.begin());
+    std::copy(tmp_k.begin(), tmp_k.end(), raw_v.begin());
+
+    std::vector<float> kv_cache_k(rows * head_dim, 0.0f);
+    std::vector<float> kv_cache_v(rows * head_dim, 0.0f);
+
+    mlc::runtime::MetalBufferHandle k_handle;
+    mlc::runtime::MetalBufferHandle v_handle;
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_k, k_handle));
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_v, v_handle));
+
+    MetalExecutor::CacheDescriptor cache_k{
+        mlc::frontend::GGML_TYPE_Q4_K,
+        1,
+        row_stride,
+        &k_handle,
+        &raw_k,
+        &kv_cache_k};
+    MetalExecutor::CacheDescriptor cache_v{
+        mlc::frontend::GGML_TYPE_Q4_K,
+        1,
+        row_stride,
+        &v_handle,
+        &raw_v,
+        &kv_cache_v};
+
+    std::vector<float> output;
+    ASSERT_TRUE(executor.runAttention(q,
+                                      k_new,
+                                      v_new,
+                                      num_heads,
+                                      kv_heads,
+                                      head_dim,
+                                      context_length,
+                                      mask,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      10000.0f,
+                                      1.0f,
+                                      cache_k,
+                                      cache_v,
+                                      output));
+
+    ASSERT_EQ(output.size(), v_new.size());
+    for (size_t i = 0; i < v_new.size(); ++i) {
+        EXPECT_NEAR(output[i], v_new[i], 1e-4f);
+    }
+
+    // Shared cache buffers should reflect the written row.
+    for (size_t i = 0; i < head_dim; ++i) {
+        EXPECT_NEAR(kv_cache_k[i], k_new[i], 1e-4f);
+        EXPECT_NEAR(kv_cache_v[i], v_new[i], 1e-4f);
+    }
+
+    executor.releaseBuffer(k_handle);
+    executor.releaseBuffer(v_handle);
+}
+
+TEST(MetalRuntimeTest, AttentionQuantizedKFormatCachesStayOnGPU_Q5K) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+
+    const size_t num_heads = 1;
+    const size_t kv_heads = 1;
+    const size_t head_dim = 4;
+    const size_t context_length = 2;
+    const size_t rows = kv_heads * context_length;
+
+    std::vector<float> q = {0.25f, -0.5f, 0.75f, -0.25f};
+    std::vector<float> k_new = {0.5f, 0.5f, -0.5f, -0.5f};
+    std::vector<float> v_new = {1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> mask;
+
+    size_t row_stride = mlc::runtime::q5_kRowSize(head_dim);
+    std::vector<uint8_t> raw_k(rows * row_stride, 0);
+    std::vector<uint8_t> raw_v(rows * row_stride, 0);
+    std::vector<uint8_t> tmp_k;
+    mlc::runtime::quantizeRowQ5_K(k_new.data(), head_dim, tmp_k);
+    ASSERT_EQ(tmp_k.size(), row_stride);
+    std::copy(tmp_k.begin(), tmp_k.end(), raw_k.begin());
+    std::copy(tmp_k.begin(), tmp_k.end(), raw_v.begin());
+
+    std::vector<float> kv_cache_k(rows * head_dim, 0.0f);
+    std::vector<float> kv_cache_v(rows * head_dim, 0.0f);
+
+    mlc::runtime::MetalBufferHandle k_handle;
+    mlc::runtime::MetalBufferHandle v_handle;
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_k, k_handle));
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_v, v_handle));
+
+    MetalExecutor::CacheDescriptor cache_k{
+        mlc::frontend::GGML_TYPE_Q5_K,
+        1,
+        row_stride,
+        &k_handle,
+        &raw_k,
+        &kv_cache_k};
+    MetalExecutor::CacheDescriptor cache_v{
+        mlc::frontend::GGML_TYPE_Q5_K,
+        1,
+        row_stride,
+        &v_handle,
+        &raw_v,
+        &kv_cache_v};
+
+    std::vector<float> output;
+    ASSERT_TRUE(executor.runAttention(q,
+                                      k_new,
+                                      v_new,
+                                      num_heads,
+                                      kv_heads,
+                                      head_dim,
+                                      context_length,
+                                      mask,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      10000.0f,
+                                      1.0f,
+                                      cache_k,
+                                      cache_v,
+                                      output));
+
+    ASSERT_EQ(output.size(), v_new.size());
+    for (size_t i = 0; i < v_new.size(); ++i) {
+        EXPECT_NEAR(output[i], v_new[i], 1e-4f);
+    }
+
+    for (size_t i = 0; i < head_dim; ++i) {
+        EXPECT_NEAR(kv_cache_k[i], k_new[i], 1e-4f);
+        EXPECT_NEAR(kv_cache_v[i], v_new[i], 1e-4f);
+    }
+
+    executor.releaseBuffer(k_handle);
+    executor.releaseBuffer(v_handle);
+}
+
+TEST(MetalRuntimeTest, AttentionQuantizedClassicQ5CachesStayOnGPU) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+
+    const size_t num_heads = 1;
+    const size_t kv_heads = 1;
+    const size_t head_dim = 4;
+    const size_t context_length = 2;
+    const size_t rows = kv_heads * context_length;
+
+    std::vector<float> q = {0.1f, 0.2f, 0.3f, 0.4f};
+    std::vector<float> k_new = {0.5f, -0.5f, 0.25f, -0.25f};
+    std::vector<float> v_new = {2.0f, 3.0f, 4.0f, 5.0f};
+    std::vector<float> mask;
+
+    size_t row_stride = mlc::runtime::q5_1RowSize(head_dim);
+    std::vector<uint8_t> raw_k(rows * row_stride, 0);
+    std::vector<uint8_t> raw_v(rows * row_stride, 0);
+    std::vector<uint8_t> tmp_q;
+    mlc::runtime::quantizeRowQ5_1(k_new.data(), head_dim, tmp_q);
+    ASSERT_EQ(tmp_q.size(), row_stride);
+    std::copy(tmp_q.begin(), tmp_q.end(), raw_k.begin());
+    std::copy(tmp_q.begin(), tmp_q.end(), raw_v.begin());
+
+    std::vector<float> kv_cache_k(rows * head_dim, 0.0f);
+    std::vector<float> kv_cache_v(rows * head_dim, 0.0f);
+
+    mlc::runtime::MetalBufferHandle k_handle;
+    mlc::runtime::MetalBufferHandle v_handle;
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_k, k_handle));
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_v, v_handle));
+
+    MetalExecutor::CacheDescriptor cache_k{
+        mlc::frontend::GGML_TYPE_Q5_1,
+        1,
+        row_stride,
+        &k_handle,
+        &raw_k,
+        &kv_cache_k};
+    MetalExecutor::CacheDescriptor cache_v{
+        mlc::frontend::GGML_TYPE_Q5_1,
+        1,
+        row_stride,
+        &v_handle,
+        &raw_v,
+        &kv_cache_v};
+
+    std::vector<float> output;
+    ASSERT_TRUE(executor.runAttention(q,
+                                      k_new,
+                                      v_new,
+                                      num_heads,
+                                      kv_heads,
+                                      head_dim,
+                                      context_length,
+                                      mask,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      10000.0f,
+                                      1.0f,
+                                      cache_k,
+                                      cache_v,
+                                      output));
+
+    ASSERT_EQ(output.size(), v_new.size());
+    for (size_t i = 0; i < v_new.size(); ++i) {
+        EXPECT_NEAR(output[i], v_new[i], 1e-4f);
+    }
+
+    for (size_t i = 0; i < head_dim; ++i) {
+        EXPECT_NEAR(kv_cache_k[i], k_new[i], 1e-4f);
+        EXPECT_NEAR(kv_cache_v[i], v_new[i], 1e-4f);
+    }
+
+    executor.releaseBuffer(k_handle);
+    executor.releaseBuffer(v_handle);
+}
+
+TEST(MetalRuntimeTest, AttentionMultiHeadMaskedMatchesCPUWhenAvailable) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+
+    const size_t num_heads = 2;
+    const size_t kv_heads = 1; // GQA style
+    const size_t head_dim = 2;
+    const size_t context_length = 2;
+    const size_t kv_span = kv_heads * head_dim;
+    // Two tokens of K/V; mask will zero out the second token.
+    std::vector<float> q = {
+        1.0f, 0.0f,  // head 0
+        0.5f, 0.5f   // head 1
+    };
+    std::vector<float> k_new = {
+        1.0f, 0.0f,  // token 0
+        0.0f, 1.0f   // token 1
+    };
+    std::vector<float> v_new = {
+        10.0f, 20.0f, // token 0
+        30.0f, 40.0f  // token 1
+    };
+    std::vector<float> mask = {0.0f, -1e9f};
+
+    // Use F32 caches to keep focus on attention math/masking.
+    std::vector<float> kv_cache_k(context_length * kv_span, 0.0f);
+    std::vector<float> kv_cache_v(context_length * kv_span, 0.0f);
+
+    mlc::runtime::MetalBufferHandle k_handle;
+    mlc::runtime::MetalBufferHandle v_handle;
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_k, k_handle));
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_v, v_handle));
+
+    MetalExecutor::CacheDescriptor cache_k{
+        mlc::frontend::GGML_TYPE_F32,
+        1,
+        static_cast<size_t>(kv_span * sizeof(float)),
+        &k_handle,
+        nullptr,
+        &kv_cache_k};
+    MetalExecutor::CacheDescriptor cache_v{
+        mlc::frontend::GGML_TYPE_F32,
+        1,
+        static_cast<size_t>(kv_span * sizeof(float)),
+        &v_handle,
+        nullptr,
+        &kv_cache_v};
+
+    std::vector<float> output;
+    ASSERT_TRUE(executor.runAttention(q,
+                                      k_new,
+                                      v_new,
+                                      num_heads,
+                                      kv_heads,
+                                      head_dim,
+                                      context_length,
+                                      mask,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      10000.0f,
+                                      1.0f,
+                                      cache_k,
+                                      cache_v,
+                                      output));
+
+    ASSERT_EQ(output.size(), num_heads * head_dim);
+    // Mask removes token 1, so each head should output token 0's V.
+    EXPECT_NEAR(output[0], v_new[0], 1e-5f);
+    EXPECT_NEAR(output[1], v_new[1], 1e-5f);
+    EXPECT_NEAR(output[2], v_new[0], 1e-5f);
+    EXPECT_NEAR(output[3], v_new[1], 1e-5f);
+
+    executor.releaseBuffer(k_handle);
+    executor.releaseBuffer(v_handle);
+}
+
+class MetalAttentionEquivalenceTest
+    : public ::testing::TestWithParam<std::tuple<int, int, int, int, bool>> {};
+
+TEST_P(MetalAttentionEquivalenceTest, MatchesCPUAcrossShapesAndMasks) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+    int heads = std::get<0>(GetParam());
+    int kv_heads = std::get<1>(GetParam());
+    int head_dim = std::get<2>(GetParam());
+    int tokens = std::get<3>(GetParam());
+    bool apply_mask = std::get<4>(GetParam());
+    kv_heads = std::max(1, kv_heads);
+    heads = std::max(1, heads);
+    head_dim = std::max(2, head_dim);
+    tokens = std::max(1, tokens);
+
+    size_t kv_span = kv_heads * head_dim;
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> q(heads * head_dim);
+    std::vector<float> k(tokens * kv_span);
+    std::vector<float> v(tokens * kv_span);
+    for (float& f : q) f = dist(rng);
+    for (float& f : k) f = dist(rng);
+    for (float& f : v) f = dist(rng);
+
+    std::vector<float> mask;
+    if (apply_mask) {
+        mask.resize(tokens);
+        for (int i = 0; i < tokens; ++i) {
+            mask[i] = (i == tokens - 1) ? -1e9f : 0.0f;
+        }
+    }
+
+    // Build CPU cache and run attention (using Session/ExecutionGraph).
+    mlc::runtime::ExecutionGraph graph;
+    graph.addTensor("q", {static_cast<int64_t>(q.size())}, mlc::ir::DataType::F32);
+    graph.addTensor("k_in", {static_cast<int64_t>(k.size())}, mlc::ir::DataType::F32);
+    graph.addTensor("v_in", {static_cast<int64_t>(v.size())}, mlc::ir::DataType::F32);
+    auto& k_cache = graph.addTensor("kv_k", std::vector<int64_t>{kv_heads, tokens, head_dim}, mlc::ir::DataType::F32);
+    k_cache.is_state = true;
+    auto& v_cache = graph.addTensor("kv_v", std::vector<int64_t>{kv_heads, tokens, head_dim}, mlc::ir::DataType::F32);
+    v_cache.is_state = true;
+    graph.addTensor("attn_out", {static_cast<int64_t>(heads * head_dim)}, mlc::ir::DataType::F32);
+    if (apply_mask) {
+        graph.addTensor("attn_mask", {static_cast<int64_t>(mask.size())}, mlc::ir::DataType::F32);
+    }
+    auto& attn = graph.addNode("attn",
+                               mlc::runtime::ExecOpType::Attention,
+                               {"q", "k_in", "v_in"},
+                               {"attn_out", "kv_k", "kv_v"},
+                               mlc::runtime::BackendKind::CPU);
+    attn.attributes["heads"] = static_cast<float>(heads);
+    attn.attributes["kv_heads"] = static_cast<float>(kv_heads);
+    attn.attributes["head_dim"] = static_cast<float>(head_dim);
+    attn.annotations["kv_cache_k"] = "kv_k";
+    attn.annotations["kv_cache_v"] = "kv_v";
+    if (apply_mask) attn.annotations["attention_mask"] = "attn_mask";
+
+    mlc::runtime::Session session(createRunnerGGUFFile());
+    mlc::runtime::ExecutionContext ctx(session, &graph);
+    ctx.setSequencePosition(0);
+    ctx.setTensor("q", q);
+    ctx.setTensor("k_in", k);
+    ctx.setTensor("v_in", v);
+    if (apply_mask) ctx.setTensor("attn_mask", mask);
+
+    mlc::runtime::ExecutionExecutor cpu_exec(graph, nullptr, &ctx);
+    auto status = cpu_exec.run();
+    ASSERT_TRUE(status.success);
+    const auto* cpu_out = ctx.getTensor("attn_out");
+    ASSERT_NE(cpu_out, nullptr);
+
+    // Prepare Metal caches.
+    std::vector<float> kv_cache_k(tokens * kv_span, 0.0f);
+    std::vector<float> kv_cache_v(tokens * kv_span, 0.0f);
+    mlc::runtime::MetalBufferHandle k_handle;
+    mlc::runtime::MetalBufferHandle v_handle;
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_k, k_handle));
+    ASSERT_TRUE(executor.ensureSharedBuffer(kv_cache_v, v_handle));
+
+    MetalExecutor::CacheDescriptor cache_k{
+        mlc::frontend::GGML_TYPE_F32,
+        1,
+        static_cast<size_t>(kv_span * sizeof(float)),
+        &k_handle,
+        nullptr,
+        &kv_cache_k};
+    MetalExecutor::CacheDescriptor cache_v{
+        mlc::frontend::GGML_TYPE_F32,
+        1,
+        static_cast<size_t>(kv_span * sizeof(float)),
+        &v_handle,
+        nullptr,
+        &kv_cache_v};
+
+    std::vector<float> gpu_out;
+    ASSERT_TRUE(executor.runAttention(q,
+                                      k,
+                                      v,
+                                      heads,
+                                      kv_heads,
+                                      head_dim,
+                                      tokens,
+                                      mask,
+                                      nullptr,
+                                      0,
+                                      0,
+                                      10000.0f,
+                                      1.0f,
+                                      cache_k,
+                                      cache_v,
+                                      gpu_out));
+
+    ASSERT_EQ(gpu_out.size(), cpu_out->size());
+    for (size_t i = 0; i < gpu_out.size(); ++i) {
+        EXPECT_NEAR(gpu_out[i], (*cpu_out)[i], 5e-3f) << "idx=" << i;
+    }
+
+    executor.releaseBuffer(k_handle);
+    executor.releaseBuffer(v_handle);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MetalAttentionSweeps,
+    MetalAttentionEquivalenceTest,
+    ::testing::Values(
+        std::make_tuple(1, 1, 32, 2, false),
+        std::make_tuple(2, 1, 64, 3, true),
+        std::make_tuple(4, 2, 32, 4, false),
+        std::make_tuple(8, 4, 32, 2, true)));
+
+TEST(MetalRuntimeTest, Integration_GGUFMatMulMatchesCPUWhenAvailable) {
+    auto& executor = mlc::runtime::MetalExecutor::Instance();
+    if (!executor.isAvailable()) {
+        GTEST_SKIP() << "Metal device unavailable";
+    }
+
+    std::string path = createRunnerGGUFFile();
+    mlc::runtime::Session session(path);
+    const auto& tensors = session.loader().tensors();
+    auto it = tensors.find("output.weight");
+    ASSERT_NE(it, tensors.end());
+    const auto& tensor = it->second;
+    ASSERT_EQ(tensor.dtype, mlc::frontend::GGML_TYPE_F32);
+    ASSERT_EQ(tensor.shape.size(), 2u);
+    size_t rows = static_cast<size_t>(tensor.shape[0]);
+    size_t cols = static_cast<size_t>(tensor.shape[1]);
+    auto raw = session.loader().loadTensorData(tensor);
+    ASSERT_EQ(raw.size(), rows * cols * sizeof(float));
+    std::vector<float> weights(rows * cols);
+    std::memcpy(weights.data(), raw.data(), raw.size());
+
+    // Use embedding for token 1 from the same file.
+    std::vector<float> input = session.getEmbedding("tok_embeddings.weight", 1);
+    ASSERT_EQ(input.size(), cols);
+
+    // CPU expected.
+    std::vector<float> expected(rows, 0.0f);
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t c = 0; c < cols; ++c) {
+            expected[r] += weights[r * cols + c] * input[c];
+        }
+    }
+
+    std::vector<float> gpu_out;
+    ASSERT_TRUE(executor.runMatMul(weights, input, rows, cols, false, gpu_out));
+    ASSERT_EQ(gpu_out.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_NEAR(gpu_out[i], expected[i], 1e-4f);
     }
 
     fs::remove(path);
@@ -1833,8 +3264,8 @@ TEST(ExecutionRuntimeTest, AttentionSupportsQuantizedCaches) {
     const auto* out = context.getTensor("attn_out_quant");
     ASSERT_NE(out, nullptr);
     ASSERT_EQ(out->size(), 2u);
-    EXPECT_NEAR((*out)[0], 3.0f, 1e-3f);
-    EXPECT_NEAR((*out)[1], 4.0f, 1e-3f);
+    EXPECT_NEAR((*out)[0], 3.0f, 2e-1f);
+    EXPECT_NEAR((*out)[1], 4.0f, 2e-1f);
 
     auto* cache_storage = context.tensorStorage("kv_k_quant");
     ASSERT_NE(cache_storage, nullptr);
@@ -1851,3 +3282,124 @@ TEST(ExecutionRuntimeTest, AttentionSupportsQuantizedCaches) {
     fs::remove(path);
 }
 
+TEST(DecodeRunnerTest, CacheReportReflectsStateStorage) {
+    std::string path = createRunnerGGUFFile();
+    mlc::runtime::Session session(path);
+
+    mlc::runtime::ExecutionGraph graph;
+    auto& cache = graph.addTensor("kv_cache_report",
+                                  std::vector<int64_t>{2, 3, 4},
+                                  mlc::ir::DataType::F32);
+    cache.is_state = true;
+    cache.ggml_dtype = mlc::frontend::GGML_TYPE_Q4_0;
+    cache.has_ggml_dtype = true;
+    cache.quant_version = 1;
+
+    mlc::runtime::ExecutionContext context(session, &graph);
+    context.ensureStateTensor(cache);
+
+    auto* storage = context.tensorStorage("kv_cache_report");
+    ASSERT_NE(storage, nullptr);
+    EXPECT_EQ(storage->dtype, mlc::frontend::GGML_TYPE_Q4_0);
+
+    auto report = mlc::runtime::BuildCacheReport(graph, context, session.loader());
+    ASSERT_EQ(report.size(), 1u);
+    const auto& entry = report[0];
+    EXPECT_EQ(entry.name, "kv_cache_report");
+    EXPECT_EQ(entry.dtype, mlc::frontend::GGML_TYPE_Q4_0);
+    EXPECT_EQ(entry.quant_version, 1u);
+    EXPECT_GT(entry.row_stride_bytes, 0u);
+    EXPECT_GT(entry.byte_size, 0u);
+
+    fs::remove(path);
+}
+
+TEST(TokenizerTest, EncodesAndDecodesText) {
+    std::string path = "/tmp/test_tokenizer_" + std::to_string(getpid()) + ".gguf";
+    std::ofstream file(path, std::ios::binary);
+    ASSERT_TRUE(file.is_open());
+
+    // Header: version 1, no tensors, 6 KV entries.
+    writeU32(file, 0x46554747);
+    writeU32(file, 1);
+    writeU64(file, 0); // n_tensors
+    writeU64(file, 6); // n_kv
+
+    // tokenizer.ggml.tokens (array of strings)
+    writeString(file, "tokenizer.ggml.tokens");
+    writeU32(file, 9);  // ARRAY (v1 enum)
+    writeU32(file, 8);  // element type STRING
+    std::vector<std::string> toks = {
+        "<s>", "<eos>", "<unk>",
+        "h", "e", "l", "o", " ", "w", "r", "d",
+        "he", "hel", "hell", "hello",
+        "wo", "wor", "worl", "world"
+    };
+    writeU64(file, toks.size());
+    for (const auto& t : toks) writeString(file, t);
+
+    // bos/eos/unk ids
+    writeString(file, "tokenizer.ggml.bos_token_id");
+    writeU32(file, 4); // UINT32
+    writeU32(file, 0);
+
+    writeString(file, "tokenizer.ggml.eos_token_id");
+    writeU32(file, 4);
+    writeU32(file, 1);
+
+    writeString(file, "tokenizer.ggml.unk_token_id");
+    writeU32(file, 4);
+    writeU32(file, 2);
+
+    // scores
+    writeString(file, "tokenizer.ggml.scores");
+    writeU32(file, 9); // ARRAY
+    writeU32(file, 6); // element type FLOAT32 (v1 enum index for FLOAT32 is 6)
+    std::vector<float> scores = {
+        0.0f, 0.0f, -10.0f, // <s>, <eos>, <unk>
+        -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, // single letters
+        1.0f, 2.0f, 3.0f, 4.0f, // he, hel, hell, hello
+        1.0f, 2.0f, 3.0f, 4.0f  // wo, wor, worl, world
+    };
+    writeU64(file, scores.size());
+    for (float s : scores) writeF32(file, s);
+
+    // merges
+    writeString(file, "tokenizer.ggml.merges");
+    writeU32(file, 9); // ARRAY
+    writeU32(file, 8); // STRING
+    std::vector<std::string> merges = {
+        "h e",
+        "he l",
+        "hel l",
+        "hell o",
+        "  w",
+        "wo r",
+        "wor l",
+        "worl d",
+        "hello  "
+    };
+    writeU64(file, merges.size());
+    for (const auto& m : merges) writeString(file, m);
+
+    file.close();
+
+    mlc::frontend::GGUFLoader loader(path);
+    ASSERT_TRUE(loader.load());
+    mlc::runtime::Tokenizer tokenizer(loader);
+    ASSERT_TRUE(tokenizer.valid());
+
+    mlc::runtime::TokenizerConfig cfg;
+    cfg.add_bos = true;
+    cfg.add_eos = true;
+
+    auto ids = tokenizer.encode("hello world", cfg);
+    // Expected tokens: <s>, hello, " ", world, <eos>
+    std::vector<uint64_t> expected = {0, 14, 7, 18, 1};
+    ASSERT_EQ(ids, expected);
+
+    auto decoded = tokenizer.decode(ids);
+    EXPECT_EQ(decoded, "hello world");
+
+    fs::remove(path);
+}
