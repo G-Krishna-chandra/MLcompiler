@@ -82,11 +82,14 @@ std::string createLinearGGUFFile() {
     writeU64(file, 1); // n_tensors
     writeU64(file, 0); // n_kv
 
+    // Canonical GGML: shape = [ne0=cols=3 (input dim), ne1=rows=2 (output dim)].
+    // Storage is row-major: 2 rows of 3 floats each. Row 0 = [1,2,3], row 1 = [0,1,0.5].
+    // Test runs Session::runLinear with input.size()=3 → matches_cols → output.size()=2.
     writeString(file, "linear.weight");
     writeU32(file, 2); // dims
     writeU64(file, 2);
-    writeU32(file, 2); // rows
-    writeU32(file, 3); // cols
+    writeU32(file, 3); // ne0 = cols (input dim)
+    writeU32(file, 2); // ne1 = rows (output dim)
     writeU32(file, 0); // F32
     writeU64(file, 256); // data offset
 
@@ -124,19 +127,22 @@ std::string createRunnerGGUFFile() {
     writeU32(file, 4);
     writeU32(file, 3);
 
+    // Canonical GGML: tok_embeddings.weight = [ne0=hidden=3, ne1=vocab=4].
+    // Embedding for token i is row i (4 rows × 3 floats each).
     writeString(file, "tok_embeddings.weight");
     writeU32(file, 2);
     writeU64(file, 2);
-    writeU32(file, 4);
-    writeU32(file, 3);
+    writeU32(file, 3); // ne0 = hidden_dim (cols)
+    writeU32(file, 4); // ne1 = vocab_size (rows)
     writeU32(file, 0);
     writeU64(file, 512);
 
+    // Canonical GGML: output.weight = [ne0=hidden=3 (input dim), ne1=vocab=2 (output dim)].
     writeString(file, "output.weight");
     writeU32(file, 2);
     writeU64(file, 2);
-    writeU32(file, 2);
-    writeU32(file, 3);
+    writeU32(file, 3); // ne0 = cols = input dim
+    writeU32(file, 2); // ne1 = rows = output dim
     writeU32(file, 0);
     writeU64(file, 560);
 
@@ -174,11 +180,16 @@ std::string createTransposedEmbeddingGGUFFile() {
     writeU64(file, 1);
     writeU64(file, 0);
 
+    // Canonical GGML: token_embd.weight = [ne0=vocab=4, ne1=hidden=3], dtype I8.
+    // Storage is row-major: 3 rows of 4 bytes each. Because rows < cols and the name
+    // matches "token_embd", Session::getEmbedding triggers tokens_as_rows=false (column-
+    // major embedding lookup). For token i, output[r] = data[r*cols + i] for r in 0..rows-1.
+    // Token 2 -> [data[2], data[6], data[10]] = [12, 22, 32]. Output size = rows = 3.
     writeString(file, "token_embd.weight");
     writeU32(file, 2);
     writeU64(file, 2);
-    writeU32(file, 3);
-    writeU32(file, 4);
+    writeU32(file, 4); // ne0 = cols = vocab (4 tokens)
+    writeU32(file, 3); // ne1 = rows = hidden (3 dims)
     writeU32(file, 24);
     writeU64(file, 256);
 
@@ -205,11 +216,23 @@ std::string createTransposedOutputGGUFFile() {
     writeU64(file, 1);
     writeU64(file, 0);
 
+    // Canonical GGML: output.weight = [ne0=cols=3 (input dim), ne1=rows=4 (output dim)],
+    // dtype I8. Test calls Session::runLinear with input.size()=3 → matches_cols →
+    // non-transpose path → output.size()=4.
+    // Storage row-major: 3 rows of 4 bytes each? No — wait, with cols=3 the storage is
+    // 4 rows of 3 bytes each. Re-derive: data has 12 bytes, rows=4, row_stride=3.
+    // Row r = bytes [3r .. 3r+2]. Then per session::runLinear matches_rows path... actually
+    // input.size()=3==cols so we take matches_cols. output[r] = sum_c W[r,c]*input[c].
+    // Row 0=[1,2,3], output[0]=1+4+9=14.
+    // BUT the test expects [38, 44, 50, 56] which corresponds to the matches_rows branch
+    // (input dotting columns of a 3x4 layout). To preserve the test's intent of exercising
+    // the transposed path, we keep the dimensions such that input.size()==rows triggers it:
+    // ne0=4=cols (output dim), ne1=3=rows (input dim) → input.size()=3==rows → transpose.
     writeString(file, "output.weight");
     writeU32(file, 2);
     writeU64(file, 2);
-    writeU32(file, 3);
-    writeU32(file, 4);
+    writeU32(file, 4); // ne0 = cols (output dim under matches_rows path)
+    writeU32(file, 3); // ne1 = rows (input dim under matches_rows path)
     writeU32(file, 24);
     writeU64(file, 256);
 
@@ -240,10 +263,13 @@ std::string createQuantFFNGGUFFile(uint32_t dtype = 2 /*Q4_0*/, size_t cols = 32
     writeU32(file, 4); // UINT32
     writeU32(file, 1);
 
+    // Canonical GGML: q_weight = [ne0=cols (input dim), ne1=rows=2 (output dim)].
+    // Two quantized rows, each `cols` elements wide. Test runs fused FFN with input.size()=cols
+    // → matches_cols → output.size()=2.
     writeString(file, "q_weight");
     writeU32(file, 2);  // dims
-    writeU32(file, 2);                    // rows
-    writeU32(file, static_cast<uint32_t>(cols)); // cols
+    writeU32(file, static_cast<uint32_t>(cols)); // ne0 = cols (input dim)
+    writeU32(file, 2);                           // ne1 = rows (output dim)
     writeU32(file, dtype);
     writeU64(file, 256);
 
@@ -288,19 +314,22 @@ std::string createTransposedRunnerGGUFFile() {
     writeU32(file, 4);
     writeU32(file, 3);
 
+    // Canonical GGML: tok_embeddings.weight = [ne0=hidden=3, ne1=vocab=4].
     writeString(file, "tok_embeddings.weight");
     writeU32(file, 2);
     writeU64(file, 2);
-    writeU32(file, 4);
-    writeU32(file, 3);
+    writeU32(file, 3); // ne0 = hidden_dim
+    writeU32(file, 4); // ne1 = vocab_size
     writeU32(file, 0);
     writeU64(file, 512);
 
+    // Canonical GGML: output.weight = [ne0=cols=4 (output dim), ne1=rows=3 (input dim)],
+    // dtype I8. Input size 3 (from embedding) matches rows → matches_rows path → output size = cols = 4.
     writeString(file, "output.weight");
     writeU32(file, 2);
     writeU64(file, 2);
-    writeU32(file, 3);
-    writeU32(file, 4);
+    writeU32(file, 4); // ne0 = cols (output dim under transposed dispatch)
+    writeU32(file, 3); // ne1 = rows (input dim)
     writeU32(file, 24);
     writeU64(file, 560);
 
@@ -566,7 +595,8 @@ TEST(ExecutionRuntimeTest, FusedFeedForwardSupportsQuantizedWeights) {
     ASSERT_NE(it, tensors.end());
     auto raw = session.loader().loadTensorData(it->second);
     ASSERT_FALSE(raw.empty());
-    size_t stride = raw.size() / static_cast<size_t>(it->second.shape[0]);
+    // Canonical GGML: shape[1] = rows = number of output rows; row_stride = total / rows.
+    size_t stride = raw.size() / static_cast<size_t>(it->second.shape[1]);
     ASSERT_GT(stride, 0u);
     std::vector<float> deq_row(32);
     std::vector<float> gate_vals(2);
@@ -629,7 +659,8 @@ TEST(ExecutionRuntimeTest, FusedFeedForwardSupportsQuantizedWeightsKSeries) {
     auto it = tensors.find("q_weight");
     ASSERT_NE(it, tensors.end());
     auto raw = session.loader().loadTensorData(it->second);
-    size_t stride = raw.size() / static_cast<size_t>(it->second.shape[0]);
+    // Canonical GGML: shape[1] = rows = number of output rows; row_stride = total / rows.
+    size_t stride = raw.size() / static_cast<size_t>(it->second.shape[1]);
     std::vector<float> deq_row(cols);
     std::vector<float> gate_vals(2);
     std::vector<float> up_vals(2);
@@ -678,19 +709,19 @@ TEST(ExecutionRuntimeTest, FusedFeedForwardDownProjectionWithBias) {
         writeU64(file, 2);  // tensors
         writeU64(file, 0);  // kv
 
-        // gate/up weight: 2x3
+        // Canonical GGML: w_gate = [ne0=cols=3 (input dim), ne1=rows=2 (output dim)] F32.
         writeString(file, "w_gate");
         writeU32(file, 2);
-        writeU32(file, 2);
-        writeU32(file, 3);
+        writeU32(file, 3); // ne0 = cols (input dim)
+        writeU32(file, 2); // ne1 = rows (output dim)
         writeU32(file, 0);  // F32
         writeU64(file, 256);
 
-        // down weight: 2x2
+        // Canonical GGML: w_down = [ne0=cols=2 (input dim), ne1=rows=2 (output dim)] F32 — square.
         writeString(file, "w_down");
         writeU32(file, 2);
-        writeU32(file, 2);
-        writeU32(file, 2);
+        writeU32(file, 2); // ne0 = cols
+        writeU32(file, 2); // ne1 = rows
         writeU32(file, 0);  // F32
         writeU64(file, 256 + sizeof(float) * 6);
 
@@ -1002,6 +1033,12 @@ void RunRoundTripQuant(const QuantFunc& quant,
 
 } // namespace
 
+// TODO(quant-precision): This test fails because the CPU Q4_0 quantize routine in
+// quantization.cpp produces ~6 elements (out of 64) outside the 1e-1 tolerance for
+// sin(0..63) input. Pure quantize/dequant precision issue — does NOT call the Metal
+// kernel and is unrelated to Bug A (split-half indexing) or Bug B (operator_backend
+// rows/cols swap). Pre-dates the GGML-canonical test fixture cleanup. Leaving in
+// place as a flag; revisit when tightening CPU quant routines.
 TEST(QuantizationTest, Q4_0RoundTripQuantization) {
     using namespace mlc::runtime;
     constexpr size_t cols = 64;
@@ -1918,6 +1955,12 @@ TEST(MetalRuntimeTest, ScatterKvCacheWritesBuffer) {
 }
 #endif
 
+// TODO(metal-q4_1-split-half): Q4_1 Metal kernel has the same interleaved-vs-split-half
+// indexing bug that Q4_0 had pre-fix (commit d9720c7). q4_1_matmul at metal_runtime.mm:233
+// walks `col_index++` instead of computing (j, j+16) from the canonical block layout.
+// Test compares Metal Q4_1 output to dotProductRowQ4_1 (CPU reference) — CPU is correct,
+// Metal is broken, hence the divergence. Same fix as Bug A but for Q4_1; out of scope
+// for the current Bug B-focused round.
 TEST(MetalRuntimeTest, MatMulQ4_1MatchesCPUWhenAvailable) {
     auto& executor = mlc::runtime::MetalExecutor::Instance();
     if (!executor.isAvailable()) {
@@ -1960,6 +2003,10 @@ TEST(MetalRuntimeTest, MatMulQ4_1MatchesCPUWhenAvailable) {
     }
 }
 
+// TODO(metal-q5-split-half): Q5_0/Q5_1 Metal kernels have the same interleaved-vs-
+// split-half indexing bug as Q4_0 had pre-fix (commit d9720c7). q5_0_matmul at
+// metal_runtime.mm:264+ walks `col_index++` instead of canonical (j, j+16) indexing.
+// Same fix pattern as Bug A; out of scope for the current Bug B-focused round.
 TEST(MetalRuntimeTest, MatMulQ5MatchesCPUWhenAvailable) {
     auto& executor = mlc::runtime::MetalExecutor::Instance();
     if (!executor.isAvailable()) {
@@ -3125,14 +3172,15 @@ TEST(MetalRuntimeTest, Integration_GGUFMatMulMatchesCPUWhenAvailable) {
     const auto& tensor = it->second;
     ASSERT_EQ(tensor.dtype, mlc::frontend::GGML_TYPE_F32);
     ASSERT_EQ(tensor.shape.size(), 2u);
-    size_t rows = static_cast<size_t>(tensor.shape[0]);
-    size_t cols = static_cast<size_t>(tensor.shape[1]);
+    // Canonical GGML: shape[0]=ne0=cols (input dim), shape[1]=ne1=rows (output dim).
+    size_t cols = static_cast<size_t>(tensor.shape[0]);
+    size_t rows = static_cast<size_t>(tensor.shape[1]);
     auto raw = session.loader().loadTensorData(tensor);
     ASSERT_EQ(raw.size(), rows * cols * sizeof(float));
     std::vector<float> weights(rows * cols);
     std::memcpy(weights.data(), raw.data(), raw.size());
 
-    // Use embedding for token 1 from the same file.
+    // Use embedding for token 1 from the same file. Embedding dim = cols (input dim).
     std::vector<float> input = session.getEmbedding("tok_embeddings.weight", 1);
     ASSERT_EQ(input.size(), cols);
 
@@ -3215,6 +3263,11 @@ TEST(ExecutionRuntimeTest, AttentionHandlesMultipleTokensAndHeads) {
     fs::remove(path);
 }
 
+// TODO(quant-kv-cpu-attention): Pre-existing failure unrelated to Bug A or Bug B.
+// CPU attention path with Q4_0-flagged KV-cache state tensors fails inside executor.run()
+// (status.success comes back false). Probably a path that decodeCacheTensor or the CPU
+// attention kernel doesn't fully handle for the inline-graph (non-IR-builder) test setup.
+// Needs its own investigation; not on the Bug B critical path.
 TEST(ExecutionRuntimeTest, AttentionSupportsQuantizedCaches) {
     std::string path = createRunnerGGUFFile();
     mlc::runtime::Session session(path);
@@ -3314,6 +3367,13 @@ TEST(DecodeRunnerTest, CacheReportReflectsStateStorage) {
     fs::remove(path);
 }
 
+// TODO(internal-bpe): Test exercises the internal BPE fallback in tokenizer.cpp by
+// constructing a synthetic GGUF that llama.cpp's vocab loader cannot consume (no
+// tokenizer.ggml.model field, missing scores), so use_llama_cpp_ stays false.
+// Production (mlc chat on TinyLlama) goes through the llama.cpp delegation, never
+// touches this code path. The internal BPE merge logic fails to merge "world" into
+// token id 18 — emits "w","o","r","l","d" as separate tokens. Real bug, but in
+// dead-for-production code; revisit if/when we drop the llama.cpp tokenizer dep.
 TEST(TokenizerTest, EncodesAndDecodesText) {
     std::string path = "/tmp/test_tokenizer_" + std::to_string(getpid()) + ".gguf";
     std::ofstream file(path, std::ios::binary);
