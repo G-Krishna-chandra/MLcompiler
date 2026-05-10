@@ -2,8 +2,24 @@
 
 A modern ML compiler project written in C++17. It ingests GGUF models, lifts
 them into a structured IR, runs layout/tiling/fusion passes, schedules an
-execution graph across CPU/Metal backends, and can already execute simple
-graphs end-to-end.
+execution graph across CPU and Metal backends, and runs Llama-class quantized
+LLMs token-by-token on Apple Silicon.
+
+## Status
+
+Metal backend is end-to-end functional on Q4_0 quantized models. Numerical
+parity against the CPU backend is verified by the in-tree parity harness
+(`mlc compare --metal-vs-cpu`): on TinyLlama 1.1B every layer-boundary tensor
+matches between CPU and Metal at cosine ≥ 0.999999 (max abs error in the
+1e-5 range — float-rounding noise) and the final logits agree on top-1,
+top-5, and top-10 token rankings.
+
+The runtime does not yet match llama.cpp byte-for-byte at the model-output
+level. A small-magnitude numerical drift between mlc CPU and llama.cpp causes
+the greedy first generated token to differ on some prompts. That gap is
+orthogonal to the CPU↔Metal parity above and is the next milestone; the
+specific Metal kernel families that still need the same split-half fix
+that landed for Q4_0 are listed under "Known issues" below.
 
 ## Project Structure
 
@@ -82,9 +98,12 @@ met before running any kernels.
 
 ### Execute the Graph
 
-Use `--execute` to run the compiled execution graph for a single token. The CPU
-backend currently powers execution (Metal routes through CPU until we add real
-GPU kernels).
+Use `--execute` to run the compiled execution graph for a single token. By
+default Metal is used for embedding, attention, FFN, RMSNorm, softmax, RoPE,
+fused bias-add, and the Q4_0 / Q6_K quantized matmuls that TinyLlama needs;
+the executor falls back to the CPU backend automatically when Metal is
+unavailable or for ops that don't yet have a Metal kernel. Setting
+`MLC_FORCE_CPU=1` pins every kernel to CPU for parity comparisons.
 
 ```bash
 ./build/bin/mlc run --execute models/tinyllama.gguf 42
@@ -106,6 +125,28 @@ see both traces and results in one invocation.
 | `--position=N` | Set the KV-cache position / decode step (default 0) |
 | `--verbose` | Dump the full execution graph when building plans |
 
+### Compare CPU vs Metal (parity harness)
+
+`mlc compare` runs the same prompt through two execution paths in-process and
+reports per-tensor numerical divergence at every layer-boundary tensor —
+embedding output, per-block attn_output / residual_1 / ffn_down / residual_2,
+the final RMSNorm output, and the final logits.
+
+```bash
+./build/bin/mlc compare --metal-vs-cpu models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf \
+  --prompt "The capital of France is" \
+  --csv-out logs/compare.csv
+```
+
+Each row reports max abs diff, mean abs diff, RMS, and cosine similarity;
+the logits row also reports top-1 / top-5 / top-10 overlap. Useful for
+catching regressions when adding or modifying Metal kernels.
+
+A second mode, `mlc compare --vs-llamacpp ... --reference-dir DIR`, consumes
+pre-dumped llama.cpp tensor values (one `<sanitized_name>.f32.bin` per
+boundary tensor) and reports mlc-CPU vs llama.cpp divergence. The reference
+dump format is documented inline in `mlc compare --help`.
+
 ## Architecture Overview
 
 1. **GGUF Loader** (`compiler/frontends/gguf_loader.*`): Parses GGUF v1–v3 files
@@ -118,9 +159,13 @@ see both traces and results in one invocation.
 4. **Kernel Scheduler** (`compiler/runtime/kernel_scheduler.*`): Lowers the IR
    into an execution graph with backend hints.
 5. **Executor** (`compiler/runtime/execution_*`): Creates an
-   `ExecutionContext`, loads tensors, and dispatches CPU/Metal kernels.
-   Embedding + matmul/linear kernels already run end-to-end on Apple GPUs with
-   CPU fallbacks; attention/FFN/softmax/add/norm kernels also have GPU coverage.
+   `ExecutionContext`, loads tensors, and dispatches CPU or Metal kernels.
+   Metal kernels cover embedding, attention (with GQA + sliding-window),
+   FFN, RMSNorm / LayerNorm, softmax, RoPE, fused bias-add, KV-cache
+   scatter, and the Q4_0 / Q6_K quantized matmuls. The CPU backend is the
+   reference path and the automatic fallback. Numerical parity between
+   the two backends is asserted by the parity harness on every layer
+   boundary (see "Compare CPU vs Metal" above).
 
 ## Apple Silicon Optimizations
 
@@ -129,8 +174,10 @@ see both traces and results in one invocation.
   (Q4/Q5/Q6/Q8, K-series included), minimizing CPU dequant work.
 - RMSNorm, softmax, and residual adds execute via vDSP on CPU, and Metal kernels
   now cover embeddings, attention, FFN, add, norm, softmax, rotary position
-  updates, and all quantized matmuls; LM-head matmuls fuse their bias adds on
-  Metal so logits stay on the GPU. Remaining ops (logit post-processing) fall
+  updates, and quantized matmuls; LM-head matmuls fuse their bias adds on
+  Metal so logits stay on the GPU. Q4_0 and Q6_K matmul kernels are
+  parity-tested against the CPU reference; Q4_1 / Q5_0 / Q5_1 are known
+  broken (see Known issues). Remaining ops (logit post-processing) fall
   back to CPU until their GPU path lands.
 - KV caches live in shared Metal buffers so attention reads/writes the entire
   prefix without re-uploading per head; multi-token batches reuse the same
@@ -145,6 +192,27 @@ see both traces and results in one invocation.
 - When nodes target the Metal backend, the executor runs them on the Apple GPU
   using MPS + custom compute shaders, falling back to Accelerate automatically
   when Metal isn’t available.
+
+## Known issues
+
+- **mlc CPU output diverges from llama.cpp on greedy decode.** Small per-layer
+  numerical drift (RMSNorm epsilon / RoPE / Q4_0 dequant rounding) accumulates
+  across the 22 transformer blocks of TinyLlama and flips the top-1 logit on
+  some prompts (e.g. greedy completion of "The capital of France is" picks "a"
+  instead of " Paris"). The drift is bounded; mlc CPU and llama.cpp logits
+  remain highly correlated. Under investigation.
+- **Q4_1 / Q5_0 / Q5_1 Metal kernels have a known split-half indexing bug.**
+  Same pattern as the Q4_0 bug fixed in commit d9720c7: the kernel walks
+  `col_index++` against an assumed interleaved layout, but Q-quant storage is
+  split-half (lo nibbles fill positions 0..15, hi nibbles fill 16..31). Test
+  cases `MetalRuntimeTest.MatMulQ4_1MatchesCPUWhenAvailable` and
+  `MetalRuntimeTest.MatMulQ5MatchesCPUWhenAvailable` document the failure and
+  are currently red. TinyLlama Q4_0 does not exercise these kernels.
+- **Internal BPE fallback in the tokenizer is incomplete.** Production paths
+  go through the optional llama.cpp tokenizer (linked when
+  `MLC_ENABLE_LLAMA_TOKENIZER=1`); the fallback BPE merge logic in
+  `compiler/runtime/tokenizer.cpp` does not always merge correctly. Flagged
+  by `TokenizerTest.EncodesAndDecodesText`.
 
 ## Future Integration
 
