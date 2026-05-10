@@ -1,10 +1,12 @@
 #include "ir/ir_builder.hpp"
 
 #include "frontends/gguf_to_ir.hpp"
+#include "runtime/execution_graph.hpp"
 
 #include <algorithm>
 #include <stdexcept>
 #include <unordered_map>
+#include <cctype>
 
 namespace mlc {
 namespace ir {
@@ -79,6 +81,18 @@ Tensor* addActivation(ir::Graph& graph,
     return graph.addTensor(name, shape, dtype);
 }
 
+runtime::ArchitectureFamily detectFamily(const std::string& arch) {
+    if (arch.empty()) return runtime::ArchitectureFamily::Unknown;
+    std::string lower = arch;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (lower.find("llama") != std::string::npos) return runtime::ArchitectureFamily::Llama;
+    if (lower.find("gemma") != std::string::npos) return runtime::ArchitectureFamily::Gemma;
+    if (lower.find("mistral") != std::string::npos) return runtime::ArchitectureFamily::Mistral;
+    return runtime::ArchitectureFamily::Unknown;
+}
+
 } // namespace
 
 std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& loader) {
@@ -87,18 +101,22 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
         throw std::runtime_error("GGUFToIR returned null graph");
     }
 
+    // Prefer family-specific keys, then fall back to common/llama.
     size_t num_layers = readSize(loader,
-                                 {"llama.block_count", "llama.layers", "n_layer", "num_hidden_layers"},
+                                 {"llama.block_count", "llama.layers", "n_layer", "num_hidden_layers",
+                                  "gemma.block_count", "mistral.block_count"},
                                  0);
     size_t hidden_size = readSize(loader,
-                                  {"llama.embedding_length", "llama.n_embd", "n_embd"},
+                                  {"llama.embedding_length", "llama.n_embd", "n_embd",
+                                   "gemma.embedding_length", "mistral.embedding_length"},
                                   0);
     size_t head_count = readSize(loader,
-                                 {"llama.attention.head_count", "attention.head_count", "num_attention_heads"},
+                                 {"llama.attention.head_count", "attention.head_count", "num_attention_heads",
+                                  "gemma.attention.head_count", "mistral.attention.head_count"},
                                  0);
     if (head_count == 0) head_count = 8;
     if (num_layers == 0 || hidden_size == 0) {
-        throw std::runtime_error("IRBuilder requires llama.block_count and llama.embedding_length metadata");
+        throw std::runtime_error("IRBuilder requires block_count and embedding_length metadata");
     }
 
     Tensor* tokens = graph->addTensor("token_ids", {1}, ir::DataType::I4);
@@ -126,9 +144,18 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
     Node* current_node = embedding_node;
     Tensor* current_tensor = hidden_tensor;
 
+    std::string arch = loader.kvMetadata().count("general.architecture")
+                           ? std::get<std::string>(loader.kvMetadata().at("general.architecture").data)
+                           : "";
+    runtime::ArchitectureFamily family = detectFamily(arch);
+    std::string ffn_activation = (family == runtime::ArchitectureFamily::Gemma) ? "geglu" : "silu";
+
     for (size_t layer = 0; layer < num_layers; ++layer) {
         std::string prefix = "blk." + std::to_string(layer) + ".";
         std::string layer_tag = std::to_string(layer);
+
+        Tensor* residual_input = current_tensor;
+        Node* residual_node = current_node;
 
         auto buildLinear = [&](Node* input_node,
                                Tensor* activation,
@@ -175,9 +202,11 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
             current_tensor = norm_output;
         }
 
-        auto q = buildLinear(current_node, current_tensor, "attn_q", "attn_q");
-        auto k = buildLinear(current_node, current_tensor, "attn_k", "attn_k");
-        auto v = buildLinear(current_node, current_tensor, "attn_v", "attn_v");
+        Node* attn_input_node = norm_node ? norm_node : current_node;
+        Tensor* attn_input_tensor = norm_output;
+        auto q = buildLinear(attn_input_node, attn_input_tensor, "attn_q", "attn_q");
+        auto k = buildLinear(attn_input_node, attn_input_tensor, "attn_k", "attn_k");
+        auto v = buildLinear(attn_input_node, attn_input_tensor, "attn_v", "attn_v");
 
         Tensor* attn_mix = addActivation(*graph,
                                          prefix + "attention_mix",
@@ -192,13 +221,46 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
         attention->outputs.push_back(attn_mix);
         attention->metadata["layer"] = layer_tag;
         attention->metadata["heads"] = std::to_string(head_count);
+        size_t sliding_window = readSize(loader,
+                                         {"attention.sliding_window", "mistral.sliding_window"},
+                                         0);
+        if (sliding_window > 0) {
+            attention->metadata["sliding_window"] = std::to_string(sliding_window);
+        }
 
         auto out = buildLinear(attention, attn_mix, "attn_output", "attn_out");
-        current_node = out.first ? out.first : attention;
-        current_tensor = out.second ? out.second : attn_mix;
+        Node* attn_out_node = out.first ? out.first : attention;
+        Tensor* attn_out_tensor = out.second ? out.second : attn_mix;
 
-        auto gate = buildLinear(current_node, current_tensor, "ffn_gate", "ffn_gate");
-        auto up = buildLinear(current_node, current_tensor, "ffn_up", "ffn_up");
+        Tensor* resid1_tensor = addActivation(*graph,
+                                              prefix + "residual_1",
+                                              {static_cast<int64_t>(hidden_size)});
+        Node* resid1 = graph->addNode(ir::OpKind::Add, prefix + "residual_add1");
+        if (residual_node) resid1->inputs.push_back(residual_node);
+        if (attn_out_node) resid1->inputs.push_back(attn_out_node);
+        resid1->activation_inputs.push_back(residual_input);
+        resid1->activation_inputs.push_back(attn_out_tensor);
+        resid1->outputs.push_back(resid1_tensor);
+        resid1->metadata["layer"] = layer_tag;
+        resid1->metadata["role"] = "residual_1";
+
+        Tensor* ffn_norm_out = resid1_tensor;
+        Node* ffn_norm_node = resid1;
+        if (Tensor* norm_weight = lookupWeight(*graph, prefix + "ffn_norm.weight")) {
+            ffn_norm_out = addActivation(*graph,
+                                         prefix + "ffn_norm.out",
+                                         {static_cast<int64_t>(hidden_size)});
+            ffn_norm_node = graph->addNode(ir::OpKind::LayerNorm, prefix + "ffn_norm");
+            ffn_norm_node->inputs.push_back(resid1);
+            ffn_norm_node->activation_inputs.push_back(resid1_tensor);
+            ffn_norm_node->tensor_inputs.push_back(norm_weight);
+            ffn_norm_node->outputs.push_back(ffn_norm_out);
+            ffn_norm_node->metadata["layer"] = layer_tag;
+            ffn_norm_node->metadata["weight"] = prefix + "ffn_norm.weight";
+        }
+
+        auto gate = buildLinear(ffn_norm_node, ffn_norm_out, "ffn_gate", "ffn_gate");
+        auto up = buildLinear(ffn_norm_node, ffn_norm_out, "ffn_up", "ffn_up");
         Tensor* ffn_mix = addActivation(*graph,
                                         prefix + "ffn_mix",
                                         {static_cast<int64_t>(hidden_size)});
@@ -209,10 +271,27 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
         if (up.second) ffn->activation_inputs.push_back(up.second);
         ffn->outputs.push_back(ffn_mix);
         ffn->metadata["layer"] = layer_tag;
+        ffn->metadata["activation"] = ffn_activation;
 
         auto down = buildLinear(ffn, ffn_mix, "ffn_down", "ffn_down");
-        current_node = down.first ? down.first : ffn;
-        current_tensor = down.second ? down.second : ffn_mix;
+
+        Node* ffn_out_node = down.first ? down.first : ffn;
+        Tensor* ffn_out_tensor = down.second ? down.second : ffn_mix;
+
+        Tensor* resid2_tensor = addActivation(*graph,
+                                              prefix + "residual_2",
+                                              {static_cast<int64_t>(hidden_size)});
+        Node* resid2 = graph->addNode(ir::OpKind::Add, prefix + "residual_add2");
+        resid2->inputs.push_back(resid1);
+        if (ffn_out_node) resid2->inputs.push_back(ffn_out_node);
+        resid2->activation_inputs.push_back(resid1_tensor);
+        resid2->activation_inputs.push_back(ffn_out_tensor);
+        resid2->outputs.push_back(resid2_tensor);
+        resid2->metadata["layer"] = layer_tag;
+        resid2->metadata["role"] = "residual_2";
+
+        current_node = resid2;
+        current_tensor = resid2_tensor;
     }
 
     // Final normalization if available

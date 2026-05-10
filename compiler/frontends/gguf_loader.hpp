@@ -74,6 +74,8 @@ public:
     const std::unordered_map<std::string, GGUFValue>& kvMetadata() const {
         return kv_metadata_;
     }
+
+    const std::string& path() const { return path_; }
     
     const GGUFHeader& header() const {
         return header_;

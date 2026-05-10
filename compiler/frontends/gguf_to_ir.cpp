@@ -79,6 +79,15 @@ std::unique_ptr<ir::Graph> GGUFToIR(const GGUFLoader& loader) {
                 ir_tensor->metadata["needs_transpose"] = "true";
             }
         }
+        // Detect column-major token embeddings (e.g., Gemma-style) so downstream can dequantize correctly.
+        if ((name.find("tok_embeddings.weight") != std::string::npos ||
+             name.find("token_embd.weight") != std::string::npos ||
+             name.find("token_emb.weight") != std::string::npos ||
+             name.find("token_embeddings.weight") != std::string::npos ||
+             name.find("embed_tokens.weight") != std::string::npos) &&
+            file_shape.size() == 2 && file_shape[0] < file_shape[1]) {
+            ir_tensor->metadata["tokens_column_major"] = "true";
+        }
         // Do NOT transpose tok_embeddings.weight or other tensors - only output.weight
     }
     
