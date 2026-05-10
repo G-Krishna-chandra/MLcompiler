@@ -77,6 +77,11 @@ ExecutionGraph ExecutionPlanBuilder::BuildToy(size_t num_layers, size_t hidden_s
     config.context_length = 128;
     config.vocab_size = 32000;
     config.head_dim = hidden_size / std::max<size_t>(1, config.head_count);
+    // BuildToy is for tests/diagnostics that have no real GGUF weights; satisfy
+    // Build()'s precondition with a synthetic head name. The lm_head node it
+    // creates references this name but no kernel will actually find a parameter
+    // for it — toy callers only inspect graph structure, not run inference.
+    config.head_weight_name = "lm_head.weight";
     return Build(config);
 }
 

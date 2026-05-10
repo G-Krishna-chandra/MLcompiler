@@ -83,6 +83,7 @@ TEST(ExecutionPlanBuilderTest, GemmaDefaultsGeGLUActivation) {
     cfg.context_length = 8;
     cfg.vocab_size = 16;
     cfg.family = ArchitectureFamily::Gemma;
+    cfg.head_weight_name = "lm_head.weight";  // synthetic; satisfies Build()'s precondition
     // leave activation empty to force default
     auto graph = ExecutionPlanBuilder::BuildForTests(cfg);
     const auto& nodes = graph.nodes();
@@ -109,6 +110,7 @@ TEST(ExecutionPlanBuilderTest, MistralGroupedQueryAndSlidingWindowPropagate) {
     cfg.vocab_size = 32;
     cfg.family = ArchitectureFamily::Mistral;
     cfg.sliding_window = 32;
+    cfg.head_weight_name = "lm_head.weight";  // synthetic; satisfies Build()'s precondition
     auto graph = ExecutionPlanBuilder::BuildForTests(cfg);
     EXPECT_EQ(graph.modelConfig().sliding_window, 32u);
     bool found_gqa = false;
