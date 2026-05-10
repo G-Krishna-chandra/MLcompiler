@@ -18,6 +18,9 @@ bool TilingPass::Run(ir::Graph& graph) {
             default:
                 continue;
         }
+        if (node->attributes.count("tile_m") && node->attributes.count("tile_n")) {
+            continue; // Already provided by an earlier architecture-aware pass.
+        }
         if (node->outputs.empty() || !node->outputs[0]) continue;
         const auto& shape = node->outputs[0]->shape;
         if (shape.empty()) continue;
