@@ -1,2 +1,6 @@
 build/
 models/
+Testing/
+logs/
+data/
+.DS_Store
