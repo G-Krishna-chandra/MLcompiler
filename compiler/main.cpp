@@ -2770,23 +2770,25 @@ int handleTestMatmulQ4Command(const std::vector<std::string>& args) {
             size_t shape0 = static_cast<size_t>(info.shape[0]);
             size_t shape1 = static_cast<size_t>(info.shape[1]);
 
-            // Handwritten path: replicate operator_backend.cpp:963-973.
-            size_t hw_rows = shape0;
-            size_t hw_cols = shape1;
-            bool hw_transpose;
-            if (hw_cols == input.size())      hw_transpose = false;
-            else if (hw_rows == input.size()) hw_transpose = true;
+            // Canonical GGML convention: cols=shape[0]=ne0 (input dim),
+            // rows=shape[1]=ne1 (output dim). Matches Session::runLinear and
+            // (post-Bug-B fix) MetalExecutionBackend::execute.
+            size_t cols = shape0;
+            size_t rows = shape1;
+            bool transpose;
+            if (cols == input.size())      transpose = false;
+            else if (rows == input.size()) transpose = true;
             else {
-                std::printf("%-31s | (neither hw_rows nor hw_cols match input %zu)\n",
+                std::printf("%-31s | (neither cols nor rows match input %zu)\n",
                             name.c_str(), input.size());
                 continue;
             }
 
             const auto& raw = session.tensorData(info);
-            size_t row_stride = raw.size() / hw_rows;
+            size_t row_stride = raw.size() / rows;
 
             auto handwritten = q4diag::cpuMatmulHandwritten(
-                raw.data(), hw_rows, hw_cols, row_stride, qversion, input, hw_transpose);
+                raw.data(), rows, cols, row_stride, qversion, input, transpose);
 
             std::vector<float> canonical;
             try {
@@ -2798,11 +2800,11 @@ int handleTestMatmulQ4Command(const std::vector<std::string>& args) {
             }
 
             std::vector<float> metal;
-            bool ok = hw_transpose
+            bool ok = transpose
                 ? MetalExecutor::Instance().runMatMulQ4_0Transposed(
-                      raw, input, hw_rows, hw_cols, row_stride, qversion, metal, nullptr)
+                      raw, input, rows, cols, row_stride, qversion, metal, nullptr)
                 : MetalExecutor::Instance().runMatMulQ4_0(
-                      raw, input, hw_rows, hw_cols, row_stride, qversion, metal, nullptr);
+                      raw, input, rows, cols, row_stride, qversion, metal, nullptr);
             if (!ok) {
                 std::printf("%-31s | metal kernel returned ok=false\n", name.c_str());
                 continue;
@@ -2817,7 +2819,7 @@ int handleTestMatmulQ4Command(const std::vector<std::string>& args) {
             const char* flag = q4diag::classifyDivergence(m_hc.cosine, m_hm.cosine, m_cm.cosine);
             std::printf("%-31s | %-13s | %-11s | %10.6f | %10.6f | %10.6f | %s\n",
                         name.c_str(), shape_buf,
-                        hw_transpose ? "transposed" : "non-trans",
+                        transpose ? "transposed" : "non-trans",
                         m_hc.cosine, m_hm.cosine, m_cm.cosine, flag);
 
             PerWeightDiag d;
