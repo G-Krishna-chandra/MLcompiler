@@ -186,19 +186,19 @@ kernel void q4_0_matmul(
     uint cols = params.cols;
     uint blocks = (cols + 31u) / 32u;
     float acc = 0.0f;
-    uint col_index = 0;
-    for (uint b = 0; b < blocks && col_index < cols; ++b) {
+    for (uint b = 0; b < blocks; ++b) {
         const device half* d_half = reinterpret_cast<const device half*>(row + b * block_size);
         float d = static_cast<float>(d_half[0]);
         const device uchar* qs = row + b * block_size + 2;
-        for (uint j = 0; j < 16 && col_index < cols; ++j) {
+        uint base = b * 32u;
+        for (uint j = 0; j < 16; ++j) {
             uchar byte = qs[j];
             int lo = static_cast<int>(byte & 0x0F) - 8;
-            acc += d * static_cast<float>(lo) * input[col_index++];
-            if (col_index < cols) {
-                int hi = static_cast<int>((byte >> 4) & 0x0F) - 8;
-                acc += d * static_cast<float>(hi) * input[col_index++];
-            }
+            int hi = static_cast<int>((byte >> 4) & 0x0F) - 8;
+            uint i0 = base + j;
+            uint i1 = base + j + 16u;
+            if (i0 < cols) acc += d * static_cast<float>(lo) * input[i0];
+            if (i1 < cols) acc += d * static_cast<float>(hi) * input[i1];
         }
     }
     output[gid] = acc;
@@ -221,9 +221,15 @@ kernel void q4_0_matmul_transposed(
         const device half* d_half = reinterpret_cast<const device half*>(row + block * block_size);
         float d = static_cast<float>(d_half[0]);
         const device uchar* qs = row + block * block_size + 2;
-        uchar byte = qs[offset / 2];
-        int q = (offset % 2 == 0) ? static_cast<int>(byte & 0x0F)
-                                  : static_cast<int>((byte >> 4) & 0x0F);
+        uchar byte;
+        int q;
+        if (offset < 16u) {
+            byte = qs[offset];
+            q = static_cast<int>(byte & 0x0F);
+        } else {
+            byte = qs[offset - 16u];
+            q = static_cast<int>((byte >> 4) & 0x0F);
+        }
         q -= 8;
         acc += d * static_cast<float>(q) * input[r];
     }
