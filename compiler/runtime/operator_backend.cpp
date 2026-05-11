@@ -199,7 +199,8 @@ struct CacheDecodeResult {
     bool owns_buffer = false;
 };
 
-bool decodeCacheTensor(const ExecutionTensor* info,
+bool decodeCacheTensor(const ExecutionNode& node,
+                       const ExecutionTensor* info,
                        TensorStorage* storage,
                        size_t head_dim_attr,
                        CacheDecodeResult& result) {
@@ -227,8 +228,9 @@ bool decodeCacheTensor(const ExecutionTensor* info,
     }
     result.buffer.resize(elements);
 #if defined(__APPLE__)
-    // Try GPU dequant when Metal is available for supported formats.
-    if (MetalExecutor::Instance().isAvailable()) {
+    // Dequant via Metal only when the owning node would itself run on Metal —
+    // routes through MetalExecutor::shouldUseFor so force-CPU is honored.
+    if (MetalExecutor::Instance().shouldUseFor(node)) {
         bool ok = false;
         const size_t cols = result.head_dim * rows;
         switch (storage->dtype) {
@@ -687,7 +689,7 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             return result;
         }
         case ExecOpType::Attention: {
-            bool use_gpu = (node.backend == BackendKind::Metal && MetalExecutor::Instance().isAvailable());
+            bool use_gpu = MetalExecutor::Instance().shouldUseFor(node);
             if (node.inputs.size() < 3) {
                 result.success = false;
                 result.message = "Attention node missing qkv inputs";
@@ -738,8 +740,8 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                 CacheDecodeResult cache_k_decoded;
                 CacheDecodeResult cache_v_decoded;
                 size_t head_dim_attr = static_cast<size_t>(node.attributes.count("head_dim") ? node.attributes.at("head_dim") : 0.0f);
-                if (!decodeCacheTensor(cache_k_info, cache_k_storage, head_dim_attr, cache_k_decoded) ||
-                    !decodeCacheTensor(cache_v_info, cache_v_storage, head_dim_attr, cache_v_decoded)) {
+                if (!decodeCacheTensor(node, cache_k_info, cache_k_storage, head_dim_attr, cache_k_decoded) ||
+                    !decodeCacheTensor(node, cache_v_info, cache_v_storage, head_dim_attr, cache_v_decoded)) {
                     use_gpu = false;
                 } else {
                     size_t num_heads = static_cast<size_t>(node.attributes.count("heads") ? node.attributes.at("heads") : 0.0f);
