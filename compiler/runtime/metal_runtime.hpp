@@ -9,6 +9,8 @@
 namespace mlc {
 namespace runtime {
 
+struct ExecutionNode;
+
 struct MetalBufferHandle {
     void* buffer = nullptr;
     size_t bytes = 0;
@@ -23,6 +25,13 @@ public:
     bool isAvailable() const;
     // Metal is required; this throws if unavailable.
     void requireAvailable() const;
+
+    // Centralized dispatch decision: returns true iff the caller should run the
+    // Metal kernel for this node. Combines the scheduler's tag, device
+    // availability, and the programmatic force-CPU override into a single test
+    // so that no caller can accidentally bypass force-CPU by gating on only
+    // (node.backend == Metal && isAvailable()).
+    bool shouldUseFor(const ExecutionNode& node) const;
 
     bool runMatMul(const std::vector<float>& weights,
                    const std::vector<float>& input,

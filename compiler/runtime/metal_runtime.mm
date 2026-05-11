@@ -1,4 +1,6 @@
 #include "runtime/metal_runtime.hpp"
+#include "runtime/execution_graph.hpp"
+#include "runtime/kernel_registry.hpp"
 #include "runtime/quantization.hpp"
 #include "runtime/quant_utils.hpp"
 #include "frontends/ggml_types.hpp"
@@ -3530,6 +3532,12 @@ void MetalExecutor::requireAvailable() const {
     if (!isAvailable()) {
         throw std::runtime_error("Metal is required but no device is available");
     }
+}
+
+bool MetalExecutor::shouldUseFor(const ExecutionNode& node) const {
+    return node.backend == BackendKind::Metal
+        && isAvailable()
+        && !KernelDescriptorRegistry::forceCpu();
 }
 
 bool MetalExecutor::runMatMul(const std::vector<float>& weights,
