@@ -3307,6 +3307,15 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
             size_t stride = q_single_cos.size();
             const float* cos_ptr = q_cos_table.data() + head * stride;
             const float* sin_ptr = q_sin_table.data() + head * stride;
+            // offset_tokens=0 is intentional: this is the single-token Q-rotation
+            // path, and `cos_ptr`/`sin_ptr` already point at this head's slice of
+            // the cos/sin table (filled by computeRotaryCoefficients for the
+            // current base_position above). The shader interprets offset_elems as
+            // a buffer index — see apply_rotary_batch at metal_runtime.mm:996,
+            // specifically `vec += offset_elems * head_dim` — so passing
+            // base_position here would push the write pointer base_position *
+            // head_dim floats past the start of qBuffer, which is only head_dim
+            // floats long. Passing 0 keeps the rotation in-bounds.
             bool rotated = applyRotaryGPU(qBuffer,
                                           1,
                                           headRowBytes,
@@ -3315,7 +3324,7 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                                           cos_ptr,
                                           sin_ptr,
                                           stride,
-                                          base_position);
+                                          0);
             if (!rotated) {
                 float* vec = reinterpret_cast<float*>([qBuffer contents]);
                 applyRotaryEmbedding(vec,
