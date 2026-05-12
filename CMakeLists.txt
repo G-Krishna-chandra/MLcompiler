@@ -47,6 +47,19 @@ endif()
 add_executable(metal_diag tools/metal_diag.mm)
 target_link_libraries(metal_diag PRIVATE "-framework Foundation" "-framework Metal" "-framework CoreGraphics" "-framework QuartzCore")
 
+# Diagnostic: dumps per-step CPU activations + final block-0 K/V cache to disk.
+add_executable(mlc_dump_kv_cache tools/mlc_dump_kv_cache.cpp)
+target_link_libraries(mlc_dump_kv_cache PRIVATE mlc_lib)
+if(APPLE)
+    target_link_libraries(mlc_dump_kv_cache PRIVATE
+        "-framework Metal"
+        "-framework MetalPerformanceShaders"
+        "-framework Foundation"
+        "-framework CoreGraphics"
+        "-framework QuartzCore"
+        "-framework Accelerate")
+endif()
+
 # Future: MLIR/LLVM integration point
 # find_package(MLIR REQUIRED CONFIG)
 # find_package(LLVM REQUIRED CONFIG)
