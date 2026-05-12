@@ -12,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -3164,42 +3165,47 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
             rotated_k = k;
             bool rotated = false;
 #if defined(__APPLE__)
+            // DEAD CODE — gated off by sharedCacheValid being force-pinned to
+            // false a few lines above (search 'sharedCacheValid = false'). Kept
+            // for the future GPU-cache-residency work, but it has TWO known
+            // sizing bugs that would fire the moment sharedCacheValid is
+            // re-enabled. Don't silently re-enable that flag without fixing
+            // them. The assert below makes that impossible.
+            //
+            // Bug 1 — cos/sin table is too small.
+            //   The host fills cos_table / sin_table of size pairs * tokens_to_write,
+            //   then calls applyRotaryGPU with count = tokens_to_write *
+            //   effective_kv_heads. Inside applyRotaryGPU,
+            //     expected = pair_stride * (count + offset_tokens)
+            //              = pairs * tokens_to_write * effective_kv_heads
+            //   which is effective_kv_heads-x larger than what the host
+            //   actually allocated. newBufferWithBytes therefore reads past
+            //   the std::vectors. For TinyLlama (kv_heads=4) that is a 4-x
+            //   over-read of host memory.
+            //
+            // Bug 2 — per-thread vec stride is wrong.
+            //   row_stride = kv_span * sizeof(float) means each gid jumps by a
+            //   whole [kv_heads, head_dim] row instead of by one head_dim
+            //   vector, so threads gid >= tokens_to_write address bytes past
+            //   the end of tmpK (which is only tokens_to_write * kv_span
+            //   floats long). Symmetric to bug 1 but on the data side.
+            //
+            // A correct rewrite probably wants:
+            //   row_stride = head_dim * sizeof(float)
+            //   count      = tokens_to_write * effective_kv_heads
+            //   cos/sin    = sized [count, pairs], with the same cos values
+            //                replicated across kv_heads for each token (or
+            //                use offset_elems to encode the kv_head dim).
+            // But the cleanest place to do that is inside a new shader path
+            // that knows the [token, kv_head, head_dim] layout explicitly.
+            //
+            // For now: trip an assert so this path can never silently run
+            // without a sizing review. The CPU fallback path below produces
+            // bit-equal results and is the production code.
             if (sharedCacheValid && effective_rotary > 0) {
-                std::vector<float> cos_table;
-                std::vector<float> sin_table;
-                size_t pairs = effective_rotary / 2;
-                cos_table.resize(pairs * tokens_to_write);
-                sin_table.resize(pairs * tokens_to_write);
-                for (size_t t = 0; t < tokens_to_write; ++t) {
-                    size_t pos = std::min(context_length - 1, base_position + t);
-                    computeRotaryCoefficients(pos,
-                                              effective_rotary,
-                                              freq_base,
-                                              freq_scale,
-                                              rotary_cos,
-                                              rotary_sin);
-                    std::copy(rotary_cos.begin(), rotary_cos.end(), cos_table.begin() + t * pairs);
-                    std::copy(rotary_sin.begin(), rotary_sin.end(), sin_table.begin() + t * pairs);
-                }
-                id<MTLBuffer> tmpK = [device newBufferWithBytes:k_ptr->data()
-                                                       length:tokens_to_write * kv_span * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
-                if (tmpK) {
-                    rotated = applyRotaryGPU(tmpK,
-                                             tokens_to_write * effective_kv_heads,
-                                             kv_span * sizeof(float),
-                                             head_dim,
-                                             effective_rotary,
-                                             cos_table.data(),
-                                             sin_table.data(),
-                                             pairs,
-                                             0);
-                    if (rotated) {
-                        std::memcpy(rotated_k.data(), [tmpK contents],
-                                    tokens_to_write * kv_span * sizeof(float));
-                        k_ptr = &rotated_k;
-                    }
-                }
+                assert(false && "K-RoPE GPU path has unfixed sizing bugs; "
+                                "see comment block at this line before enabling sharedCacheValid");
+                (void)tokens_to_write; (void)base_position; (void)effective_kv_heads;
             }
 #endif
             if (!rotated) {
