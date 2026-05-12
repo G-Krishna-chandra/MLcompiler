@@ -14,12 +14,12 @@ matches between CPU and Metal at cosine ≥ 0.999999 (max abs error in the
 1e-5 range — float-rounding noise) and the final logits agree on top-1,
 top-5, and top-10 token rankings.
 
-The runtime does not yet match llama.cpp byte-for-byte at the model-output
-level. A small-magnitude numerical drift between mlc CPU and llama.cpp causes
-the greedy first generated token to differ on some prompts. That gap is
-orthogonal to the CPU↔Metal parity above and is the next milestone; the
-specific Metal kernel families that still need the same split-half fix
-that landed for Q4_0 are listed under "Known issues" below.
+mlc CPU backend produces output that matches llama.cpp at the residual-stream
+level (bit-equal through all tested blocks on TinyLlama Q4_0). Metal backend
+has a known attention kernel divergence; non-attention ops (embedding,
+RMSNorm, FFN, Q4_0 matmul) remain parity-verified. Specific Metal kernel
+families that still need the same split-half fix that landed for Q4_0 are
+listed under "Known issues" below.
 
 ## Project Structure
 
@@ -195,12 +195,10 @@ dump format is documented inline in `mlc compare --help`.
 
 ## Known issues
 
-- **mlc CPU output diverges from llama.cpp on greedy decode.** Small per-layer
-  numerical drift (RMSNorm epsilon / RoPE / Q4_0 dequant rounding) accumulates
-  across the 22 transformer blocks of TinyLlama and flips the top-1 logit on
-  some prompts (e.g. greedy completion of "The capital of France is" picks "a"
-  instead of " Paris"). The drift is bounded; mlc CPU and llama.cpp logits
-  remain highly correlated. Under investigation.
+- **Metal attention kernel diverges from CPU at attention boundaries** with a
+  per-head-by-GQA-group pattern (group 0 near-perfect, group 3 catastrophic).
+  Isolated and reproducible via `mlc compare --metal-vs-cpu`. Under
+  investigation.
 - **Q4_1 / Q5_0 / Q5_1 Metal kernels have a known split-half indexing bug.**
   Same pattern as the Q4_0 bug fixed in commit d9720c7: the kernel walks
   `col_index++` against an assumed interleaved layout, but Q-quant storage is
@@ -213,6 +211,20 @@ dump format is documented inline in `mlc compare --help`.
   `MLC_ENABLE_LLAMA_TOKENIZER=1`); the fallback BPE merge logic in
   `compiler/runtime/tokenizer.cpp` does not always merge correctly. Flagged
   by `TokenizerTest.EncodesAndDecodesText`.
+
+## Resolved
+
+- **mlc CPU output diverged from llama.cpp on greedy decode** (e.g. greedy
+  completion of "The capital of France is" picked "a" instead of " Paris").
+  Originally tracked as accumulated per-layer CPU drift. Misattributed: the
+  actual cause was a dispatch leak in `CpuExecutionBackend::execute` where
+  the Attention case re-tested `node.backend == Metal` and silently routed
+  to Metal even under force-CPU, masking a separate Metal-attention kernel
+  bug. Fixed in 96a2de6 + 3dcd8dd by routing all Metal dispatch through
+  `MetalExecutor::shouldUseFor(node)`, which folds in the force-CPU check.
+  After the fix, mlc-CPU residual-stream output is bit-equal to llama.cpp
+  through every tested block on TinyLlama Q4_0. The remaining Metal-side
+  attention divergence is now tracked separately under "Known issues" above.
 
 ## Future Integration
 
