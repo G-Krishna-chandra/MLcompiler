@@ -179,6 +179,38 @@ size_t summarizeDispatchLeaks(const std::unordered_map<std::string, BackendKind>
     return offenders.size();
 }
 
+// If MLC_PARITY_DUMP=DIR is set, write both sides' captured tap tensors to that
+// directory as raw little-endian float32 blobs. File names are
+//   <side_label>_<sanitized(tensor_name)>.f32.bin
+// so that any analysis script can pair the two sides without ambiguity. Common
+// callers: compareMetalVsCpu (cpu/metal) and compareVsLlamaCpp (mlc/llamacpp).
+void maybeDumpParityTaps(const std::string& side_a_label,
+                         const std::unordered_map<std::string, std::vector<float>>& taps_a,
+                         const std::string& side_b_label,
+                         const std::unordered_map<std::string, std::vector<float>>& taps_b,
+                         std::vector<std::string>& notes_out) {
+    const char* dump_dir = std::getenv("MLC_PARITY_DUMP");
+    if (!dump_dir) return;
+    std::string d = dump_dir;
+    auto write_side = [&](const std::string& label,
+                          const std::unordered_map<std::string, std::vector<float>>& taps) -> size_t {
+        size_t wrote = 0;
+        for (const auto& [name, data] : taps) {
+            std::string path = d + "/" + label + "_" + sanitizeForFilename(name) + ".f32.bin";
+            std::ofstream of(path, std::ios::binary);
+            if (of) {
+                of.write(reinterpret_cast<const char*>(data.data()),
+                         static_cast<std::streamsize>(data.size() * sizeof(float)));
+                ++wrote;
+            }
+        }
+        return wrote;
+    };
+    size_t total = write_side(side_a_label, taps_a) + write_side(side_b_label, taps_b);
+    notes_out.push_back("MLC_PARITY_DUMP: wrote " + std::to_string(total) +
+                        " tap files (" + side_a_label + "_*, " + side_b_label + "_*) to " + d);
+}
+
 LayerComparison computeMetrics(const std::string& name,
                                const std::vector<float>* a,
                                const std::vector<float>* b) {
@@ -347,6 +379,8 @@ CompareReport compareMetalVsCpu(const CompareOptions& opts) {
         report.notes.push_back("MLC_HARNESS_STRICT=1: failing because of dispatch leak above");
     }
 
+    maybeDumpParityTaps("cpu", cpu_taps, "metal", metal_taps, report.notes);
+
     // The CPU run determines the canonical ordering — its tap_names_cpu is already
     // sorted by topo position. Use it; any tensors only present on the metal side
     // get appended at the end.
@@ -402,20 +436,7 @@ CompareReport compareVsLlamaCpp(const CompareOptions& opts) {
     if (!note.empty()) report.notes.push_back("mlc-cpu: " + note);
     KernelDescriptorRegistry::setForceCpu(prior_force_cpu);
 
-    // Diagnostic hook: write mlc-CPU's tap snapshots to disk if requested. Used by
-    // ad-hoc analyses (per-head cosine, layout checks) that need raw tensor bytes.
-    if (const char* dump_dir = std::getenv("MLC_PARITY_DUMP_SIDE_A")) {
-        for (const auto& [name, data] : mlc_taps) {
-            std::string path = std::string(dump_dir) + "/" + sanitizeForFilename(name) + ".f32.bin";
-            std::ofstream out(path, std::ios::binary);
-            if (out) {
-                out.write(reinterpret_cast<const char*>(data.data()),
-                          static_cast<std::streamsize>(data.size() * sizeof(float)));
-            }
-        }
-        report.notes.push_back(std::string("dumped mlc-cpu taps to ") + dump_dir);
-    }
-
+    std::unordered_map<std::string, std::vector<float>> llamacpp_refs;
     for (const auto& name : tap_names) {
         std::string ref_path = opts.reference_dir + "/" + sanitizeForFilename(name) + ".f32.bin";
         std::vector<float> ref;
@@ -430,9 +451,14 @@ CompareReport compareVsLlamaCpp(const CompareOptions& opts) {
         const std::vector<float>* b = nullptr;
         auto it = mlc_taps.find(name);
         if (it != mlc_taps.end()) a = &it->second;
-        if (ref_ok) b = &ref;
+        if (ref_ok) {
+            auto [ins, _] = llamacpp_refs.emplace(name, std::move(ref));
+            b = &ins->second;
+        }
         report.layers.push_back(computeMetrics(name, a, b));
     }
+
+    maybeDumpParityTaps("mlc", mlc_taps, "llamacpp", llamacpp_refs, report.notes);
 
     return report;
 }

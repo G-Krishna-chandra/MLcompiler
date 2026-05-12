@@ -2405,7 +2405,17 @@ int handleCompareCommand(const std::vector<std::string>& args) {
                      "                                <dir>/<sanitized(X)>.f32.bin (raw little-endian f32,\n"
                      "                                length must match).\n"
                      "  --wrap-chat                 Wrap prompt with [INST] template before tokenizing\n"
-                     "                                (default off — raw prompt for parity tests).\n";
+                     "                                (default off — raw prompt for parity tests).\n"
+                     "\n"
+                     "Env vars:\n"
+                     "  MLC_PARITY_DUMP=DIR         Dump both sides' captured tap tensors to DIR as\n"
+                     "                                raw little-endian float32 blobs. Files are named\n"
+                     "                                <side>_<sanitized_tensor>.f32.bin where <side> is\n"
+                     "                                'cpu'/'metal' (--metal-vs-cpu) or 'mlc'/'llamacpp'\n"
+                     "                                (--vs-llamacpp). Use for per-head / layout checks.\n"
+                     "  MLC_HARNESS_STRICT=1        (--metal-vs-cpu only) Exit nonzero if the side_a run\n"
+                     "                                had dispatch leaks (nodes actually ran on Metal\n"
+                     "                                under force_cpu) — turns the warning into a CI gate.\n";
     };
 
     if (args.empty()) { usage(); return 1; }
