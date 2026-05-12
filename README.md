@@ -7,19 +7,22 @@ LLMs token-by-token on Apple Silicon.
 
 ## Status
 
-Metal backend is end-to-end functional on Q4_0 quantized models. Numerical
-parity against the CPU backend is verified by the in-tree parity harness
-(`mlc compare --metal-vs-cpu`): on TinyLlama 1.1B every layer-boundary tensor
-matches between CPU and Metal at cosine ≥ 0.999999 (max abs error in the
-1e-5 range — float-rounding noise) and the final logits agree on top-1,
-top-5, and top-10 token rankings.
+Both CPU and Metal backends produce output that matches llama.cpp on
+TinyLlama 1.1B Q4_0:
 
-mlc CPU backend produces output that matches llama.cpp at the residual-stream
-level (bit-equal through all tested blocks on TinyLlama Q4_0). Metal backend
-has a known attention kernel divergence; non-attention ops (embedding,
-RMSNorm, FFN, Q4_0 matmul) remain parity-verified. Specific Metal kernel
-families that still need the same split-half fix that landed for Q4_0 are
-listed under "Known issues" below.
+- Layer-boundary tensors match llama.cpp at the residual stream (cosine
+  1.000000, max abs error ~1e-5 — float rounding) through every transformer
+  block.
+- Greedy decode of "The capital of France is" produces "Paris." matching
+  llama.cpp's choice, with coherent factual continuation.
+- CPU and Metal paths produce byte-equivalent token streams.
+
+Verified by the in-tree parity harness (`mlc compare --metal-vs-cpu` and
+`mlc compare --vs-llamacpp`).
+
+The runtime is correct end-to-end on TinyLlama Q4_0. Q4_1, Q5_0, Q5_1 Metal
+kernels are still known broken (same split-half indexing pattern as the Q4_0
+fix earlier this session — see Known issues).
 
 ## Project Structure
 
@@ -195,10 +198,11 @@ dump format is documented inline in `mlc compare --help`.
 
 ## Known issues
 
-- **Metal attention kernel diverges from CPU at attention boundaries** with a
-  per-head-by-GQA-group pattern (group 0 near-perfect, group 3 catastrophic).
-  Isolated and reproducible via `mlc compare --metal-vs-cpu`. Under
-  investigation.
+- **Embedding op falls back to CPU under Metal dispatch.** Surfaced by the
+  parity harness's missing-kernel fallback warning
+  (`mlc compare --metal-vs-cpu` reports 1/N nodes ran on CPU when Metal was
+  expected). The CPU path is fast enough that this isn't latency-critical,
+  but a Metal embedding kernel would tighten parity.
 - **Q4_1 / Q5_0 / Q5_1 Metal kernels have a known split-half indexing bug.**
   Same pattern as the Q4_0 bug fixed in commit d9720c7: the kernel walks
   `col_index++` against an assumed interleaved layout, but Q-quant storage is
@@ -223,8 +227,20 @@ dump format is documented inline in `mlc compare --help`.
   bug. Fixed in 96a2de6 + 3dcd8dd by routing all Metal dispatch through
   `MetalExecutor::shouldUseFor(node)`, which folds in the force-CPU check.
   After the fix, mlc-CPU residual-stream output is bit-equal to llama.cpp
-  through every tested block on TinyLlama Q4_0. The remaining Metal-side
-  attention divergence is now tracked separately under "Known issues" above.
+  through every tested block on TinyLlama Q4_0.
+- **Metal attention kernel diverged from CPU with a per-head-by-GQA-group
+  pattern** (group 0 near-perfect, group 3 catastrophic, worst head cosine
+  +0.23 on a 6-token prompt). Root cause: the per-head Q-rotation call site
+  in `MetalExecutor::Impl::attention` passed `base_position` as
+  `applyRotaryGPU`'s `offset_tokens` parameter, which the shader interprets
+  as a buffer index — `vec += offset_elems * head_dim` advanced the write
+  pointer `base_position * head_dim` floats into a `head_dim`-sized buffer,
+  putting all rotation writes out of bounds. qBuffer stayed unrotated and
+  the dot product used un-rotated Q against rotated K. Fixed in c9fffc2 by
+  passing `offset_tokens=0` (`cos_ptr`/`sin_ptr` already encode the
+  position). After the fix, `mlc compare --metal-vs-cpu` reports cosine
+  1.000000 at every layer-boundary tensor and `mlc chat` on Metal decodes
+  the same token stream as the CPU path.
 
 ## Future Integration
 
