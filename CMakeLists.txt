@@ -47,6 +47,23 @@ endif()
 add_executable(metal_diag tools/metal_diag.mm)
 target_link_libraries(metal_diag PRIVATE "-framework Foundation" "-framework Metal" "-framework CoreGraphics" "-framework QuartzCore")
 
+# llama.cpp activation dumper for the parity harness.
+# Builds only when libllama is present at the conventional sibling path.
+set(LLAMA_CPP_ROOT ${CMAKE_SOURCE_DIR}/../llama.cpp)
+set(LLAMA_CPP_LIB  ${LLAMA_CPP_ROOT}/build/bin/libllama.dylib)
+if (EXISTS ${LLAMA_CPP_LIB})
+    set(LLAMA_GGML_BASE ${LLAMA_CPP_ROOT}/build/bin/libggml-base.dylib)
+    set(LLAMA_GGML      ${LLAMA_CPP_ROOT}/build/bin/libggml.dylib)
+    add_executable(llamacpp_dump_activations tools/llamacpp_dump_activations.cpp)
+    target_include_directories(llamacpp_dump_activations PRIVATE
+        ${LLAMA_CPP_ROOT}/include
+        ${LLAMA_CPP_ROOT}/ggml/include)
+    target_link_libraries(llamacpp_dump_activations PRIVATE
+        ${LLAMA_CPP_LIB}
+        ${LLAMA_GGML}
+        ${LLAMA_GGML_BASE})
+endif()
+
 # Diagnostic: dumps per-step CPU activations + final block-0 K/V cache to disk.
 add_executable(mlc_dump_kv_cache tools/mlc_dump_kv_cache.cpp)
 target_link_libraries(mlc_dump_kv_cache PRIVATE mlc_lib)

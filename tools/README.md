@@ -18,3 +18,14 @@ Usage:
 
     mlc_dump_kv_cache --model PATH --prompt "..." --out-dir DIR \
                      [--tap blk.0.attn_k.out] [--tap blk.0.attn_v.out] ...
+
+## `llamacpp_dump_activations`
+
+Produces the reference tensor dumps that `mlc compare --vs-llamacpp` consumes.
+Loads a GGUF via libllama and uses llama.cpp's eval-callback to capture every
+intermediate tensor during a prefill, writing each as
+`<out_dir>/<sanitized_name>.f32.bin`. Built only when `../llama.cpp/build/bin`
+is populated (sibling-checkout convention); the CMake stanza skips silently
+otherwise, so the build doesn't require the dependency on systems that don't
+have it.
+
