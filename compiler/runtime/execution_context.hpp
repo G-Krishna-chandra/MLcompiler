@@ -63,6 +63,13 @@ public:
     void captureTapIfRegistered(const std::string& tensor_name);
     const std::unordered_map<std::string, std::vector<float>>& tapData() const { return tap_data_; }
 
+    // Dispatch trace: records the backend each node actually executed on, so
+    // callers (notably the parity harness) can verify that force-CPU runs
+    // didn't silently leak to Metal. Populated by ExecutionExecutor.
+    void recordDispatch(const std::string& node_name, BackendKind backend);
+    const std::unordered_map<std::string, BackendKind>& dispatchTrace() const { return dispatch_trace_; }
+    void clearDispatchTrace() { dispatch_trace_.clear(); }
+
 #if defined(__APPLE__)
     MetalBufferHandle* ensureMetalBuffer(const std::string& name,
                                          std::vector<float>& data);
@@ -82,6 +89,7 @@ private:
     mutable std::unordered_map<std::string, TensorStorage> parameter_cache_;
     std::unordered_set<std::string> tap_names_;
     std::unordered_map<std::string, std::vector<float>> tap_data_;
+    std::unordered_map<std::string, BackendKind> dispatch_trace_;
 #if defined(__APPLE__)
     std::unordered_map<std::string, MetalBufferHandle> metal_buffers_;
 #endif

@@ -50,6 +50,10 @@ struct CompareReport {
     // Diagnostic metadata captured during the run.
     std::vector<std::string> notes;
     bool success = true;
+    // Set to true when MLC_HARNESS_STRICT is set and the side-A (force-CPU)
+    // run had nodes that actually ran on Metal — i.e. a dispatch leak that
+    // would silently invalidate the comparison.
+    bool strict_violation = false;
 };
 
 // Run the harness in metal-vs-cpu mode (in-process; rebuilds the execution

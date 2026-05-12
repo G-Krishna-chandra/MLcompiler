@@ -12,6 +12,12 @@ namespace runtime {
 
 struct BackendExecutionResult {
     bool success = true;
+    // Backend that actually executed the kernel. May differ from
+    // node.backend or from the receiving ExecutionBackend subclass when an
+    // op falls back (e.g. Metal kernel unavailable for a shape, or
+    // shouldUseFor() returned false). Used by the parity harness to verify
+    // that force-CPU runs really ran on CPU.
+    BackendKind actual_backend = BackendKind::CPU;
     std::string message;
     std::string kernel_id;
 };

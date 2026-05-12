@@ -229,6 +229,9 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         }
         const auto& backend = registry_->backendFor(node->backend);
         auto backend_result = backend.execute(*node, context_, descriptor);
+        if (context_) {
+            context_->recordDispatch(node->name, backend_result.actual_backend);
+        }
         if (!backend_result.message.empty()) {
             entry.notes.push_back(backend_result.message);
         }

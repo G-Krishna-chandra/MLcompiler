@@ -68,6 +68,11 @@ bool ExecutionContext::isTapped(const std::string& tensor_name) const {
     return tap_names_.count(tensor_name) > 0;
 }
 
+void ExecutionContext::recordDispatch(const std::string& node_name, BackendKind backend) {
+    if (node_name.empty()) return;
+    dispatch_trace_[node_name] = backend;
+}
+
 void ExecutionContext::captureTapIfRegistered(const std::string& tensor_name) {
     if (tap_names_.empty()) return;
     if (!tap_names_.count(tensor_name)) return;

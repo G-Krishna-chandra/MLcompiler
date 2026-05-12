@@ -98,7 +98,8 @@ runPrefillAndCaptureTaps(Session& session,
                          const std::vector<uint64_t>& tokens,
                          const std::vector<std::string>& tap_patterns,
                          std::vector<std::string>* tap_names_out,
-                         std::string* note_out) {
+                         std::string* note_out,
+                         std::unordered_map<std::string, BackendKind>* dispatch_trace_out = nullptr) {
     auto graph = ExecutionPlanBuilder::BuildFromLoader(session.loader());
     auto taps = findTapTensors(graph, tap_patterns);
     if (tap_names_out) *tap_names_out = taps;
@@ -106,6 +107,7 @@ runPrefillAndCaptureTaps(Session& session,
     ExecutionContext context(session, &graph);
     ExecutionExecutor executor(graph, &BackendRegistry::Default(), &context);
     for (const auto& name : taps) context.registerTap(name);
+    context.clearDispatchTrace();
 
     const size_t context_len = std::max<size_t>(1, graph.modelConfig().context_length);
     size_t pos = 0;
@@ -141,7 +143,40 @@ runPrefillAndCaptureTaps(Session& session,
         pos += 1;
     }
 
+    if (dispatch_trace_out) {
+        *dispatch_trace_out = context.dispatchTrace();
+    }
     return context.tapData();
+}
+
+// Builds the "harness warning" lines describing nodes whose actual backend
+// did not match what the caller pinned. Emits a leading summary line + up to
+// kMaxListed offending node names. Returns the number of offenders.
+size_t summarizeDispatchLeaks(const std::unordered_map<std::string, BackendKind>& trace,
+                              BackendKind expected,
+                              const std::string& warning_prefix,
+                              std::vector<std::string>& notes_out) {
+    std::vector<std::string> offenders;
+    for (const auto& [name, kind] : trace) {
+        if (kind != expected) offenders.push_back(name);
+    }
+    if (offenders.empty()) return 0;
+    std::sort(offenders.begin(), offenders.end());
+    constexpr size_t kMaxListed = 6;
+    std::ostringstream head;
+    head << warning_prefix << ": " << offenders.size() << " of "
+         << trace.size() << " nodes";
+    notes_out.push_back(head.str());
+    size_t limit = std::min(offenders.size(), kMaxListed);
+    for (size_t i = 0; i < limit; ++i) {
+        notes_out.push_back("    - " + offenders[i]);
+    }
+    if (offenders.size() > kMaxListed) {
+        std::ostringstream tail;
+        tail << "    ... (" << (offenders.size() - kMaxListed) << " more)";
+        notes_out.push_back(tail.str());
+    }
+    return offenders.size();
 }
 
 LayerComparison computeMetrics(const std::string& name,
@@ -272,17 +307,45 @@ CompareReport compareMetalVsCpu(const CompareOptions& opts) {
     KernelDescriptorRegistry::setForceCpu(true);
     std::vector<std::string> tap_names_cpu;
     std::string cpu_note;
-    auto cpu_taps = runPrefillAndCaptureTaps(session, tokens, patterns, &tap_names_cpu, &cpu_note);
+    std::unordered_map<std::string, BackendKind> cpu_dispatch_trace;
+    auto cpu_taps = runPrefillAndCaptureTaps(session, tokens, patterns, &tap_names_cpu, &cpu_note,
+                                             &cpu_dispatch_trace);
     if (!cpu_note.empty()) report.notes.push_back("cpu: " + cpu_note);
 
     // Run B: Metal default.
     KernelDescriptorRegistry::setForceCpu(false);
     std::vector<std::string> tap_names_metal;
     std::string metal_note;
-    auto metal_taps = runPrefillAndCaptureTaps(session, tokens, patterns, &tap_names_metal, &metal_note);
+    std::unordered_map<std::string, BackendKind> metal_dispatch_trace;
+    auto metal_taps = runPrefillAndCaptureTaps(session, tokens, patterns, &tap_names_metal, &metal_note,
+                                               &metal_dispatch_trace);
     if (!metal_note.empty()) report.notes.push_back("metal: " + metal_note);
 
     KernelDescriptorRegistry::setForceCpu(prior_force_cpu);
+
+    // Dispatch-trace audit. The side-A run is the load-bearing one: any node
+    // that actually ran on Metal here means force-CPU leaked, which would
+    // silently invalidate the CPU column. Treat as a real warning (and as
+    // an error under MLC_HARNESS_STRICT).
+    size_t cpu_leaks = summarizeDispatchLeaks(
+        cpu_dispatch_trace,
+        BackendKind::CPU,
+        "HARNESS WARNING [dispatch leak]: nodes ran on Metal under force_cpu — comparison is invalid for these",
+        report.notes);
+    // Side-B is purely informational: nodes that ran on CPU under default
+    // dispatch typically mean the Metal kernel is missing for that op shape,
+    // not a dispatch bug. Phrased accordingly.
+    summarizeDispatchLeaks(
+        metal_dispatch_trace,
+        BackendKind::Metal,
+        "HARNESS NOTE [missing-kernel fallback]: nodes ran on CPU when Metal was expected (probably no Metal kernel for this op)",
+        report.notes);
+
+    if (cpu_leaks > 0 && std::getenv("MLC_HARNESS_STRICT") != nullptr) {
+        report.strict_violation = true;
+        report.success = false;
+        report.notes.push_back("MLC_HARNESS_STRICT=1: failing because of dispatch leak above");
+    }
 
     // The CPU run determines the canonical ordering — its tap_names_cpu is already
     // sorted by topo position. Use it; any tensors only present on the metal side
@@ -338,6 +401,20 @@ CompareReport compareVsLlamaCpp(const CompareOptions& opts) {
     auto mlc_taps = runPrefillAndCaptureTaps(session, tokens, patterns, &tap_names, &note);
     if (!note.empty()) report.notes.push_back("mlc-cpu: " + note);
     KernelDescriptorRegistry::setForceCpu(prior_force_cpu);
+
+    // Diagnostic hook: write mlc-CPU's tap snapshots to disk if requested. Used by
+    // ad-hoc analyses (per-head cosine, layout checks) that need raw tensor bytes.
+    if (const char* dump_dir = std::getenv("MLC_PARITY_DUMP_SIDE_A")) {
+        for (const auto& [name, data] : mlc_taps) {
+            std::string path = std::string(dump_dir) + "/" + sanitizeForFilename(name) + ".f32.bin";
+            std::ofstream out(path, std::ios::binary);
+            if (out) {
+                out.write(reinterpret_cast<const char*>(data.data()),
+                          static_cast<std::streamsize>(data.size() * sizeof(float)));
+            }
+        }
+        report.notes.push_back(std::string("dumped mlc-cpu taps to ") + dump_dir);
+    }
 
     for (const auto& name : tap_names) {
         std::string ref_path = opts.reference_dir + "/" + sanitizeForFilename(name) + ".f32.bin";

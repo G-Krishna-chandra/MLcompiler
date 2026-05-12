@@ -820,6 +820,7 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                             }
                             encodeCacheTensor(cache_k_info, cache_k_storage, cache_k_decoded);
                             encodeCacheTensor(cache_v_info, cache_v_storage, cache_v_decoded);
+                            result.actual_backend = BackendKind::Metal;
                             result.message = "metal-attention";
                             return result;
                         }
@@ -928,6 +929,10 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                                                       ExecutionContext* context,
                                                       const KernelDescriptor* descriptor) const {
     BackendExecutionResult result;
+    // Default for the Metal backend: success paths in this function will leave
+    // this in place. Any CPU-fallback path returns CpuExecutionBackend::execute()
+    // directly, whose result already carries actual_backend = CPU.
+    result.actual_backend = BackendKind::Metal;
     if (descriptor) {
         result.kernel_id = descriptor->id;
     } else if (!node.kernel_id.empty()) {
