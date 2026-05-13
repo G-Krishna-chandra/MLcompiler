@@ -5,6 +5,7 @@
 #include "runtime/execution_context.hpp"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mlc {
@@ -32,6 +33,18 @@ public:
     };
 
     Result run(size_t max_nodes = 0) const;
+
+    // Coarse per-op-type profiling. Accumulates total ms and call count across
+    // every backend.execute() invocation while MLC_PROFILE_NODES is set in the
+    // environment. Static so callers don't need a back-channel to the executor
+    // instance. Use clearNodeProfile() at the start of a measurement window and
+    // dumpNodeProfile() to read it out.
+    struct OpProfileEntry {
+        double total_ms = 0.0;
+        size_t calls = 0;
+    };
+    static const std::unordered_map<ExecOpType, OpProfileEntry>& nodeProfile();
+    static void clearNodeProfile();
 
 private:
     const ExecutionGraph& graph_;

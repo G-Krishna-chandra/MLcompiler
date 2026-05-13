@@ -1,6 +1,7 @@
 #include "runtime/execution_executor.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -14,6 +15,26 @@
 
 namespace mlc {
 namespace runtime {
+
+namespace {
+bool nodeProfileEnabled() {
+    static const bool enabled = (std::getenv("MLC_PROFILE_NODES") != nullptr);
+    return enabled;
+}
+std::unordered_map<ExecOpType, ExecutionExecutor::OpProfileEntry>& mutableNodeProfile() {
+    static std::unordered_map<ExecOpType, ExecutionExecutor::OpProfileEntry> table;
+    return table;
+}
+} // namespace
+
+const std::unordered_map<ExecOpType, ExecutionExecutor::OpProfileEntry>&
+ExecutionExecutor::nodeProfile() {
+    return mutableNodeProfile();
+}
+
+void ExecutionExecutor::clearNodeProfile() {
+    mutableNodeProfile().clear();
+}
 
 namespace {
 size_t elementCount(const std::vector<int64_t>& shape) {
@@ -228,7 +249,14 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             descriptor = KernelDescriptorRegistry::Instance().findById(node->kernel_id);
         }
         const auto& backend = registry_->backendFor(node->backend);
+        auto t_op_begin = std::chrono::steady_clock::now();
         auto backend_result = backend.execute(*node, context_, descriptor);
+        if (nodeProfileEnabled()) {
+            auto t_op_end = std::chrono::steady_clock::now();
+            auto& entry = mutableNodeProfile()[node->op];
+            entry.total_ms += std::chrono::duration<double, std::milli>(t_op_end - t_op_begin).count();
+            entry.calls += 1;
+        }
         if (context_) {
             context_->recordDispatch(node->name, backend_result.actual_backend);
         }

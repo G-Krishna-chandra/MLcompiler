@@ -3,6 +3,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#include <chrono>
 #include "frontends/frontend.hpp"
 #include "frontends/gguf_loader.hpp"
 #include "frontends/gguf_to_ir.hpp"
@@ -1955,6 +1956,12 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
             logTokenList(log_cfg, "chat_prompt_tokens", turn_index, history);
 
             std::vector<float> logits;
+            // PART A timing: wall-clock the prefill (token-by-token replay of
+            // the chat-templated prompt) and the generation loop separately.
+            using clk = std::chrono::steady_clock;
+            mlc::runtime::ExecutionExecutor::clearNodeProfile();
+            auto t_prefill_begin = clk::now();
+            size_t prompt_tokens_processed = 0;
             // Feed any unprocessed tokens (including BOS once).
             for (size_t i = processed; i < history.size(); ++i) {
                 if (pos >= context_len) {
@@ -1969,10 +1976,13 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
                 }
                 logLogits(log_cfg, "prompt", turn_index, i, history[i], pos, logits, top_k);
                 pos += 1;
+                ++prompt_tokens_processed;
             }
             processed = history.size();
+            auto t_prefill_end = clk::now();
 
             std::vector<uint64_t> generated;
+            auto t_gen_begin = clk::now();
             for (size_t i = 0; i < max_new; ++i) {
                 const std::vector<float>* sample_logits = &logits;
                 std::vector<float> masked;
@@ -2020,6 +2030,51 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
             }
             std::string decoded = tokenizer.decode(generated);
             std::cout << "Model: " << (decoded.empty() ? "[empty]" : decoded) << "\n";
+            auto t_gen_end = clk::now();
+            auto dur_ms = [](clk::time_point a, clk::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            double prefill_ms = dur_ms(t_prefill_begin, t_prefill_end);
+            double gen_ms     = dur_ms(t_gen_begin,     t_gen_end);
+            double per_tok_ms = generated.empty() ? 0.0 : gen_ms / static_cast<double>(generated.size());
+            std::cout << "[timing] prefill=" << std::fixed << std::setprecision(1)
+                      << prefill_ms << " ms (" << prompt_tokens_processed << " prompt tokens, "
+                      << (prompt_tokens_processed
+                              ? prefill_ms / static_cast<double>(prompt_tokens_processed)
+                              : 0.0)
+                      << " ms/tok)  generated=" << generated.size()
+                      << " tok in " << gen_ms << " ms ("
+                      << per_tok_ms << " ms/tok, "
+                      << (per_tok_ms > 0 ? 1000.0 / per_tok_ms : 0.0)
+                      << " tok/s)" << std::defaultfloat << "\n";
+            if (std::getenv("MLC_PROFILE_NODES") != nullptr) {
+                const auto& prof = mlc::runtime::ExecutionExecutor::nodeProfile();
+                std::vector<std::pair<mlc::runtime::ExecOpType,
+                                      mlc::runtime::ExecutionExecutor::OpProfileEntry>>
+                    sorted(prof.begin(), prof.end());
+                std::sort(sorted.begin(), sorted.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.second.total_ms > b.second.total_ms;
+                          });
+                double total = 0.0;
+                for (const auto& p : sorted) total += p.second.total_ms;
+                std::cout << "[profile] per-op breakdown (turn total " << std::fixed
+                          << std::setprecision(1) << total << " ms across "
+                          << (prompt_tokens_processed + generated.size())
+                          << " forward passes):\n";
+                for (const auto& [op, e] : sorted) {
+                    double avg_us_per_call = e.calls ? (e.total_ms * 1000.0 / e.calls) : 0.0;
+                    double pct = total > 0 ? (e.total_ms / total) * 100.0 : 0.0;
+                    std::cout << "  " << std::setw(11) << std::left
+                              << mlc::runtime::toString(op) << " "
+                              << std::right << std::setw(7) << std::setprecision(1)
+                              << e.total_ms << " ms (" << std::setw(5) << std::setprecision(1)
+                              << pct << "%)  calls=" << std::setw(6) << e.calls
+                              << "  avg=" << std::setw(7) << std::setprecision(1)
+                              << avg_us_per_call << " us/call\n";
+                }
+                std::cout << std::defaultfloat;
+            }
             if (used_template && !decoded.empty()) {
                 messages.push_back({"assistant", decoded});
             }
