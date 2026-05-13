@@ -2074,6 +2074,10 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
                               << avg_us_per_call << " us/call\n";
                 }
                 std::cout << std::defaultfloat;
+                std::string cache_line = mlc::runtime::MetalExecutor::Instance().weightCacheSummary();
+                if (!cache_line.empty()) {
+                    std::cout << "[profile] " << cache_line << "\n";
+                }
             }
             if (used_template && !decoded.empty()) {
                 messages.push_back({"assistant", decoded});
@@ -2867,9 +2871,9 @@ int handleTestMatmulQ4Command(const std::vector<std::string>& args) {
             std::vector<float> metal;
             bool ok = transpose
                 ? MetalExecutor::Instance().runMatMulQ4_0Transposed(
-                      raw, input, rows, cols, row_stride, qversion, metal, nullptr)
+                      name, raw, input, rows, cols, row_stride, qversion, metal, nullptr)
                 : MetalExecutor::Instance().runMatMulQ4_0(
-                      raw, input, rows, cols, row_stride, qversion, metal, nullptr);
+                      name, raw, input, rows, cols, row_stride, qversion, metal, nullptr);
             if (!ok) {
                 std::printf("%-31s | metal kernel returned ok=false\n", name.c_str());
                 continue;
@@ -2943,10 +2947,10 @@ int handleTestMatmulQ4Command(const std::vector<std::string>& args) {
             std::vector<float> metal_out;
             bool ok = transpose
                 ? MetalExecutor::Instance().runMatMulQ4_0Transposed(
-                      weights, input, weight_rows, weight_cols, row_stride, qversion,
+                      std::string{}, weights, input, weight_rows, weight_cols, row_stride, qversion,
                       metal_out, nullptr)
                 : MetalExecutor::Instance().runMatMulQ4_0(
-                      weights, input, weight_rows, weight_cols, row_stride, qversion,
+                      std::string{}, weights, input, weight_rows, weight_cols, row_stride, qversion,
                       metal_out, nullptr);
             char shape_buf[24];
             std::snprintf(shape_buf, sizeof(shape_buf), "[%zu,%zu]", weight_rows, weight_cols);

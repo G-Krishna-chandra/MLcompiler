@@ -15,8 +15,12 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <sstream>
+#include <unordered_map>
 
 #if defined(__APPLE__)
 namespace {
@@ -1220,6 +1224,45 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> biasAddPipeline = nil;
     id<MTLComputePipelineState> kvWritePipeline = nil;
     bool debug_log = false;
+
+    // Persistent device-side weight cache. Weights are immutable for the
+    // lifetime of the runtime, so we upload each tensor once and reuse the
+    // Metal buffer across every matmul that consumes it. Keyed by full
+    // tensor name (e.g. "blk.5.attn_q.weight") to avoid cross-block collisions.
+    mutable std::unordered_map<std::string, id<MTLBuffer>> weight_cache_;
+    mutable std::mutex weight_cache_mutex_;
+    mutable size_t cache_hits_ = 0;
+    mutable size_t cache_misses_ = 0;
+    mutable size_t cache_bytes_ = 0;
+
+    id<MTLBuffer> getOrCacheWeight(const std::string& name,
+                                   const std::vector<uint8_t>& bytes) const {
+        if (!name.empty()) {
+            std::lock_guard<std::mutex> lock(weight_cache_mutex_);
+            auto it = weight_cache_.find(name);
+            if (it != weight_cache_.end()) {
+                ++cache_hits_;
+                return it->second;
+            }
+        }
+        id<MTLBuffer> buffer = [device newBufferWithBytes:bytes.data()
+                                                   length:bytes.size()
+                                                  options:MTLResourceStorageModeShared];
+        if (!buffer) return nil;
+        if (!name.empty()) {
+            std::lock_guard<std::mutex> lock(weight_cache_mutex_);
+            // Re-check in case another thread inserted while we allocated.
+            auto it = weight_cache_.find(name);
+            if (it != weight_cache_.end()) {
+                ++cache_hits_;
+                return it->second;
+            }
+            weight_cache_.emplace(name, buffer);
+            ++cache_misses_;
+            cache_bytes_ += bytes.size();
+        }
+        return buffer;
+    }
 #endif
 
     Impl() {
@@ -1994,7 +2037,8 @@ struct MetalExecutor::Impl {
         return false;
     }
 
-    bool matmul(const std::vector<float>& weights,
+    bool matmul(const std::string& weight_name,
+                const std::vector<float>& weights,
                 const std::vector<float>& input,
                 size_t rows,
                 size_t cols,
@@ -2002,6 +2046,8 @@ struct MetalExecutor::Impl {
                 std::vector<float>& output,
                 const std::vector<float>* bias = nullptr) const {
 #if defined(__APPLE__)
+        (void)weight_name;  // F32 path stages into a row-aligned buffer below;
+                            // caching the raw float bytes wouldn't fit that layout.
         if (!available() || weights.size() != rows * cols) {
             return false;
         }
@@ -2120,7 +2166,8 @@ struct MetalExecutor::Impl {
         return false;
     }
 
-bool matmulQuant(const std::vector<uint8_t>& weights,
+bool matmulQuant(const std::string& weight_name,
+                 const std::vector<uint8_t>& weights,
                  const std::vector<float>& input,
                  size_t rows,
                  size_t cols,
@@ -2136,9 +2183,7 @@ bool matmulQuant(const std::vector<uint8_t>& weights,
         if (weights.size() < row_stride * rows) return false;
         if (@available(macOS 11.0, *)) {
             @autoreleasepool {
-                id<MTLBuffer> weightBuffer = [device newBufferWithBytes:weights.data()
-                                                                 length:weights.size()
-                                                                options:MTLResourceStorageModeShared];
+                id<MTLBuffer> weightBuffer = getOrCacheWeight(weight_name, weights);
                 id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
                                                                 length:input.size() * sizeof(float)
                                                                options:MTLResourceStorageModeShared];
@@ -2190,7 +2235,8 @@ bool matmulQuant(const std::vector<uint8_t>& weights,
         return false;
     }
 
-bool matmulQuantTransposed(const std::vector<uint8_t>& weights,
+bool matmulQuantTransposed(const std::string& weight_name,
+                           const std::vector<uint8_t>& weights,
                            const std::vector<float>& input,
                            size_t rows,
                            size_t cols,
@@ -2206,9 +2252,7 @@ bool matmulQuantTransposed(const std::vector<uint8_t>& weights,
         if (weights.size() < row_stride * rows) return false;
         if (@available(macOS 11.0, *)) {
             @autoreleasepool {
-                id<MTLBuffer> weightBuffer = [device newBufferWithBytes:weights.data()
-                                                                 length:weights.size()
-                                                                options:MTLResourceStorageModeShared];
+                id<MTLBuffer> weightBuffer = getOrCacheWeight(weight_name, weights);
                 id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
                                                                 length:input.size() * sizeof(float)
                                                                options:MTLResourceStorageModeShared];
@@ -2260,7 +2304,8 @@ bool matmulQuantTransposed(const std::vector<uint8_t>& weights,
         return false;
     }
 
-bool matmulQuantKTransposed(const std::vector<uint8_t>& weights,
+bool matmulQuantKTransposed(const std::string& weight_name,
+                            const std::vector<uint8_t>& weights,
                             const std::vector<float>& input,
                             size_t rows,
                             size_t cols,
@@ -2274,9 +2319,7 @@ bool matmulQuantKTransposed(const std::vector<uint8_t>& weights,
         if (weights.size() < row_stride * rows) return false;
         if (@available(macOS 11.0, *)) {
             @autoreleasepool {
-                id<MTLBuffer> weightBuffer = [device newBufferWithBytes:weights.data()
-                                                                 length:weights.size()
-                                                                options:MTLResourceStorageModeShared];
+                id<MTLBuffer> weightBuffer = getOrCacheWeight(weight_name, weights);
                 id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
                                                                 length:input.size() * sizeof(float)
                                                                options:MTLResourceStorageModeShared];
@@ -2327,7 +2370,8 @@ bool matmulQuantKTransposed(const std::vector<uint8_t>& weights,
         return false;
     }
 
-bool matmulQuantK(const std::vector<uint8_t>& weights,
+bool matmulQuantK(const std::string& weight_name,
+                  const std::vector<uint8_t>& weights,
                   const std::vector<float>& input,
                   size_t rows,
                   size_t cols,
@@ -2341,9 +2385,7 @@ bool matmulQuantK(const std::vector<uint8_t>& weights,
         if (weights.size() < row_stride * rows) return false;
         if (@available(macOS 11.0, *)) {
             @autoreleasepool {
-                id<MTLBuffer> weightBuffer = [device newBufferWithBytes:weights.data()
-                                                                 length:weights.size()
-                                                                options:MTLResourceStorageModeShared];
+                id<MTLBuffer> weightBuffer = getOrCacheWeight(weight_name, weights);
                 id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
                                                                 length:input.size() * sizeof(float)
                                                                options:MTLResourceStorageModeShared];
@@ -2394,7 +2436,8 @@ bool matmulQuantK(const std::vector<uint8_t>& weights,
         return false;
     }
 
-bool matmulQ4_0(const std::vector<uint8_t>& weights,
+bool matmulQ4_0(const std::string& weight_name,
+                const std::vector<uint8_t>& weights,
                 const std::vector<float>& input,
                 size_t rows,
                 size_t cols,
@@ -2402,11 +2445,12 @@ bool matmulQ4_0(const std::vector<uint8_t>& weights,
                 uint32_t quant_version,
                 const std::vector<float>* bias,
                 std::vector<float>& output) const {
-    return matmulQuant(weights, input, rows, cols, row_stride, quant_version,
+    return matmulQuant(weight_name, weights, input, rows, cols, row_stride, quant_version,
                        q4MatmulPipeline, bias, output);
 }
 
-bool matmulQ4_0Transposed(const std::vector<uint8_t>& weights,
+bool matmulQ4_0Transposed(const std::string& weight_name,
+                          const std::vector<uint8_t>& weights,
                           const std::vector<float>& input,
                           size_t rows,
                           size_t cols,
@@ -2414,44 +2458,48 @@ bool matmulQ4_0Transposed(const std::vector<uint8_t>& weights,
                           uint32_t quant_version,
                           const std::vector<float>* bias,
                           std::vector<float>& output) const {
-    return matmulQuantTransposed(weights, input, rows, cols, row_stride, quant_version,
+    return matmulQuantTransposed(weight_name, weights, input, rows, cols, row_stride, quant_version,
                                  q4MatmulTransposedPipeline, bias, output);
 }
 
-bool matmulQ4_1(const std::vector<uint8_t>& weights,
+bool matmulQ4_1(const std::string& weight_name,
+                const std::vector<uint8_t>& weights,
                 const std::vector<float>& input,
                 size_t rows,
                 size_t cols,
                 size_t row_stride,
                 const std::vector<float>* bias,
                 std::vector<float>& output) const {
-    return matmulQuant(weights, input, rows, cols, row_stride, 0,
+    return matmulQuant(weight_name, weights, input, rows, cols, row_stride, 0,
                        q4_1MatmulPipeline, bias, output);
 }
 
-bool matmulQ5_0(const std::vector<uint8_t>& weights,
+bool matmulQ5_0(const std::string& weight_name,
+                const std::vector<uint8_t>& weights,
                 const std::vector<float>& input,
                 size_t rows,
                 size_t cols,
                 size_t row_stride,
                 const std::vector<float>* bias,
                 std::vector<float>& output) const {
-    return matmulQuant(weights, input, rows, cols, row_stride, 0,
+    return matmulQuant(weight_name, weights, input, rows, cols, row_stride, 0,
                        q5_0MatmulPipeline, bias, output);
 }
 
-bool matmulQ5_1(const std::vector<uint8_t>& weights,
+bool matmulQ5_1(const std::string& weight_name,
+                const std::vector<uint8_t>& weights,
                 const std::vector<float>& input,
                 size_t rows,
                 size_t cols,
                 size_t row_stride,
                 const std::vector<float>* bias,
                 std::vector<float>& output) const {
-    return matmulQuant(weights, input, rows, cols, row_stride, 0,
+    return matmulQuant(weight_name, weights, input, rows, cols, row_stride, 0,
                        q5_1MatmulPipeline, bias, output);
 }
 
-bool matmulQ2_K(const std::vector<uint8_t>& weights,
+bool matmulQ2_K(const std::string& weight_name,
+                const std::vector<uint8_t>& weights,
                 const std::vector<float>& input,
                 size_t rows,
                 size_t cols,
@@ -2460,7 +2508,7 @@ bool matmulQ2_K(const std::vector<uint8_t>& weights,
                 std::vector<float>& output) const {
 #if defined(__APPLE__)
     if (!available() || !q2KMatmulPipeline) return false;
-    auto result = matmulQuantK(weights, input, rows, cols, row_stride, q2KMatmulPipeline, bias, output);
+    auto result = matmulQuantK(weight_name, weights, input, rows, cols, row_stride, q2KMatmulPipeline, bias, output);
     return result;
 #else
     (void)weights;
@@ -2473,7 +2521,8 @@ bool matmulQ2_K(const std::vector<uint8_t>& weights,
 #endif
     }
 
-bool matmulQ3_K(const std::vector<uint8_t>& weights,
+bool matmulQ3_K(const std::string& weight_name,
+                const std::vector<uint8_t>& weights,
                 const std::vector<float>& input,
                 size_t rows,
                 size_t cols,
@@ -2482,7 +2531,7 @@ bool matmulQ3_K(const std::vector<uint8_t>& weights,
                 std::vector<float>& output) const {
 #if defined(__APPLE__)
     if (!available() || !q3KMatmulPipeline) return false;
-    return matmulQuantK(weights, input, rows, cols, row_stride, q3KMatmulPipeline, bias, output);
+    return matmulQuantK(weight_name, weights, input, rows, cols, row_stride, q3KMatmulPipeline, bias, output);
 #else
     (void)weights;
         (void)input;
@@ -2494,13 +2543,15 @@ bool matmulQ3_K(const std::vector<uint8_t>& weights,
 #endif
     }
 
-bool matmulQ4_K(const std::vector<uint8_t>& weights,
+bool matmulQ4_K(const std::string& weight_name,
+                const std::vector<uint8_t>& weights,
                 const std::vector<float>& input,
                 size_t rows,
                 size_t cols,
                 size_t row_stride,
                 const std::vector<float>* bias,
                 std::vector<float>& output) const {
+    (void)weight_name;  // CPU reference path; no Metal weight upload.
 #if defined(__APPLE__)
     // Use CPU reference for exact parity with host path (avoids tiny GPU rounding drift).
     if (input.size() != cols || weights.size() < row_stride * rows) return false;
@@ -2523,7 +2574,8 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 #endif
 }
 
-    bool matmulQ5_K(const std::vector<uint8_t>& weights,
+    bool matmulQ5_K(const std::string& weight_name,
+                    const std::vector<uint8_t>& weights,
                     const std::vector<float>& input,
                     size_t rows,
                     size_t cols,
@@ -2532,7 +2584,7 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
         if (!available() || !q5KMatmulPipeline) return false;
-        return matmulQuantK(weights, input, rows, cols, row_stride, q5KMatmulPipeline, bias, output);
+        return matmulQuantK(weight_name, weights, input, rows, cols, row_stride, q5KMatmulPipeline, bias, output);
 #else
         (void)weights;
         (void)input;
@@ -2544,13 +2596,15 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 #endif
     }
 
-    bool matmulQ6_K(const std::vector<uint8_t>& weights,
+    bool matmulQ6_K(const std::string& weight_name,
+                    const std::vector<uint8_t>& weights,
                     const std::vector<float>& input,
                     size_t rows,
                     size_t cols,
                     size_t row_stride,
                     const std::vector<float>* bias,
                     std::vector<float>& output) const {
+        (void)weight_name;  // CPU reference path; no Metal weight upload.
 #if defined(__APPLE__)
         // CPU reference for exact parity until GPU kernel is fully bit-accurate.
         if (input.size() != cols || weights.size() < row_stride * rows) return false;
@@ -2572,7 +2626,8 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 #endif
     }
 
-    bool matmulQ6_KTransposed(const std::vector<uint8_t>& weights,
+    bool matmulQ6_KTransposed(const std::string& weight_name,
+                              const std::vector<uint8_t>& weights,
                               const std::vector<float>& input,
                               size_t rows,
                               size_t cols,
@@ -2581,7 +2636,7 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                               std::vector<float>& output) const {
 #if defined(__APPLE__)
         if (!available() || !q6KMatmulTransposedPipeline) return false;
-        return matmulQuantKTransposed(weights, input, rows, cols, row_stride,
+        return matmulQuantKTransposed(weight_name, weights, input, rows, cols, row_stride,
                                       q6KMatmulTransposedPipeline, bias, output);
 #else
         (void)weights;
@@ -2594,7 +2649,8 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 #endif
     }
 
-    bool matmulQ8_K(const std::vector<uint8_t>& weights,
+    bool matmulQ8_K(const std::string& weight_name,
+                    const std::vector<uint8_t>& weights,
                     const std::vector<float>& input,
                     size_t rows,
                     size_t cols,
@@ -2603,7 +2659,7 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
         if (!available() || !q8KMatmulPipeline) return false;
-        return matmulQuantK(weights, input, rows, cols, row_stride, q8KMatmulPipeline, bias, output);
+        return matmulQuantK(weight_name, weights, input, rows, cols, row_stride, q8KMatmulPipeline, bias, output);
 #else
         (void)weights;
         (void)input;
@@ -2615,7 +2671,8 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 #endif
     }
 
-    bool matmulQ8_0(const std::vector<uint8_t>& weights,
+    bool matmulQ8_0(const std::string& weight_name,
+                    const std::vector<uint8_t>& weights,
                     const std::vector<float>& input,
                     size_t rows,
                     size_t cols,
@@ -2624,7 +2681,7 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
         if (!available() || !q8_0MatmulPipeline) return false;
-        return matmulQuant(weights, input, rows, cols, row_stride, 0, q8_0MatmulPipeline, bias, output);
+        return matmulQuant(weight_name, weights, input, rows, cols, row_stride, 0, q8_0MatmulPipeline, bias, output);
 #else
         (void)weights;
         (void)input;
@@ -2636,7 +2693,8 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
 #endif
     }
 
-    bool matmulQ8_1(const std::vector<uint8_t>& weights,
+    bool matmulQ8_1(const std::string& weight_name,
+                    const std::vector<uint8_t>& weights,
                     const std::vector<float>& input,
                     size_t rows,
                     size_t cols,
@@ -2645,7 +2703,7 @@ bool matmulQ4_K(const std::vector<uint8_t>& weights,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
         if (!available() || !q8_1MatmulPipeline) return false;
-        return matmulQuant(weights, input, rows, cols, row_stride, 0, q8_1MatmulPipeline, bias, output);
+        return matmulQuant(weight_name, weights, input, rows, cols, row_stride, 0, q8_1MatmulPipeline, bias, output);
 #else
         (void)weights;
         (void)input;
@@ -3759,7 +3817,8 @@ bool MetalExecutor::shouldUseFor(const ExecutionNode& node) const {
         && !KernelDescriptorRegistry::forceCpu();
 }
 
-bool MetalExecutor::runMatMul(const std::vector<float>& weights,
+bool MetalExecutor::runMatMul(const std::string& weight_name,
+                              const std::vector<float>& weights,
                               const std::vector<float>& input,
                               size_t rows,
                               size_t cols,
@@ -3767,10 +3826,11 @@ bool MetalExecutor::runMatMul(const std::vector<float>& weights,
                               std::vector<float>& output,
                               const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmul(weights, input, rows, cols, transpose_weight, output, bias);
+    return impl_->matmul(weight_name, weights, input, rows, cols, transpose_weight, output, bias);
 }
 
-bool MetalExecutor::runMatMulQ4_0(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ4_0(const std::string& weight_name,
+                                  const std::vector<uint8_t>& weights,
                                   const std::vector<float>& input,
                                   size_t rows,
                                   size_t cols,
@@ -3779,10 +3839,11 @@ bool MetalExecutor::runMatMulQ4_0(const std::vector<uint8_t>& weights,
                                   std::vector<float>& output,
                                   const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ4_0(weights, input, rows, cols, row_stride, quant_version, bias, output);
+    return impl_->matmulQ4_0(weight_name, weights, input, rows, cols, row_stride, quant_version, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ4_0Transposed(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ4_0Transposed(const std::string& weight_name,
+                                            const std::vector<uint8_t>& weights,
                                             const std::vector<float>& input,
                                             size_t rows,
                                             size_t cols,
@@ -3791,10 +3852,11 @@ bool MetalExecutor::runMatMulQ4_0Transposed(const std::vector<uint8_t>& weights,
                                             std::vector<float>& output,
                                             const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ4_0Transposed(weights, input, rows, cols, row_stride, quant_version, bias, output);
+    return impl_->matmulQ4_0Transposed(weight_name, weights, input, rows, cols, row_stride, quant_version, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ4_1(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ4_1(const std::string& weight_name,
+                                  const std::vector<uint8_t>& weights,
                                   const std::vector<float>& input,
                                   size_t rows,
                                   size_t cols,
@@ -3802,10 +3864,11 @@ bool MetalExecutor::runMatMulQ4_1(const std::vector<uint8_t>& weights,
                                   std::vector<float>& output,
                                   const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ4_1(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ4_1(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ5_0(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ5_0(const std::string& weight_name,
+                                  const std::vector<uint8_t>& weights,
                                   const std::vector<float>& input,
                                   size_t rows,
                                   size_t cols,
@@ -3813,10 +3876,11 @@ bool MetalExecutor::runMatMulQ5_0(const std::vector<uint8_t>& weights,
                                   std::vector<float>& output,
                                   const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ5_0(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ5_0(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ5_1(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ5_1(const std::string& weight_name,
+                                  const std::vector<uint8_t>& weights,
                                   const std::vector<float>& input,
                                   size_t rows,
                                   size_t cols,
@@ -3824,10 +3888,11 @@ bool MetalExecutor::runMatMulQ5_1(const std::vector<uint8_t>& weights,
                                   std::vector<float>& output,
                                   const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ5_1(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ5_1(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ2K(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ2K(const std::string& weight_name,
+                                 const std::vector<uint8_t>& weights,
                                  const std::vector<float>& input,
                                  size_t rows,
                                  size_t cols,
@@ -3835,10 +3900,11 @@ bool MetalExecutor::runMatMulQ2K(const std::vector<uint8_t>& weights,
                                  std::vector<float>& output,
                                  const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ2_K(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ2_K(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ3K(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ3K(const std::string& weight_name,
+                                 const std::vector<uint8_t>& weights,
                                  const std::vector<float>& input,
                                  size_t rows,
                                  size_t cols,
@@ -3846,10 +3912,11 @@ bool MetalExecutor::runMatMulQ3K(const std::vector<uint8_t>& weights,
                                  std::vector<float>& output,
                                  const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ3_K(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ3_K(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ4K(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ4K(const std::string& weight_name,
+                                 const std::vector<uint8_t>& weights,
                                  const std::vector<float>& input,
                                  size_t rows,
                                  size_t cols,
@@ -3857,10 +3924,11 @@ bool MetalExecutor::runMatMulQ4K(const std::vector<uint8_t>& weights,
                                  std::vector<float>& output,
                                  const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ4_K(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ4_K(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ5K(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ5K(const std::string& weight_name,
+                                 const std::vector<uint8_t>& weights,
                                  const std::vector<float>& input,
                                  size_t rows,
                                  size_t cols,
@@ -3868,10 +3936,11 @@ bool MetalExecutor::runMatMulQ5K(const std::vector<uint8_t>& weights,
                                  std::vector<float>& output,
                                  const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ5_K(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ5_K(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ6K(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ6K(const std::string& weight_name,
+                                 const std::vector<uint8_t>& weights,
                                  const std::vector<float>& input,
                                  size_t rows,
                                  size_t cols,
@@ -3879,10 +3948,11 @@ bool MetalExecutor::runMatMulQ6K(const std::vector<uint8_t>& weights,
                                  std::vector<float>& output,
                                  const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ6_K(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ6_K(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ6KTransposed(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ6KTransposed(const std::string& weight_name,
+                                           const std::vector<uint8_t>& weights,
                                            const std::vector<float>& input,
                                            size_t rows,
                                            size_t cols,
@@ -3890,10 +3960,11 @@ bool MetalExecutor::runMatMulQ6KTransposed(const std::vector<uint8_t>& weights,
                                            std::vector<float>& output,
                                            const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ6_KTransposed(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ6_KTransposed(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ8K(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ8K(const std::string& weight_name,
+                                 const std::vector<uint8_t>& weights,
                                  const std::vector<float>& input,
                                  size_t rows,
                                  size_t cols,
@@ -3901,10 +3972,11 @@ bool MetalExecutor::runMatMulQ8K(const std::vector<uint8_t>& weights,
                                  std::vector<float>& output,
                                  const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ8_K(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ8_K(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ8_0(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ8_0(const std::string& weight_name,
+                                  const std::vector<uint8_t>& weights,
                                   const std::vector<float>& input,
                                   size_t rows,
                                   size_t cols,
@@ -3912,10 +3984,11 @@ bool MetalExecutor::runMatMulQ8_0(const std::vector<uint8_t>& weights,
                                   std::vector<float>& output,
                                   const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ8_0(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ8_0(weight_name, weights, input, rows, cols, row_stride, bias, output);
 }
 
-bool MetalExecutor::runMatMulQ8_1(const std::vector<uint8_t>& weights,
+bool MetalExecutor::runMatMulQ8_1(const std::string& weight_name,
+                                  const std::vector<uint8_t>& weights,
                                   const std::vector<float>& input,
                                   size_t rows,
                                   size_t cols,
@@ -3923,7 +3996,19 @@ bool MetalExecutor::runMatMulQ8_1(const std::vector<uint8_t>& weights,
                                   std::vector<float>& output,
                                   const std::vector<float>* bias) const {
     if (!impl_) return false;
-    return impl_->matmulQ8_1(weights, input, rows, cols, row_stride, bias, output);
+    return impl_->matmulQ8_1(weight_name, weights, input, rows, cols, row_stride, bias, output);
+}
+
+std::string MetalExecutor::weightCacheSummary() const {
+    if (!impl_) return std::string{};
+    std::lock_guard<std::mutex> lock(impl_->weight_cache_mutex_);
+    std::ostringstream oss;
+    double mb = static_cast<double>(impl_->cache_bytes_) / (1024.0 * 1024.0);
+    oss << "weight cache: " << impl_->cache_hits_ << " hits, "
+        << impl_->cache_misses_ << " misses, "
+        << std::fixed << std::setprecision(1) << mb
+        << " MB resident across " << impl_->weight_cache_.size() << " tensors";
+    return oss.str();
 }
 
 bool MetalExecutor::ensureSharedBuffer(std::vector<float>& data, MetalBufferHandle& handle) const {

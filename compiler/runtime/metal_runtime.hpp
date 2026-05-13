@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "frontends/ggml_types.hpp"
@@ -33,7 +34,13 @@ public:
     // (node.backend == Metal && isAvailable()).
     bool shouldUseFor(const ExecutionNode& node) const;
 
-    bool runMatMul(const std::vector<float>& weights,
+    // weight_name is the GGUF tensor name for the weight (e.g.
+    // "blk.5.attn_q.weight"). It keys a persistent device-side weight cache
+    // so we upload each tensor to Metal exactly once per process lifetime
+    // instead of on every matmul call. Pass an empty string to bypass the
+    // cache (one-off / synthetic weights).
+    bool runMatMul(const std::string& weight_name,
+                   const std::vector<float>& weights,
                    const std::vector<float>& input,
                    size_t rows,
                    size_t cols,
@@ -41,7 +48,8 @@ public:
                    std::vector<float>& output,
                    const std::vector<float>* bias = nullptr) const;
 
-    bool runMatMulQ4_0(const std::vector<uint8_t>& weights,
+    bool runMatMulQ4_0(const std::string& weight_name,
+                       const std::vector<uint8_t>& weights,
                        const std::vector<float>& input,
                        size_t rows,
                        size_t cols,
@@ -49,7 +57,8 @@ public:
                        uint32_t quant_version,
                        std::vector<float>& output,
                        const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ4_0Transposed(const std::vector<uint8_t>& weights,
+    bool runMatMulQ4_0Transposed(const std::string& weight_name,
+                                 const std::vector<uint8_t>& weights,
                                  const std::vector<float>& input,
                                  size_t rows,
                                  size_t cols,
@@ -57,90 +66,108 @@ public:
                                  uint32_t quant_version,
                                  std::vector<float>& output,
                                  const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ4_1(const std::vector<uint8_t>& weights,
+    bool runMatMulQ4_1(const std::string& weight_name,
+                       const std::vector<uint8_t>& weights,
                        const std::vector<float>& input,
                        size_t rows,
                        size_t cols,
                        size_t row_stride,
                        std::vector<float>& output,
                        const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ5_0(const std::vector<uint8_t>& weights,
+    bool runMatMulQ5_0(const std::string& weight_name,
+                       const std::vector<uint8_t>& weights,
                        const std::vector<float>& input,
                        size_t rows,
                        size_t cols,
                        size_t row_stride,
                        std::vector<float>& output,
                        const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ5_1(const std::vector<uint8_t>& weights,
+    bool runMatMulQ5_1(const std::string& weight_name,
+                       const std::vector<uint8_t>& weights,
                        const std::vector<float>& input,
                        size_t rows,
                        size_t cols,
                        size_t row_stride,
                        std::vector<float>& output,
                        const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ2K(const std::vector<uint8_t>& weights,
+    bool runMatMulQ2K(const std::string& weight_name,
+                      const std::vector<uint8_t>& weights,
                       const std::vector<float>& input,
                       size_t rows,
                       size_t cols,
                       size_t row_stride,
                       std::vector<float>& output,
                       const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ3K(const std::vector<uint8_t>& weights,
+    bool runMatMulQ3K(const std::string& weight_name,
+                      const std::vector<uint8_t>& weights,
                       const std::vector<float>& input,
                       size_t rows,
                       size_t cols,
                       size_t row_stride,
                       std::vector<float>& output,
                       const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ4K(const std::vector<uint8_t>& weights,
+    bool runMatMulQ4K(const std::string& weight_name,
+                      const std::vector<uint8_t>& weights,
                       const std::vector<float>& input,
                       size_t rows,
                       size_t cols,
                       size_t row_stride,
                       std::vector<float>& output,
                       const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ5K(const std::vector<uint8_t>& weights,
+    bool runMatMulQ5K(const std::string& weight_name,
+                      const std::vector<uint8_t>& weights,
                       const std::vector<float>& input,
                       size_t rows,
                       size_t cols,
                       size_t row_stride,
                       std::vector<float>& output,
                       const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ6K(const std::vector<uint8_t>& weights,
+    bool runMatMulQ6K(const std::string& weight_name,
+                      const std::vector<uint8_t>& weights,
                       const std::vector<float>& input,
                       size_t rows,
                       size_t cols,
                       size_t row_stride,
                       std::vector<float>& output,
                       const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ6KTransposed(const std::vector<uint8_t>& weights,
+    bool runMatMulQ6KTransposed(const std::string& weight_name,
+                                const std::vector<uint8_t>& weights,
                                 const std::vector<float>& input,
                                 size_t rows,
                                 size_t cols,
                                 size_t row_stride,
                                 std::vector<float>& output,
                                 const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ8K(const std::vector<uint8_t>& weights,
+    bool runMatMulQ8K(const std::string& weight_name,
+                      const std::vector<uint8_t>& weights,
                       const std::vector<float>& input,
                       size_t rows,
                       size_t cols,
                       size_t row_stride,
                       std::vector<float>& output,
                       const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ8_0(const std::vector<uint8_t>& weights,
+    bool runMatMulQ8_0(const std::string& weight_name,
+                       const std::vector<uint8_t>& weights,
                        const std::vector<float>& input,
                        size_t rows,
                        size_t cols,
                        size_t row_stride,
                        std::vector<float>& output,
                        const std::vector<float>* bias = nullptr) const;
-    bool runMatMulQ8_1(const std::vector<uint8_t>& weights,
+    bool runMatMulQ8_1(const std::string& weight_name,
+                       const std::vector<uint8_t>& weights,
                        const std::vector<float>& input,
                        size_t rows,
                        size_t cols,
                        size_t row_stride,
                        std::vector<float>& output,
                        const std::vector<float>* bias = nullptr) const;
+
+    // Persistent weight cache reporting. Returns a one-line summary suitable
+    // for the chat REPL profiler: "weight cache: H hits, M misses, B MB
+    // resident across N tensors". H+M is the total weight-buffer fetch
+    // count since process start.
+    std::string weightCacheSummary() const;
 
     // Capability helpers (Metal availability of specific kernels).
     bool hasBiasAddKernel() const;

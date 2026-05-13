@@ -1736,7 +1736,7 @@ TEST(MetalRuntimeTest, MatMulMatchesCPUWhenAvailable) {
     std::vector<float> input = {0.2f, -0.5f, 1.0f, 0.7f};
 
     std::vector<float> gpu_output;
-    ASSERT_TRUE(executor.runMatMul(weights, input, rows, cols, false, gpu_output));
+    ASSERT_TRUE(executor.runMatMul(std::string{}, weights, input, rows, cols, false, gpu_output));
     ASSERT_EQ(gpu_output.size(), rows);
 
     std::vector<float> expected(rows, 0.0f);
@@ -1773,7 +1773,7 @@ TEST(MetalRuntimeTest, MatMulWithBiasMatchesCPUWhenAvailable) {
         expected[r] += bias[r];
     }
     std::vector<float> gpu_output;
-    ASSERT_TRUE(executor.runMatMul(weights, input, rows, cols, false, gpu_output, &bias));
+    ASSERT_TRUE(executor.runMatMul(std::string{}, weights, input, rows, cols, false, gpu_output, &bias));
     ASSERT_EQ(gpu_output.size(), rows);
     for (size_t i = 0; i < rows; ++i) {
         EXPECT_NEAR(gpu_output[i], expected[i], 1e-4f);
@@ -1807,7 +1807,7 @@ TEST(MetalRuntimeTest, MatMulQ4_0MatchesCPUWhenAvailable) {
         expected[r] = mlc::runtime::dotProductRowQ4_0(row, cols, 1, input.data());
     }
     std::vector<float> gpu_output;
-    if (!executor.runMatMulQ4_0(weights,
+    if (!executor.runMatMulQ4_0(std::string{}, weights,
                                 input,
                                 rows,
                                 cols,
@@ -1850,7 +1850,7 @@ TEST(MetalRuntimeTest, MatMulQ4_0WithBiasMatchesCPUWhenAvailable) {
         expected[r] = mlc::runtime::dotProductRowQ4_0(row, cols, 1, input.data()) + bias[r];
     }
     std::vector<float> gpu_output;
-    if (!executor.runMatMulQ4_0(weights,
+    if (!executor.runMatMulQ4_0(std::string{}, weights,
                                 input,
                                 rows,
                                 cols,
@@ -1989,7 +1989,7 @@ TEST(MetalRuntimeTest, MatMulQ4_1MatchesCPUWhenAvailable) {
         expected[r] = mlc::runtime::dotProductRowQ4_1(row, cols, input.data());
     }
     std::vector<float> gpu_output;
-    if (!executor.runMatMulQ4_1(weights,
+    if (!executor.runMatMulQ4_1(std::string{}, weights,
                                 input,
                                 rows,
                                 cols,
@@ -2048,7 +2048,7 @@ TEST(MetalRuntimeTest, MatMulQ5MatchesCPUWhenAvailable) {
     };
 
     std::vector<float> gpu_q5_0;
-    if (!executor.runMatMulQ5_0(row_q5_0,
+    if (!executor.runMatMulQ5_0(std::string{}, row_q5_0,
                                 input,
                                 1,
                                 cols,
@@ -2057,7 +2057,7 @@ TEST(MetalRuntimeTest, MatMulQ5MatchesCPUWhenAvailable) {
         GTEST_SKIP() << "Metal Q5_0 matmul unavailable";
     }
     std::vector<float> gpu_q5_1;
-    if (!executor.runMatMulQ5_1(row_q5_1,
+    if (!executor.runMatMulQ5_1(std::string{}, row_q5_1,
                                 input,
                                 1,
                                 cols,
@@ -2084,7 +2084,7 @@ TEST(MetalRuntimeTest, MatMulQ4KMatchesCPUWhenAvailable) {
     for (size_t i = 0; i < cols; ++i) input[i] = 0.002f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ4_K(row.data(), cols, input.data());
     std::vector<float> gpu_out;
-    if (!executor.runMatMulQ4K(row, input, 1, cols, stride, gpu_out)) {
+    if (!executor.runMatMulQ4K(std::string{}, row, input, 1, cols, stride, gpu_out)) {
         GTEST_SKIP() << "Metal Q4_K matmul unavailable";
     }
     EXPECT_NEAR(gpu_out[0], expected, 1e-3f);
@@ -2105,7 +2105,7 @@ TEST(MetalRuntimeTest, MatMulQ5KMatchesCPUWhenAvailable) {
     for (size_t i = 0; i < cols; ++i) input[i] = -0.0015f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ5_K(row.data(), cols, input.data());
     std::vector<float> gpu_out;
-    if (!executor.runMatMulQ5K(row, input, 1, cols, stride, gpu_out)) {
+    if (!executor.runMatMulQ5K(std::string{}, row, input, 1, cols, stride, gpu_out)) {
         GTEST_SKIP() << "Metal Q5_K matmul unavailable";
     }
     EXPECT_NEAR(gpu_out[0], expected, 1e-3f);
@@ -2126,7 +2126,7 @@ TEST(MetalRuntimeTest, MatMulQ6KMatchesCPUWhenAvailable) {
     for (size_t i = 0; i < cols; ++i) input[i] = 0.0005f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ6_K(row.data(), cols, input.data());
     std::vector<float> gpu_out;
-    if (!executor.runMatMulQ6K(row, input, 1, cols, stride, gpu_out)) {
+    if (!executor.runMatMulQ6K(std::string{}, row, input, 1, cols, stride, gpu_out)) {
         GTEST_SKIP() << "Metal Q6_K matmul unavailable";
     }
     EXPECT_NEAR(gpu_out[0], expected, 1e-3f);
@@ -2146,7 +2146,7 @@ TEST(MetalRuntimeTest, MatMulQ8KMatchesCPUWhenAvailable) {
     for (size_t i = 0; i < cols; ++i) input[i] = -0.0008f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ8_K(row.data(), cols, input.data());
     std::vector<float> gpu_out;
-    if (!executor.runMatMulQ8K(row, input, 1, cols, stride, gpu_out)) {
+    if (!executor.runMatMulQ8K(std::string{}, row, input, 1, cols, stride, gpu_out)) {
         GTEST_SKIP() << "Metal Q8_K matmul unavailable";
     }
     EXPECT_NEAR(gpu_out[0], expected, 1e-3f);
@@ -2170,7 +2170,7 @@ TEST(MetalRuntimeTest, MatMulQ8_0MatchesCPUWhenAvailable) {
     for (size_t i = 0; i < cols; ++i) input[i] = 0.05f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ8_0(row.data(), cols, input.data());
     std::vector<float> gpu_out;
-    if (!executor.runMatMulQ8_0(row, input, 1, cols, stride, gpu_out)) {
+    if (!executor.runMatMulQ8_0(std::string{}, row, input, 1, cols, stride, gpu_out)) {
         GTEST_SKIP() << "Metal Q8_0 matmul unavailable";
     }
     EXPECT_NEAR(gpu_out[0], expected, 1e-3f);
@@ -2195,7 +2195,7 @@ TEST(MetalRuntimeTest, MatMulQ8_1MatchesCPUWhenAvailable) {
     for (size_t i = 0; i < cols; ++i) input[i] = -0.04f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ8_1(row.data(), cols, input.data());
     std::vector<float> gpu_out;
-    if (!executor.runMatMulQ8_1(row, input, 1, cols, stride, gpu_out)) {
+    if (!executor.runMatMulQ8_1(std::string{}, row, input, 1, cols, stride, gpu_out)) {
         GTEST_SKIP() << "Metal Q8_1 matmul unavailable";
     }
     EXPECT_NEAR(gpu_out[0], expected, 1e-3f);
@@ -2217,7 +2217,7 @@ TEST(MetalRuntimeTest, MatMulQ2KMatchesCPUWhenAvailable) {
     for (size_t i = 0; i < cols; ++i) input[i] = 0.001f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ2_K(weights.data(), cols, input.data());
     std::vector<float> gpu_out;
-    if (!executor.runMatMulQ2K(weights, input, rows, cols, stride, gpu_out)) {
+    if (!executor.runMatMulQ2K(std::string{}, weights, input, rows, cols, stride, gpu_out)) {
         GTEST_SKIP() << "Metal Q2_K matmul unavailable";
     }
     EXPECT_NEAR(gpu_out[0], expected, 1e-3f);
@@ -2238,7 +2238,7 @@ TEST(MetalRuntimeTest, MatMulQ3KMatchesCPUWhenAvailable) {
     for (size_t i = 0; i < cols; ++i) input[i] = -0.002f * static_cast<float>(i + 1);
     float expected = mlc::runtime::dotProductRowQ3_K(weights.data(), cols, input.data());
     std::vector<float> gpu_out;
-    if (!executor.runMatMulQ3K(weights, input, rows, cols, stride, gpu_out)) {
+    if (!executor.runMatMulQ3K(std::string{}, weights, input, rows, cols, stride, gpu_out)) {
         GTEST_SKIP() << "Metal Q3_K matmul unavailable";
     }
     EXPECT_NEAR(gpu_out[0], expected, 1e-3f);
@@ -3193,7 +3193,7 @@ TEST(MetalRuntimeTest, Integration_GGUFMatMulMatchesCPUWhenAvailable) {
     }
 
     std::vector<float> gpu_out;
-    ASSERT_TRUE(executor.runMatMul(weights, input, rows, cols, false, gpu_out));
+    ASSERT_TRUE(executor.runMatMul(std::string{}, weights, input, rows, cols, false, gpu_out));
     ASSERT_EQ(gpu_out.size(), expected.size());
     for (size_t i = 0; i < expected.size(); ++i) {
         EXPECT_NEAR(gpu_out[i], expected[i], 1e-4f);

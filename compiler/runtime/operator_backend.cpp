@@ -1007,7 +1007,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                 } else {
                     std::vector<float> weights(raw.size() / sizeof(float));
                     std::memcpy(weights.data(), raw.data(), raw.size());
-                    ok = MetalExecutor::Instance().runMatMul(weights,
+                    ok = MetalExecutor::Instance().runMatMul(weight,
+                                                             weights,
                                                              *input,
                                                              rows,
                                                              cols,
@@ -1021,6 +1022,7 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                     case frontend::GGML_TYPE_Q4_0:
                         if (transpose_weight) {
                             ok = MetalExecutor::Instance().runMatMulQ4_0Transposed(
+                                weight,
                                 raw,
                                 *input,
                                 rows,
@@ -1031,6 +1033,7 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                                 bias_tensor);
                         } else {
                             ok = MetalExecutor::Instance().runMatMulQ4_0(
+                                weight,
                                 raw,
                                 *input,
                                 rows,
@@ -1046,7 +1049,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ4_1(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ4_1(weight,
+                                                                     raw,
                                                                      *input,
                                                                      rows,
                                                                      cols,
@@ -1059,7 +1063,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ5_0(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ5_0(weight,
+                                                                     raw,
                                                                      *input,
                                                                      rows,
                                                                      cols,
@@ -1072,7 +1077,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ5_1(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ5_1(weight,
+                                                                     raw,
                                                                      *input,
                                                                      rows,
                                                                      cols,
@@ -1089,7 +1095,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ3K(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ3K(weight,
+                                                                    raw,
                                                                     *input,
                                                                     rows,
                                                                     cols,
@@ -1102,7 +1109,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ4K(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ4K(weight,
+                                                                    raw,
                                                                     *input,
                                                                     rows,
                                                                     cols,
@@ -1115,7 +1123,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ5K(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ5K(weight,
+                                                                    raw,
                                                                     *input,
                                                                     rows,
                                                                     cols,
@@ -1129,6 +1138,7 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                         if (transpose_weight) {
                             if (enable_q6k_transposed) {
                                 ok = MetalExecutor::Instance().runMatMulQ6KTransposed(
+                                    weight,
                                     raw,
                                     *input,
                                     rows,
@@ -1141,7 +1151,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             }
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ6K(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ6K(weight,
+                                                                    raw,
                                                                     *input,
                                                                     rows,
                                                                     cols,
@@ -1155,7 +1166,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ8K(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ8K(weight,
+                                                                    raw,
                                                                     *input,
                                                                     rows,
                                                                     cols,
@@ -1168,7 +1180,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ8_0(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ8_0(weight,
+                                                                     raw,
                                                                      *input,
                                                                      rows,
                                                                      cols,
@@ -1181,7 +1194,8 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                             ok = false;
                             break;
                         }
-                        ok = MetalExecutor::Instance().runMatMulQ8_1(raw,
+                        ok = MetalExecutor::Instance().runMatMulQ8_1(weight,
+                                                                     raw,
                                                                      *input,
                                                                      rows,
                                                                      cols,
