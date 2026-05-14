@@ -20,6 +20,14 @@ struct BackendExecutionResult {
     BackendKind actual_backend = BackendKind::CPU;
     std::string message;
     std::string kernel_id;
+    // CB-batching (B4): a non-fusable Metal op that encoded onto the open
+    // forward-pass CB and deferred its result download writes its (fp32)
+    // result buffer pointer + element count here. The executor inserts
+    // these into pass_outputs so subsequent fusable FromBuffer encodes
+    // chain through GPU memory instead of via the empty host slot. nullptr
+    // / 0 means the result is already on host (synchronous mode).
+    void* gpu_output_buffer = nullptr;       // id<MTLBuffer>, opaque
+    size_t gpu_output_element_count = 0;
 };
 
 // Bundle of buffer-residency state the executor passes into encode() so the

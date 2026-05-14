@@ -1479,6 +1479,13 @@ struct MetalExecutor::Impl {
     mutable id<MTLCommandBuffer> open_forward_pass_cb_ = nil;
     mutable std::vector<id> pass_retained_;
     mutable std::vector<id<MTLBuffer>> pass_checked_out_;
+    // Set when a non-fusable Metal op (Attention) defers a result onto an
+    // open forward-pass CB. The executor reads via lastDeferredOutput*()
+    // after backend.execute() returns and inserts into pass_outputs so
+    // subsequent FromBuffer encodes chain through GPU memory. Cleared by
+    // clearLastDeferredOutput at the start of each runAttention call.
+    mutable id<MTLBuffer> last_deferred_output_buffer_ = nil;
+    mutable size_t last_deferred_output_element_count_ = 0;
 
     struct PendingReadback {
         id<MTLBuffer> source;
@@ -3403,8 +3410,11 @@ bool matmulQ4_K(const std::string& weight_name,
                    float rope_freq_scale,
                    const MetalExecutor::CacheDescriptor& cache_k_desc,
                    const MetalExecutor::CacheDescriptor& cache_v_desc,
-                   std::vector<float>& output) const {
+                   std::vector<float>& output,
+                   const std::string& output_tensor_name = "") const {
 #if defined(__APPLE__)
+        last_deferred_output_buffer_ = nil;
+        last_deferred_output_element_count_ = 0;
         if (!available()) return false;
         if (head_dim == 0 || num_heads == 0) return false;
 
@@ -4034,6 +4044,11 @@ bool matmulQ4_K(const std::string& weight_name,
                     if (!env) return true;  // default on
                     return !(env[0] == '0' && env[1] == 0);
                 }();
+                // Dual-mode CB. When the executor has a forward-pass CB
+                // open, we encode onto it and defer the result-buffer
+                // readback until flush. Otherwise we own a fresh CB and
+                // commit + wait synchronously inside this call.
+                const bool deferred_mode = (open_forward_pass_cb_ != nil);
                 const size_t kElemBytes      = fp16_attn ? sizeof(uint16_t) : sizeof(float);
                 const size_t kHeadDimBytes   = head_dim * kElemBytes;
                 const size_t kKVMatrixBytes  = tokens * kHeadDimBytes;
@@ -4198,8 +4213,12 @@ bool matmulQ4_K(const std::string& weight_name,
                 MPSMatrix* vMat = [[MPSMatrix alloc] initWithBuffer:vBatchBuffer descriptor:kDesc];
                 MPSMatrix* rMat = [[MPSMatrix alloc] initWithBuffer:resultBuffer descriptor:rDesc];
 
-                // 5. Single command buffer for all 3 MPS ops.
-                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                // 5. CB selection: in deferred mode we encode onto the
+                //    executor's open forward-pass CB; otherwise we own a
+                //    fresh CB that commits below.
+                id<MTLCommandBuffer> commandBuffer = deferred_mode
+                    ? open_forward_pass_cb_
+                    : [queue commandBuffer];
 
                 // 5a. Batched Q.K with beta=1.0 (adds scaled scores onto the
                 //     pre-populated mask/alibi values).
@@ -4242,18 +4261,75 @@ bool matmulQ4_K(const std::string& weight_name,
                               rightMatrix:vMat
                              resultMatrix:rMat];
 
-                // 6. Commit + wait once.
-                [commandBuffer commit];
-                [commandBuffer waitUntilCompleted];
+                // 6a. Deferred mode: register the host readback (and a
+                //     GPU cast kernel if the result is fp16) so the
+                //     downstream consumer + tap captures see the data
+                //     after flushForwardPassCB. Retain MPSMatrix and
+                //     MTLBuffer objects in pass_retained_ so they
+                //     survive until the CB commits.
+                if (deferred_mode) {
+                    pass_retained_.push_back((id)qBuffer);
+                    pass_retained_.push_back((id)kBatchBuffer);
+                    pass_retained_.push_back((id)vBatchBuffer);
+                    pass_retained_.push_back((id)logitsBuffer);
+                    pass_retained_.push_back((id)resultBuffer);
+                    pass_retained_.push_back((id)qMat);
+                    pass_retained_.push_back((id)kMat);
+                    pass_retained_.push_back((id)lMatBatched);
+                    pass_retained_.push_back((id)lMatSoftmax);
+                    pass_retained_.push_back((id)vMat);
+                    pass_retained_.push_back((id)rMat);
+                    pass_retained_.push_back((id)qk);
+                    pass_retained_.push_back((id)softmaxKernel);
+                    pass_retained_.push_back((id)av);
 
-                // 7. Copy result back into output (head-major layout matches CPU).
-                if (fp16_attn) {
-                    castF16toF32(reinterpret_cast<const uint16_t*>([resultBuffer contents]),
-                                 output.data(),
-                                 num_heads * head_dim);
+                    // Establish the convention "every op's downstream-
+                    // visible output buffer is fp32". When fp16_attn is
+                    // on, dispatch the cast kernel from B1 to materialize
+                    // an fp32 output buffer that downstream fusable Add
+                    // reads via FromBuffer through pass_outputs.
+                    id<MTLBuffer> downstream_buf = resultBuffer;
+                    size_t downstream_bytes = num_heads * kHeadDimBytes;
+                    if (fp16_attn) {
+                        size_t fp32_bytes = num_heads * head_dim * sizeof(float);
+                        id<MTLBuffer> fp32_result = [device newBufferWithLength:fp32_bytes
+                                                                        options:MTLResourceStorageModeShared];
+                        if (!fp32_result) return false;
+                        if (!encodeCastF16toF32(commandBuffer,
+                                                 resultBuffer,
+                                                 fp32_result,
+                                                 num_heads * head_dim)) {
+                            return false;
+                        }
+                        pass_retained_.push_back((id)fp32_result);
+                        downstream_buf = fp32_result;
+                        downstream_bytes = fp32_bytes;
+                    }
+
+                    if (!output_tensor_name.empty()) {
+                        recordReadbackByName(downstream_buf, output_tensor_name,
+                                             downstream_bytes, /*needs_host=*/true);
+                    } else {
+                        // Legacy path (no name): use the captured pointer.
+                        // Caller guarantees stability — fine for tests
+                        // that share a single CB without further alloc.
+                        recordReadback(downstream_buf, &output, downstream_bytes,
+                                       /*needs_host=*/true);
+                    }
+                    last_deferred_output_buffer_ = downstream_buf;
+                    last_deferred_output_element_count_ = num_heads * head_dim;
                 } else {
-                    std::memcpy(output.data(), [resultBuffer contents],
-                                num_heads * kHeadDimBytes);
+                    // 6b. Synchronous own-CB mode (existing path).
+                    [commandBuffer commit];
+                    [commandBuffer waitUntilCompleted];
+                    if (fp16_attn) {
+                        castF16toF32(reinterpret_cast<const uint16_t*>([resultBuffer contents]),
+                                     output.data(),
+                                     num_heads * head_dim);
+                    } else {
+                        std::memcpy(output.data(), [resultBuffer contents],
+                                    num_heads * kHeadDimBytes);
+                    }
                 }
                 }
                 return true;
@@ -4690,6 +4766,30 @@ bool MetalExecutor::flushForwardPassCB(
 #else
     (void)resolver;
     return true;
+#endif
+}
+
+void MetalExecutor::clearLastDeferredOutput() const {
+#if defined(__APPLE__)
+    if (!impl_) return;
+    impl_->last_deferred_output_buffer_ = nil;
+    impl_->last_deferred_output_element_count_ = 0;
+#endif
+}
+void* MetalExecutor::lastDeferredOutputBuffer() const {
+#if defined(__APPLE__)
+    if (!impl_) return nullptr;
+    return (__bridge void*)impl_->last_deferred_output_buffer_;
+#else
+    return nullptr;
+#endif
+}
+size_t MetalExecutor::lastDeferredOutputElementCount() const {
+#if defined(__APPLE__)
+    if (!impl_) return 0;
+    return impl_->last_deferred_output_element_count_;
+#else
+    return 0;
 #endif
 }
 
@@ -5222,12 +5322,13 @@ bool MetalExecutor::runAttention(const std::vector<float>& q,
                                  float rope_freq_scale,
                                  const CacheDescriptor& cache_k,
                                  const CacheDescriptor& cache_v,
-                                 std::vector<float>& output) const {
+                                 std::vector<float>& output,
+                                 const std::string& output_tensor_name) const {
     if (!impl_) return false;
     return impl_->attention(q, k, v, num_heads, kv_heads, head_dim,
                             context_length, mask, alibi_slopes, position,
                             rotary_dim, rope_freq_base, rope_freq_scale,
-                            cache_k, cache_v, output);
+                            cache_k, cache_v, output, output_tensor_name);
 }
 
 bool MetalExecutor::runFlashAttention(const std::vector<float>& q,

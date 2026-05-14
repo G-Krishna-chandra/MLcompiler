@@ -325,7 +325,15 @@ public:
                       float rope_freq_scale,
                       const CacheDescriptor& cache_k,
                       const CacheDescriptor& cache_v,
-                      std::vector<float>& output) const;
+                      std::vector<float>& output,
+                      const std::string& output_tensor_name = "") const;
+
+    // Set after a deferred runAttention call: caller can pull the result
+    // buffer (fp32) and element count to insert into the executor's
+    // pass_outputs map. Reset to null/0 by clearLastDeferredOutput().
+    void clearLastDeferredOutput() const;
+    void* lastDeferredOutputBuffer() const;
+    size_t lastDeferredOutputElementCount() const;
 
     // Flash-attention v1 (multi-tile online softmax, no cache, no RoPE).
     // Math correctness validated by mlc test-attention; gated default-off in

@@ -1093,7 +1093,19 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                                 alibi_slopes = &cfg.alibi_slopes;
                             }
                         }
-                        std::vector<float> gpu_out;
+                        // Pre-allocate the output tensor in the context so
+                        // its host slot has a stable name for re-resolution
+                        // at flush time. runAttention dual-modes: with an
+                        // open forward-pass CB it defers result download
+                        // and the readback writes into the slot via the
+                        // resolver in flushForwardPassCB. Without an open
+                        // CB it fills the slot synchronously.
+                        std::string out_name = node.outputs.empty() ? std::string() : node.outputs[0];
+                        std::vector<float> tmp_out;
+                        std::vector<float>* attn_out = &tmp_out;
+                        if (!out_name.empty()) {
+                            attn_out = &context->allocateTensor(out_name, num_heads * head_dim, /*zero=*/false);
+                        }
                         if (MetalExecutor::Instance().runAttention(
                                 *q,
                                 *k_new,
@@ -1110,14 +1122,18 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                                 rope_freq_scale,
                                 cache_k_desc,
                                 cache_v_desc,
-                                gpu_out)) {
-                            if (!node.outputs.empty()) {
-                                context->setTensor(node.outputs[0], std::move(gpu_out));
-                            }
+                                *attn_out,
+                                out_name)) {
                             encodeCacheTensor(cache_k_info, cache_k_storage, cache_k_decoded);
                             encodeCacheTensor(cache_v_info, cache_v_storage, cache_v_decoded);
                             result.actual_backend = BackendKind::Metal;
                             result.message = "metal-attention";
+                            // If the call deferred onto the open CB, expose
+                            // its (fp32) result buffer so the executor can
+                            // chain a FromBuffer consumer (residual_1 Add).
+                            result.gpu_output_buffer = MetalExecutor::Instance().lastDeferredOutputBuffer();
+                            result.gpu_output_element_count =
+                                MetalExecutor::Instance().lastDeferredOutputElementCount();
                             return result;
                         }
                     }

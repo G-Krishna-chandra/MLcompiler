@@ -601,14 +601,29 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             fusable = false;
         }
 
-        if (!fusable) {
+        // CB lifetime extension (commit B4): keep the forward-pass CB
+        // open across single-token Metal-eligible non-fusable ops too
+        // (Attention, FeedForward, Linear matmul). Their dual-mode run*
+        // detects the open CB and defers their result download. CPU ops
+        // and multi-token recursion still flush before running.
+        //
+        // Only engage when fuse_layer is on. With fusion off, the
+        // surrounding fusable ops (Norm, MatMul, Add) all run via
+        // execute() instead of encode(), each with its own CB; if
+        // attention deferred onto a CB those ops weren't writing to,
+        // the deferred attention output would never become host-visible
+        // before the next fusable consumer reads it.
+        const bool metal_eligible_node = fuse_layer
+                                       && (exec_seq_len <= 1)
+                                       && node->backend == BackendKind::Metal
+                                       && MetalExecutor::Instance().shouldUseFor(*node);
+        if (!fusable && !metal_eligible_node) {
             flushWindow();
-        } else {
-            // Open window if needed.
-            if (!MetalExecutor::Instance().hasForwardPassCB()) {
-                if (!MetalExecutor::Instance().beginForwardPassCB()) {
-                    fusable = false;
-                }
+        }
+        if ((fusable || metal_eligible_node) &&
+            !MetalExecutor::Instance().hasForwardPassCB()) {
+            if (!MetalExecutor::Instance().beginForwardPassCB()) {
+                fusable = false;
             }
         }
 
@@ -707,6 +722,27 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
 
         if (!entry.success) {
             result.success = false;
+        }
+
+        // CB-batching (B4): if a non-fusable Metal op deferred onto the
+        // open forward-pass CB and exposed a (fp32) GPU result buffer,
+        // register it in pass_outputs so the next FromBuffer-capable
+        // consumer (residual_1 Add, etc.) reads from GPU memory instead
+        // of the empty host slot. The deferred readback in
+        // flushForwardPassCB still populates the host slot for any
+        // non-FromBuffer consumer or for tap captures.
+        if (backend_result.gpu_output_buffer && backend_result.gpu_output_element_count > 0
+            && !node->outputs.empty() && !node->outputs[0].empty()) {
+            const std::string& out_name = node->outputs[0];
+            std::vector<float>* host_dst = context_ ? context_->mutableTensor(out_name) : nullptr;
+            if (pass_outputs.find(out_name) == pass_outputs.end() && host_dst) {
+                PassOutput po;
+                po.buffer = backend_result.gpu_output_buffer;
+                po.host_dst = host_dst;
+                po.element_count = backend_result.gpu_output_element_count;
+                po.needs_host = true;
+                pass_outputs[out_name] = po;
+            }
         }
 
         if (context_ && trace_cfg.enabled) {
