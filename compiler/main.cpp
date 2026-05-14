@@ -3056,6 +3056,40 @@ AttnTensors generateInputs(const AttnConfig& cfg) {
 //   weights = softmax(scores) = [e^0.5, 1, 1, 1] / (e^0.5 + 3)
 //                             ≈ [0.354661, 0.215113, 0.215113, 0.215113]
 //   output = weights · I = weights itself.
+
+// Stress-test inputs for the multi-tile online-softmax kernel: Q = ones,
+// K constructed so scores grow linearly with kv position (score[s] = 0.1 * s),
+// forcing the running max `m` to step up at every tile boundary. The
+// per-tile rescale factor alpha = exp(m - m_new) ≈ exp(-0.1*tile_size) is
+// significantly < 1, so applying it to both l and o is what makes the
+// composition correct. V uses the standard seed-deterministic fill.
+AttnTensors stressOnlineInputs(const AttnConfig& cfg) {
+    AttnTensors t;
+    const size_t H = cfg.num_heads;
+    const size_t Hk = cfg.kv_heads;
+    const size_t D = cfg.head_dim;
+    const size_t S = cfg.kv_seq;
+    t.q.assign(H * D, 1.0f);
+    t.k.assign(S * Hk * D, 0.0f);
+    // K[s, kv, d] = 0.1 * s / D for all kv, all d. Q · K[s] = 0.1 * s (sum
+    // over the all-ones Q and K row of D copies of 0.1*s/D). After scaling
+    // by 1/sqrt(D), score = 0.1 * s / sqrt(D). With D=64 the per-tile max
+    // steps up by 32 * 0.1 / 8 = 0.4; alpha ≈ exp(-0.4) ≈ 0.67 per tile,
+    // mid-range stress that exercises rescale without underflowing.
+    for (size_t s = 0; s < S; ++s) {
+        float v = 0.1f * static_cast<float>(s) / static_cast<float>(D);
+        for (size_t hk = 0; hk < Hk; ++hk) {
+            for (size_t d = 0; d < D; ++d) {
+                t.k[s * Hk * D + hk * D + d] = v;
+            }
+        }
+    }
+    t.v.resize(S * Hk * D);
+    std::mt19937_64 rng(cfg.seed ^ 0xA5A5A5A5ull);
+    std::normal_distribution<float> dist(0.0f, 0.1f);
+    for (auto& x : t.v) x = dist(rng);
+    return t;
+}
 AttnTensors tinyVerifyInputs() {
     AttnTensors t;
     t.q = {1.0f, 0.0f, 0.0f, 0.0f};
@@ -3176,6 +3210,8 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
                      "  --causal          (apply causal mask; no-op for q_seq=1)\n"
                      "  --verify-tiny     (run the 4-elem hand-verified sanity case)\n"
                      "  --sweep           (run a small sweep of GQA / shape configs)\n"
+                     "  --stress-online   (kv_seq=128 case constructed to exercise the\n"
+                     "                     multi-tile online-softmax rescale path)\n"
                      "  --dump-flash-intermediates  (compare flash kernel's QK + softmax\n"
                      "                               against handwritten reference)\n"
                      "Three-way parity harness: handwritten naive attention (H), production\n"
@@ -3187,6 +3223,7 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
     bool verify_tiny = false;
     bool sweep = false;
     bool dump_intermediates = false;
+    bool stress_online = false;
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         auto need = [&](const char* who) -> std::string {
@@ -3205,6 +3242,7 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
             else if (a == "--causal")   cfg.causal = true;
             else if (a == "--verify-tiny") verify_tiny = true;
             else if (a == "--sweep")    sweep = true;
+            else if (a == "--stress-online") stress_online = true;
             else if (a == "--dump-flash-intermediates") dump_intermediates = true;
             else if (a == "--help" || a == "-h") { usage(); return 0; }
             else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
@@ -3214,25 +3252,31 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
         }
     }
 
-    auto runOne = [&](attndiag::AttnConfig c, bool tiny) -> bool {
+    enum class InputMode { Random, Tiny, StressOnline };
+    auto runOne = [&](attndiag::AttnConfig c, InputMode mode) -> bool {
         if (c.kv_heads == 0) c.kv_heads = c.num_heads;
         if (c.num_heads % c.kv_heads != 0) {
             std::cerr << "num_heads must be a multiple of kv_heads (got "
                       << c.num_heads << " / " << c.kv_heads << ")\n";
             return false;
         }
-        attndiag::AttnTensors inputs = tiny
-            ? attndiag::tinyVerifyInputs()
-            : attndiag::generateInputs(c);
+        attndiag::AttnTensors inputs;
+        switch (mode) {
+            case InputMode::Tiny: inputs = attndiag::tinyVerifyInputs(); break;
+            case InputMode::StressOnline: inputs = attndiag::stressOnlineInputs(c); break;
+            default: inputs = attndiag::generateInputs(c); break;
+        }
         auto handwritten = attndiag::handwrittenAttention(c, inputs);
         std::vector<float> canonical_out;
         bool canonical_ok = attndiag::canonicalAttention(c, inputs, canonical_out);
 
-        std::printf("# heads=%zu kv_heads=%zu head_dim=%zu kv_seq=%zu causal=%s seed=%llu\n",
+        std::printf("# heads=%zu kv_heads=%zu head_dim=%zu kv_seq=%zu causal=%s seed=%llu mode=%s\n",
                     c.num_heads, c.kv_heads, c.head_dim, c.kv_seq,
                     c.causal ? "true" : "false",
-                    static_cast<unsigned long long>(c.seed));
-        if (tiny) {
+                    static_cast<unsigned long long>(c.seed),
+                    mode == InputMode::Tiny ? "tiny" :
+                    mode == InputMode::StressOnline ? "stress-online" : "random");
+        if (mode == InputMode::Tiny) {
             std::printf("# tiny-verify expected: [0.354661, 0.215113, 0.215113, 0.215113]\n");
             std::printf("# handwritten actual:   [");
             for (size_t d = 0; d < c.head_dim; ++d) {
@@ -3244,6 +3288,11 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
         std::printf("%-12s | %-10s | %12s | %12s | %12s | %12s | %s\n",
                     "sub-step", "pair", "cosine", "max_abs", "mean_abs", "rms", "flag");
         std::printf("%s\n", std::string(96, '-').c_str());
+        // Tight gate for stress-online per session-B CHANGE 3:
+        //   cosine ≥ 0.9999 AND max_abs ≤ 1e-5 → OK
+        //   cosine ≥ 0.9999 AND max_abs > 1e-5 → WARN (possible asymmetric-rescale bug)
+        //   cosine < 0.9999 → FAIL
+        // Other modes keep the original looser cosine-only check.
         auto report = [&](const std::string& step,
                           const std::string& pair,
                           const std::vector<float>& a,
@@ -3254,7 +3303,14 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
                 return;
             }
             auto m = q4diag::metrics(a, b, 0);
-            const char* flag = (std::isfinite(m.cosine) && m.cosine >= 0.999f) ? "OK" : "FAIL";
+            const char* flag;
+            if (mode == InputMode::StressOnline) {
+                bool cos_ok = std::isfinite(m.cosine) && m.cosine >= 0.9999f;
+                bool err_ok = std::isfinite(m.max_abs) && m.max_abs <= 1.0e-5f;
+                flag = !cos_ok ? "FAIL" : (err_ok ? "OK" : "WARN");
+            } else {
+                flag = (std::isfinite(m.cosine) && m.cosine >= 0.999f) ? "OK" : "FAIL";
+            }
             std::printf("%-12s | %-10s | %12.6f | %12.3e | %12.3e | %12.3e | %s\n",
                         step.c_str(), pair.c_str(),
                         m.cosine, m.max_abs, m.mean_abs, m.rms, flag);
@@ -3286,7 +3342,15 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
     if (verify_tiny) {
         attndiag::AttnConfig c = cfg;
         c.num_heads = 1; c.kv_heads = 1; c.head_dim = 4; c.kv_seq = 4;
-        runOne(c, /*tiny=*/true);
+        runOne(c, InputMode::Tiny);
+        return 0;
+    }
+
+    if (stress_online) {
+        attndiag::AttnConfig c = cfg;
+        c.num_heads = 32; c.kv_heads = 4; c.head_dim = 64; c.kv_seq = 128;
+        std::printf("=== stress-online (multi-tile rescale) ===\n");
+        runOne(c, InputMode::StressOnline);
         return 0;
     }
 
@@ -3304,12 +3368,19 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
             std::printf("=== %s ===\n", cs.label);
             attndiag::AttnConfig c = cfg;
             c.num_heads = cs.H; c.kv_heads = cs.Hk; c.head_dim = cs.D; c.kv_seq = cs.S;
-            runOne(c, false);
+            runOne(c, InputMode::Random);
+        }
+        // Stress-online appended as the 7th case so --sweep covers it too.
+        {
+            std::printf("=== stress-online (multi-tile rescale) ===\n");
+            attndiag::AttnConfig c = cfg;
+            c.num_heads = 32; c.kv_heads = 4; c.head_dim = 64; c.kv_seq = 128;
+            runOne(c, InputMode::StressOnline);
         }
         return 0;
     }
 
-    runOne(cfg, false);
+    runOne(cfg, InputMode::Random);
     return 0;
 }
 }

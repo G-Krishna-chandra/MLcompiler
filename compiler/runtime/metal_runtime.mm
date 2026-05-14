@@ -1154,22 +1154,30 @@ kernel void dequant_q8_1_block(
 }
 
 // ============================================================================
-// flash_attention_v1: skeleton single-tile flash attention.
+// flash_attention_v1: multi-tile online-softmax flash attention.
 //
 // Dispatch: one threadgroup per Q head, head_dim threads per threadgroup.
-// Thread t owns feature dim t for the loads/stores, and computes scores at
-// kv positions {t, t+D, t+2D, ...} (stride-D loop) so each score is a full
-// dot product locally — no per-score reduction needed.
+// Thread t owns feature dim t (loads, output accumulator); inside each tile
+// it computes scores at strided kv positions and contributes one feature dim
+// to the output. Tiles iterate over kv_seq in chunks of T tokens.
 //
-// Threadgroup memory (passed via setThreadgroupMemoryLength):
-//   [0, D)        shared_q       — Q[head, :] loaded once per threadgroup
-//   [D, D+S)      shared_scores  — Q·K^T → softmax weights, in place
-//   [D+S, 2D+S)   partial_buf    — per-thread scratch for max/sum reductions
-// where D = head_dim, S = kv_seq.
+// Online softmax recurrence per tile:
+//   m_new = max(m, tile_max)
+//   alpha = exp(m - m_new)  (== 0 on first tile, where m == -INFINITY)
+//   l = l * alpha + tile_sum                  (running denominator)
+//   o = o * alpha + sum_s exp(s - m_new) * V  (running output)
+//   m = m_new
+// After all tiles, output = o / l.
+//
+// Threadgroup memory layout (T = TILE_SIZE):
+//   [0, D)                              shared_q       (Q for this head)
+//   [D, D + T*D)                        tile_K         (K for current tile)
+//   [D + T*D, D + 2*T*D)                tile_V         (V for current tile)
+//   [D + 2*T*D, D + 2*T*D + T)          tile_scores
+//   [D + 2*T*D + T, 2*D + 2*T*D + T)    partial_buf    (max/sum reduction scratch)
 //
 // Determinism: reductions use fixed-stride tree (NOT simd_max/simd_sum) so the
-// floating-point reduction order is bit-stable across runs. This is what the
-// harness's cosine-1.0 results require to be meaningful.
+// reduction order is bit-stable across runs.
 //
 // Causal mask: TODO when q_seq > 1 cases are exercised. For q_seq=1 (this
 // session) causal is a no-op (the single Q sees all kv positions).
@@ -1185,6 +1193,8 @@ struct FlashAttnParams {
     uint debug_dump;   // 0 or 1; when 1, qk_out/sm_out are written
 };
 
+constant uint FLASH_TILE_SIZE = 32u;
+
 kernel void flash_attention_v1(
     device const float* Q [[buffer(0)]],
     device const float* K [[buffer(1)]],
@@ -1197,99 +1207,129 @@ kernel void flash_attention_v1(
     uint head [[threadgroup_position_in_grid]],
     uint t [[thread_position_in_threadgroup]]
 ) {
+    const uint T = FLASH_TILE_SIZE;
     const uint D = params.head_dim;
     const uint S = params.kv_seq;
     const uint kv = (head * params.kv_heads) / params.num_heads;
 
-    threadgroup float* shared_q     = tg_buf;             // [D]
-    threadgroup float* shared_scores = tg_buf + D;        // [S]
-    threadgroup float* partial_buf   = tg_buf + D + S;    // [D]
+    threadgroup float* shared_q    = tg_buf;                          // [D]
+    threadgroup float* tile_K      = tg_buf + D;                      // [T*D]
+    threadgroup float* tile_V      = tg_buf + D + T * D;              // [T*D]
+    threadgroup float* tile_scores = tg_buf + D + 2u * T * D;         // [T]
+    threadgroup float* partial_buf = tg_buf + D + 2u * T * D + T;     // [D]
 
     // 1. Load Q for this head into threadgroup memory (one element per thread).
     shared_q[t] = Q[head * D + t];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 2. Q·K^T — each thread computes whole-dot-products for its strided scores.
-    //    Score at kv position s is the dot product of Q with K[s, kv, :].
-    //    qk_out (debug only) is written inline per-position; this matches the
-    //    per-tile-slice write pattern the multi-tile rewrite uses, so the
-    //    single-tile kernel exercises the same dump path.
-    for (uint s = t; s < S; s += D) {
-        float score = 0.0f;
-        const device float* k_row = K + s * params.kv_heads * D + kv * D;
-        for (uint d = 0; d < D; ++d) {
-            score += shared_q[d] * k_row[d];
-        }
-        float scaled = score * params.inv_sqrt_d;
-        shared_scores[s] = scaled;
-        if (params.debug_dump != 0u) {
-            qk_out[head * S + s] = scaled;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Per-thread online-softmax running state.
+    float m = -INFINITY;   // running max over all tiles seen so far
+    float l = 0.0f;        // running sum (denominator)
+    float o = 0.0f;        // running output for this thread's feature dim
 
-    // 3. Softmax part 1 — max reduction across S.
-    float my_max = -INFINITY;
-    for (uint s = t; s < S; s += D) {
-        my_max = fmax(my_max, shared_scores[s]);
-    }
-    partial_buf[t] = my_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = D / 2u; stride >= 1u; stride /= 2u) {
-        if (t < stride) {
-            partial_buf[t] = fmax(partial_buf[t], partial_buf[t + stride]);
+    uint num_tiles = (S + T - 1u) / T;
+    for (uint tile = 0u; tile < num_tiles; ++tile) {
+        uint tile_start = tile * T;
+        uint tile_n = (S - tile_start < T) ? (S - tile_start) : T;
+
+        // Cooperative load: each thread loads its column (feature dim t)
+        // across all positions in the tile.
+        for (uint i = 0u; i < tile_n; ++i) {
+            uint kv_pos = tile_start + i;
+            tile_K[i * D + t] = K[kv_pos * params.kv_heads * D + kv * D + t];
+            tile_V[i * D + t] = V[kv_pos * params.kv_heads * D + kv * D + t];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (stride == 1u) break;
-    }
-    float max_val = partial_buf[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 4. Softmax part 2 — exp(score - max) into shared_scores, sum-reduce.
-    float my_sum = 0.0f;
-    for (uint s = t; s < S; s += D) {
-        float e = exp(shared_scores[s] - max_val);
-        shared_scores[s] = e;
-        my_sum += e;
-    }
-    partial_buf[t] = my_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = D / 2u; stride >= 1u; stride /= 2u) {
-        if (t < stride) {
-            partial_buf[t] += partial_buf[t + stride];
+        // 2. Tile scores: each thread computes whole-dot-products for its
+        // strided positions within the tile. qk_out (debug) is written
+        // inline per-position.
+        for (uint s_local = t; s_local < tile_n; s_local += D) {
+            float score = 0.0f;
+            threadgroup const float* k_row = tile_K + s_local * D;
+            for (uint d = 0u; d < D; ++d) {
+                score += shared_q[d] * k_row[d];
+            }
+            float scaled = score * params.inv_sqrt_d;
+            tile_scores[s_local] = scaled;
+            if (params.debug_dump != 0u) {
+                qk_out[head * S + tile_start + s_local] = scaled;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (stride == 1u) break;
-    }
-    float total = partial_buf[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 5. Softmax part 3 — normalize.
-    float inv = (total > 0.0f) ? (1.0f / total) : 0.0f;
-    for (uint s = t; s < S; s += D) {
-        shared_scores[s] *= inv;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        // 3. Tile max via fixed-stride tree reduction.
+        float my_max = -INFINITY;
+        for (uint s = t; s < tile_n; s += D) {
+            my_max = fmax(my_max, tile_scores[s]);
+        }
+        partial_buf[t] = my_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = D / 2u; stride >= 1u; stride /= 2u) {
+            if (t < stride) {
+                partial_buf[t] = fmax(partial_buf[t], partial_buf[t + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (stride == 1u) break;
+        }
+        float tile_max = partial_buf[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 6. Output = weights · V. Thread t accumulates output dim t.
-    float acc = 0.0f;
-    for (uint s = 0; s < S; ++s) {
-        acc += shared_scores[s] * V[s * params.kv_heads * D + kv * D + t];
-    }
-    O[head * D + t] = acc;
+        // 4. Online update — rescale factor for previous (l, o). The first
+        // tile guard avoids the (-INFINITY - finite) subtraction and protects
+        // against the (-INFINITY - -INFINITY) NaN that could surface once
+        // causal masking lands and a row sees no positions.
+        float m_new = fmax(m, tile_max);
+        float alpha = (m == -INFINITY) ? 0.0f : exp(m - m_new);
 
-    // 7. sm_out: softmax weights RECOMPUTED from raw scores in qk_out and the
-    // final (max_val, inv). Mathematically equivalent to running softmax
-    // weights at the final tile (same m, l), but NOT a tap of intermediate-
-    // tile running state. Validates that final m, l are correct; does not
-    // validate per-tile updates.
-    // For per-tile-state validation, see TODO: add option C harness
-    // (partial-tile reference) when intermediate-state debugging is needed.
+        // 5. exp(score - m_new) into tile_scores; tile sum via tree reduce.
+        float my_sum = 0.0f;
+        for (uint s = t; s < tile_n; s += D) {
+            float e = exp(tile_scores[s] - m_new);
+            tile_scores[s] = e;
+            my_sum += e;
+        }
+        partial_buf[t] = my_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = D / 2u; stride >= 1u; stride /= 2u) {
+            if (t < stride) {
+                partial_buf[t] += partial_buf[t + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (stride == 1u) break;
+        }
+        float tile_sum = partial_buf[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 6. Tile output contribution for this thread's feature dim.
+        float my_v_acc = 0.0f;
+        for (uint s = 0u; s < tile_n; ++s) {
+            my_v_acc += tile_scores[s] * tile_V[s * D + t];
+        }
+
+        // 7. Compose running state with this tile.
+        o = o * alpha + my_v_acc;
+        l = l * alpha + tile_sum;
+        m = m_new;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 8. Final normalize.
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    O[head * D + t] = o * inv_l;
+
+    // 9. sm_out: softmax weights RECOMPUTED from raw scores in qk_out and the
+    // final (m, l). Mathematically equivalent to running softmax weights at
+    // the final tile (same m, l), but NOT a tap of intermediate-tile running
+    // state. Validates that final m, l are correct; does not validate
+    // per-tile updates. For per-tile-state validation, add an option C
+    // harness (partial-tile reference) — TODO when intermediate-state
+    // debugging is needed.
     if (params.debug_dump != 0u) {
         for (uint s = t; s < S; s += D) {
             float raw = qk_out[head * S + s];
-            float e = exp(raw - max_val);
-            sm_out[head * S + s] = e * inv;
+            float e = exp(raw - m);
+            sm_out[head * S + s] = e * inv_l;
         }
     }
 }
@@ -4044,7 +4084,10 @@ bool matmulQ4_K(const std::string& weight_name,
         if (q.size() != q_per) return false;
         if (k.size() != kv_seq * kv_per || v.size() != kv_seq * kv_per) return false;
 
-        size_t tg_floats = 2 * head_dim + kv_seq;
+        // TG memory layout must match the kernel's. Tile size hard-coded to 32
+        // here and in the kernel (`FLASH_TILE_SIZE`); they're a paired constant.
+        static constexpr size_t kFlashTileSize = 32;
+        size_t tg_floats = 2 * head_dim + 2 * kFlashTileSize * head_dim + kFlashTileSize;
         size_t tg_bytes = tg_floats * sizeof(float);
         if (head_dim > flashAttentionPipeline.maxTotalThreadsPerThreadgroup) return false;
         if (tg_bytes > device.maxThreadgroupMemoryLength) return false;
