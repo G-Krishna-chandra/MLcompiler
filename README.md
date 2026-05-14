@@ -24,6 +24,38 @@ The runtime is correct end-to-end on TinyLlama Q4_0. Q4_1, Q5_0, Q5_1 Metal
 kernels are still known broken (same split-half indexing pattern as the Q4_0
 fix earlier this session — see Known issues).
 
+### Performance
+
+10.7 tok/s on TinyLlama 1.1B Q4_0 on an M3 Pro via Metal, single-stream
+greedy decode after a "Hello!" prompt. Reference: `llama.cpp` on the same
+model and chip runs at roughly 70–100 tok/s. The remaining gap is bounded
+by known, in-scope optimizations that this codebase has not yet taken:
+
+- **Per-layer command-buffer fusion** — every op currently commits and
+  waits on its own `MTLCommandBuffer`; grouping the ~14 ops in a
+  transformer block into one commit per layer would cut a substantial
+  fraction of per-call dispatch overhead.
+- **Fused QKV and gate+up projections** — Q/K/V share the same input and
+  could be one matmul producing stacked outputs instead of three serial
+  matmuls; same for FFN gate/up.
+- **Batched prefill** — the executor processes one prompt token per
+  `executor.run()` today. Prefill ms/tok is currently identical to
+  generation ms/tok (~95 ms) because there's no batching across the
+  prompt; `llama.cpp`'s prefill is ~2× faster per token than its
+  generation for this exact reason.
+
+These are the natural next swings if single-stream throughput parity with
+llama.cpp is the goal.
+
+### Architectural direction
+
+Single-stream tok/s against llama.cpp is not the primary target. The
+project is structured to support multi-request and agentic workloads —
+specifically, continuous batching: many in-flight requests at different
+sequence positions sharing the GPU without falling off a cliff when a
+short request finishes. Single-stream is the baseline we measure
+correctness against, not the workload we optimize for.
+
 ## Project Structure
 
 ```
