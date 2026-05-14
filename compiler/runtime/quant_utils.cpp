@@ -6,10 +6,6 @@
 #include <stdexcept>
 #include <vector>
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
-
 #include "frontends/ggml_types.hpp"
 #include "runtime/float_convert.hpp"
 #include "runtime/quantization.hpp"
@@ -67,21 +63,7 @@ void dequantizeRowTo(const uint8_t* src,
             break;
         }
         case frontend::GGML_TYPE_F16: {
-            const uint16_t* ptr = reinterpret_cast<const uint16_t*>(src);
-            size_t i = 0;
-#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
-            // NEON vcvt_f32_f16: 4 fp16 → 4 fp32 in one instruction. Critical
-            // for KV-cache decode at decode time, where the cache is read
-            // every step and a scalar fp16ToFloat path tanks tok/s.
-            for (; i + 8 <= cols; i += 8) {
-                float16x8_t h = vld1q_f16(reinterpret_cast<const __fp16*>(ptr + i));
-                float32x4_t lo = vcvt_f32_f16(vget_low_f16(h));
-                float32x4_t hi = vcvt_f32_f16(vget_high_f16(h));
-                vst1q_f32(dst + i, lo);
-                vst1q_f32(dst + i + 4, hi);
-            }
-#endif
-            for (; i < cols; ++i) dst[i] = fp16ToFloat(ptr[i]);
+            castF16toF32(reinterpret_cast<const uint16_t*>(src), dst, cols);
             break;
         }
         case frontend::GGML_TYPE_BF16: {
@@ -147,17 +129,7 @@ void quantizeRowFrom(const float* src,
             break;
         }
         case frontend::GGML_TYPE_F16: {
-            uint16_t* ptr = reinterpret_cast<uint16_t*>(dst);
-            size_t i = 0;
-#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
-            for (; i + 8 <= cols; i += 8) {
-                float32x4_t lo = vld1q_f32(src + i);
-                float32x4_t hi = vld1q_f32(src + i + 4);
-                float16x8_t h = vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
-                vst1q_f16(reinterpret_cast<__fp16*>(ptr + i), h);
-            }
-#endif
-            for (; i < cols; ++i) ptr[i] = floatToFp16(src[i]);
+            castF32toF16(src, reinterpret_cast<uint16_t*>(dst), cols);
             break;
         }
         case frontend::GGML_TYPE_BF16: {

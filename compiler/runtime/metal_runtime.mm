@@ -1,5 +1,6 @@
 #include "runtime/metal_runtime.hpp"
 #include "runtime/execution_graph.hpp"
+#include "runtime/float_convert.hpp"
 #include "runtime/kernel_registry.hpp"
 #include "runtime/quantization.hpp"
 #include "runtime/quant_utils.hpp"
@@ -3940,9 +3941,28 @@ bool matmulQ4_K(const std::string& weight_name,
                 // for it. Mask + ALiBi are folded into the logits buffer before
                 // the Q.K matmul, which runs with beta=1.0 to add the scores
                 // on top, eliminating any mid-call sync.
-                const size_t kHeadDimBytes   = head_dim * sizeof(float);
+                //
+                // fp16 attention path. Default ON per item-4 fp16 arc:
+                // - Q, K, V, logits, result allocated as half-precision.
+                // - All five MPSMatrixDescriptors use MPSDataTypeFloat16.
+                // - Q is NEON-cast to fp16 on upload; K, V on copy from cache;
+                //   mask + ALiBi pre-fill in fp16; result NEON-cast back to
+                //   fp32 on output. MPS' simdgroup_half8x8 matmul runs at 2×
+                //   throughput vs fp32. At decode shape the gain is small
+                //   (~5% per attention call) because dispatch overhead
+                //   dominates compute, but combined with fp16 KV cache the
+                //   path is wedge-compatible with paged-KV (item 5). Set
+                //   MLC_FP16_ATTN=0 to opt out.
+                static const bool fp16_attn = []() {
+                    const char* env = std::getenv("MLC_FP16_ATTN");
+                    if (!env) return true;  // default on
+                    return !(env[0] == '0' && env[1] == 0);
+                }();
+                const size_t kElemBytes      = fp16_attn ? sizeof(uint16_t) : sizeof(float);
+                const size_t kHeadDimBytes   = head_dim * kElemBytes;
                 const size_t kKVMatrixBytes  = tokens * kHeadDimBytes;
-                const size_t kLogitsRowBytes = tokens * sizeof(float);
+                const size_t kLogitsRowBytes = tokens * kElemBytes;
+                const MPSDataType mpsDtype   = fp16_attn ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
 
                 id<MTLBuffer> qBuffer = [device newBufferWithLength:num_heads * kHeadDimBytes
                                                             options:MTLResourceStorageModeShared];
@@ -3959,51 +3979,79 @@ bool matmulQ4_K(const std::string& weight_name,
                     return false;
                 }
 
-                // 1. CPU-rotate Q into qBuffer.
+                // 1. CPU-rotate Q (fp32 working buffer), then cast to fp16 (or
+                //    plain memcpy in fp32 mode).
+                std::vector<float> q_staging;
+                const float* q_src;
                 if (use_rotary && !q_single_cos.empty()) {
-                    std::vector<float> rotated_q(q.begin(),
-                                                 q.begin() + num_heads * head_dim);
+                    q_staging.assign(q.begin(), q.begin() + num_heads * head_dim);
                     for (size_t h = 0; h < num_heads; ++h) {
-                        applyRotaryEmbedding(rotated_q.data() + h * head_dim,
+                        applyRotaryEmbedding(q_staging.data() + h * head_dim,
                                              q_single_cos,
                                              q_single_sin,
                                              head_dim,
                                              effective_rotary);
                     }
-                    std::memcpy([qBuffer contents], rotated_q.data(),
-                                num_heads * kHeadDimBytes);
+                    q_src = q_staging.data();
                 } else {
-                    std::memcpy([qBuffer contents], q.data(),
-                                num_heads * kHeadDimBytes);
+                    q_src = q.data();
+                }
+                if (fp16_attn) {
+                    castF32toF16(q_src,
+                                 reinterpret_cast<uint16_t*>([qBuffer contents]),
+                                 num_heads * head_dim);
+                } else {
+                    std::memcpy([qBuffer contents], q_src, num_heads * kHeadDimBytes);
                 }
 
                 // 2. GQA broadcast: gather K[kv_index] and V[kv_index] into
                 //    per-Q-head batch slots. kv_cache_{k,v} is laid out as
                 //    [kv_heads, context_length, head_dim]; we take the first
-                //    `tokens` rows of each Q head's owning kv_head.
+                //    `tokens` rows of each Q head's owning kv_head. Cast to
+                //    fp16 inline when fp16_attn is on.
                 uint8_t* kDst = reinterpret_cast<uint8_t*>([kBatchBuffer contents]);
                 uint8_t* vDst = reinterpret_cast<uint8_t*>([vBatchBuffer contents]);
+                size_t per_head_elems = tokens * head_dim;
                 for (size_t h = 0; h < num_heads; ++h) {
                     size_t kv_idx = std::min(effective_kv_heads - 1,
                                              h * effective_kv_heads / kv_divisor);
                     const float* kSrc = kv_cache_k->data() + kv_idx * kv_stride;
                     const float* vSrc = kv_cache_v->data() + kv_idx * kv_stride;
-                    std::memcpy(kDst + h * kKVMatrixBytes, kSrc, kKVMatrixBytes);
-                    std::memcpy(vDst + h * kKVMatrixBytes, vSrc, kKVMatrixBytes);
+                    if (fp16_attn) {
+                        castF32toF16(kSrc,
+                                     reinterpret_cast<uint16_t*>(kDst + h * kKVMatrixBytes),
+                                     per_head_elems);
+                        castF32toF16(vSrc,
+                                     reinterpret_cast<uint16_t*>(vDst + h * kKVMatrixBytes),
+                                     per_head_elems);
+                    } else {
+                        std::memcpy(kDst + h * kKVMatrixBytes, kSrc, kKVMatrixBytes);
+                        std::memcpy(vDst + h * kKVMatrixBytes, vSrc, kKVMatrixBytes);
+                    }
                 }
 
                 // 3. Pre-fill logits with mask + ALiBi per head, so the Q.K
                 //    matmul (with beta=1.0) adds the scores on top in one step.
-                float* logitsBase = reinterpret_cast<float*>([logitsBuffer contents]);
-                std::memset(logitsBase, 0, num_heads * kLogitsRowBytes);
+                //    Compute mask values in fp32 (numerical headroom for
+                //    -INF / large negative), then cast the whole logits buffer
+                //    to fp16 in one bulk pass when fp16_attn is on.
                 bool have_mask = !mask.empty();
                 bool have_alibi = (alibi_slopes != nullptr);
                 size_t mask_head_stride = 0;
                 if (have_mask && mask.size() >= tokens && mask.size() % tokens == 0) {
                     mask_head_stride = tokens;
                 }
+                std::vector<float> logits_staging;
+                float* logitsF32;
+                if (fp16_attn) {
+                    logits_staging.assign(num_heads * tokens, 0.0f);
+                    logitsF32 = logits_staging.data();
+                } else {
+                    logitsF32 = reinterpret_cast<float*>([logitsBuffer contents]);
+                    std::memset(logitsF32, 0, num_heads * kLogitsRowBytes);
+                }
                 for (size_t h = 0; h < num_heads; ++h) {
-                    float* row = logitsBase + h * tokens;
+                    float* row = logitsF32 + h * tokens;
                     if (have_alibi && h < alibi_slopes->size()) {
                         float slope = (*alibi_slopes)[h];
                         for (size_t t = 0; t < tokens; ++t) {
@@ -4024,6 +4072,11 @@ bool matmulQ4_K(const std::string& weight_name,
                         }
                     }
                 }
+                if (fp16_attn) {
+                    castF32toF16(logits_staging.data(),
+                                 reinterpret_cast<uint16_t*>([logitsBuffer contents]),
+                                 num_heads * tokens);
+                }
 
                 // 4. Build batched MPS descriptors + matrices.
                 MPSMatrixDescriptor* qDesc =
@@ -4032,35 +4085,35 @@ bool matmulQ4_K(const std::string& weight_name,
                                                          matrices:num_heads
                                                          rowBytes:kHeadDimBytes
                                                       matrixBytes:kHeadDimBytes
-                                                         dataType:MPSDataTypeFloat32];
+                                                         dataType:mpsDtype];
                 MPSMatrixDescriptor* kDesc =
                     [MPSMatrixDescriptor matrixDescriptorWithRows:tokens
                                                           columns:head_dim
                                                          matrices:num_heads
                                                          rowBytes:kHeadDimBytes
                                                       matrixBytes:kKVMatrixBytes
-                                                         dataType:MPSDataTypeFloat32];
+                                                         dataType:mpsDtype];
                 MPSMatrixDescriptor* lBatchDesc =
                     [MPSMatrixDescriptor matrixDescriptorWithRows:1
                                                           columns:tokens
                                                          matrices:num_heads
                                                          rowBytes:kLogitsRowBytes
                                                       matrixBytes:kLogitsRowBytes
-                                                         dataType:MPSDataTypeFloat32];
+                                                         dataType:mpsDtype];
                 MPSMatrixDescriptor* lSoftmaxDesc =
                     [MPSMatrixDescriptor matrixDescriptorWithRows:num_heads
                                                           columns:tokens
                                                          matrices:1
                                                          rowBytes:kLogitsRowBytes
                                                       matrixBytes:num_heads * kLogitsRowBytes
-                                                         dataType:MPSDataTypeFloat32];
+                                                         dataType:mpsDtype];
                 MPSMatrixDescriptor* rDesc =
                     [MPSMatrixDescriptor matrixDescriptorWithRows:1
                                                           columns:head_dim
                                                          matrices:num_heads
                                                          rowBytes:kHeadDimBytes
                                                       matrixBytes:kHeadDimBytes
-                                                         dataType:MPSDataTypeFloat32];
+                                                         dataType:mpsDtype];
 
                 MPSMatrix* qMat = [[MPSMatrix alloc] initWithBuffer:qBuffer descriptor:qDesc];
                 MPSMatrix* kMat = [[MPSMatrix alloc] initWithBuffer:kBatchBuffer descriptor:kDesc];
@@ -4118,8 +4171,14 @@ bool matmulQ4_K(const std::string& weight_name,
                 [commandBuffer waitUntilCompleted];
 
                 // 7. Copy result back into output (head-major layout matches CPU).
-                std::memcpy(output.data(), [resultBuffer contents],
-                            num_heads * kHeadDimBytes);
+                if (fp16_attn) {
+                    castF16toF32(reinterpret_cast<const uint16_t*>([resultBuffer contents]),
+                                 output.data(),
+                                 num_heads * head_dim);
+                } else {
+                    std::memcpy(output.data(), [resultBuffer contents],
+                                num_heads * kHeadDimBytes);
+                }
                 }
                 return true;
             }

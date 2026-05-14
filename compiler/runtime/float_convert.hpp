@@ -1,7 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace mlc {
 namespace runtime {
@@ -68,6 +73,34 @@ inline uint16_t floatToFp16(float value) {
     }
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) |
                                  ((mantissa + 0x1000u) >> 13));
+}
+
+// Bulk fp16 → fp32 cast (NEON 8-elem fast path, scalar tail). Used by KV cache
+// dequant and the fp16-attention input/output staging.
+inline void castF16toF32(const uint16_t* src, float* dst, size_t n) {
+    size_t i = 0;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vld1q_f16(reinterpret_cast<const __fp16*>(src + i));
+        vst1q_f32(dst + i,     vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
+#endif
+    for (; i < n; ++i) dst[i] = fp16ToFloat(src[i]);
+}
+
+// Bulk fp32 → fp16 cast (NEON 8-elem fast path, scalar tail).
+inline void castF32toF16(const float* src, uint16_t* dst, size_t n) {
+    size_t i = 0;
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+    for (; i + 8 <= n; i += 8) {
+        float32x4_t lo = vld1q_f32(src + i);
+        float32x4_t hi = vld1q_f32(src + i + 4);
+        float16x8_t h  = vcombine_f16(vcvt_f16_f32(lo), vcvt_f16_f32(hi));
+        vst1q_f16(reinterpret_cast<__fp16*>(dst + i), h);
+    }
+#endif
+    for (; i < n; ++i) dst[i] = floatToFp16(src[i]);
 }
 
 } // namespace runtime
