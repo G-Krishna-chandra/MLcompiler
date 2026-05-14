@@ -916,6 +916,25 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             result.message = "softmax";
             return result;
         }
+        case ExecOpType::Slice: {
+            const std::vector<float>* input = fetchInput(*context, node, 0, result);
+            if (!result.success) return result;
+            auto attr_off = node.attributes.find("slice_offset");
+            auto attr_len = node.attributes.find("slice_length");
+            size_t offset = attr_off != node.attributes.end() ? static_cast<size_t>(attr_off->second) : 0;
+            size_t length = attr_len != node.attributes.end() ? static_cast<size_t>(attr_len->second) : input->size();
+            if (offset + length > input->size()) {
+                result.success = false;
+                result.message = "Slice out of range";
+                return result;
+            }
+            std::vector<float> out(input->begin() + offset, input->begin() + offset + length);
+            if (!node.outputs.empty()) {
+                context->setTensor(node.outputs[0], std::move(out));
+            }
+            result.message = "slice";
+            return result;
+        }
         default:
             result.success = false;
             std::ostringstream oss;

@@ -842,17 +842,25 @@ void GGUFLoader::parseTensorDirectory(FILE* file, uint64_t /* tensor_data_start 
 // ============================================================================
 
 std::vector<uint8_t> GGUFLoader::loadTensorData(const GGUFTensorInfo& t) const {
+    if (t.offset == std::numeric_limits<uint64_t>::max()) {
+        auto it = synthetic_data_.find(t.name);
+        if (it == synthetic_data_.end()) {
+            throw std::runtime_error("Synthetic tensor data missing: " + t.name);
+        }
+        return it->second;
+    }
+
     FILE* file = fopen(path_.c_str(), "rb");
     if (!file) {
         throw std::runtime_error("Failed to open GGUF file: " + path_);
     }
-    
+
     // Seek to tensor data offset (absolute offset)
     if (!seekAbsolute(file, t.offset)) {
         fclose(file);
         throw std::runtime_error("Failed to seek to tensor offset: " + t.name);
     }
-    
+
     // Load exactly n_bytes of raw data (opaque block for quantized types)
     std::vector<uint8_t> data(t.n_bytes);
     if (t.n_bytes > 0) {
@@ -861,9 +869,77 @@ std::vector<uint8_t> GGUFLoader::loadTensorData(const GGUFTensorInfo& t) const {
             throw std::runtime_error("Failed to read complete tensor data: " + t.name);
         }
     }
-    
+
     fclose(file);
     return data;
+}
+
+void GGUFLoader::concatenateBlockWeights() {
+    auto tryConcat = [&](const std::string& fused_name,
+                         const std::vector<std::string>& parts) {
+        if (tensor_map_.count(fused_name)) return;  // already built
+        std::vector<const GGUFTensorInfo*> infos;
+        infos.reserve(parts.size());
+        for (const auto& p : parts) {
+            auto it = tensor_map_.find(p);
+            if (it == tensor_map_.end()) return;
+            infos.push_back(&it->second);
+        }
+        // Must all be Q4_0 with same cols (shape[0]).
+        for (const auto* info : infos) {
+            if (info->dtype != GGML_TYPE_Q4_0) return;
+            if (info->shape.size() != 2) return;
+        }
+        uint64_t cols = infos[0]->shape[0];
+        uint64_t total_rows = 0;
+        uint64_t total_bytes = 0;
+        for (const auto* info : infos) {
+            if (info->shape[0] != cols) return;
+            total_rows += info->shape[1];
+            total_bytes += info->n_bytes;
+        }
+        std::vector<uint8_t> fused;
+        fused.reserve(total_bytes);
+        for (const auto* info : infos) {
+            auto bytes = loadTensorData(*info);
+            fused.insert(fused.end(), bytes.begin(), bytes.end());
+        }
+        GGUFTensorInfo synth;
+        synth.name = fused_name;
+        synth.shape = {cols, total_rows};
+        synth.dtype = GGML_TYPE_Q4_0;
+        synth.offset = std::numeric_limits<uint64_t>::max();
+        synth.n_bytes = fused.size();
+        tensor_map_[fused_name] = synth;
+        synthetic_data_[fused_name] = std::move(fused);
+    };
+
+    // Probe layer indices by scanning existing tensor names.
+    std::vector<size_t> layers;
+    {
+        std::unordered_map<size_t, bool> seen;
+        const std::string prefix = "blk.";
+        const std::string suffix = ".attn_q.weight";
+        for (const auto& [name, info] : tensor_map_) {
+            if (name.size() <= prefix.size() + suffix.size()) continue;
+            if (name.compare(0, prefix.size(), prefix) != 0) continue;
+            if (name.size() < suffix.size()) continue;
+            if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+            std::string idx_str = name.substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+            try {
+                size_t layer = static_cast<size_t>(std::stoul(idx_str));
+                if (!seen[layer]) { seen[layer] = true; layers.push_back(layer); }
+            } catch (...) {}
+        }
+        std::sort(layers.begin(), layers.end());
+    }
+    for (size_t layer : layers) {
+        std::string p = "blk." + std::to_string(layer) + ".";
+        tryConcat(p + "attn_qkv.weight",
+                  {p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"});
+        tryConcat(p + "ffn_gate_up.weight",
+                  {p + "ffn_gate.weight", p + "ffn_up.weight"});
+    }
 }
 
 } // namespace frontend

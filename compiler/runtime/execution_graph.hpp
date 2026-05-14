@@ -22,6 +22,7 @@ enum class ExecOpType {
     Norm,
     Softmax,
     Linear,
+    Slice,
     Output
 };
 

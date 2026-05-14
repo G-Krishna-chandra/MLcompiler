@@ -204,9 +204,53 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
 
         Node* attn_input_node = norm_node ? norm_node : current_node;
         Tensor* attn_input_tensor = norm_output;
-        auto q = buildLinear(attn_input_node, attn_input_tensor, "attn_q", "attn_q");
-        auto k = buildLinear(attn_input_node, attn_input_tensor, "attn_k", "attn_k");
-        auto v = buildLinear(attn_input_node, attn_input_tensor, "attn_v", "attn_v");
+
+        auto buildSlice = [&](Node* src_node,
+                              Tensor* src_tensor,
+                              const std::string& out_name,
+                              int64_t offset,
+                              int64_t length) -> std::pair<Node*, Tensor*> {
+            Tensor* out_tensor = addActivation(*graph, out_name, {length});
+            Node* slice = graph->addNode(ir::OpKind::Slice, out_name + ".slice");
+            slice->inputs.push_back(src_node);
+            slice->activation_inputs.push_back(src_tensor);
+            slice->outputs.push_back(out_tensor);
+            slice->attributes["slice_offset"] = static_cast<float>(offset);
+            slice->attributes["slice_length"] = static_cast<float>(length);
+            slice->metadata["layer"] = layer_tag;
+            return {slice, out_tensor};
+        };
+
+        std::pair<Node*, Tensor*> q{nullptr, nullptr};
+        std::pair<Node*, Tensor*> k{nullptr, nullptr};
+        std::pair<Node*, Tensor*> v{nullptr, nullptr};
+        Tensor* qkv_weight = lookupWeight(*graph, prefix + "attn_qkv.weight");
+        Tensor* q_weight = lookupWeight(*graph, prefix + "attn_q.weight");
+        Tensor* k_weight = lookupWeight(*graph, prefix + "attn_k.weight");
+        Tensor* v_weight = lookupWeight(*graph, prefix + "attn_v.weight");
+        if (qkv_weight && q_weight && k_weight && v_weight &&
+            q_weight->shape.size() == 2 && k_weight->shape.size() == 2 && v_weight->shape.size() == 2) {
+            int64_t q_rows = q_weight->shape[1];
+            int64_t k_rows = k_weight->shape[1];
+            int64_t v_rows = v_weight->shape[1];
+            int64_t total_rows = q_rows + k_rows + v_rows;
+            Tensor* qkv_out = addActivation(*graph, prefix + "attn_qkv.out_stacked", {total_rows});
+            Node* qkv_matmul = graph->addNode(ir::OpKind::MatMul, prefix + "attn_qkv.matmul");
+            qkv_matmul->inputs.push_back(attn_input_node);
+            qkv_matmul->activation_inputs.push_back(attn_input_tensor);
+            qkv_matmul->tensor_inputs.push_back(qkv_weight);
+            qkv_matmul->outputs.push_back(qkv_out);
+            qkv_matmul->metadata["layer"] = layer_tag;
+            qkv_matmul->metadata["role"] = "attn_qkv";
+            qkv_matmul->metadata["weight"] = prefix + "attn_qkv.weight";
+            q = buildSlice(qkv_matmul, qkv_out, prefix + "attn_q.out", 0, q_rows);
+            k = buildSlice(qkv_matmul, qkv_out, prefix + "attn_k.out", q_rows, k_rows);
+            v = buildSlice(qkv_matmul, qkv_out, prefix + "attn_v.out", q_rows + k_rows, v_rows);
+        } else {
+            q = buildLinear(attn_input_node, attn_input_tensor, "attn_q", "attn_q");
+            k = buildLinear(attn_input_node, attn_input_tensor, "attn_k", "attn_k");
+            v = buildLinear(attn_input_node, attn_input_tensor, "attn_v", "attn_v");
+        }
 
         Tensor* attn_mix = addActivation(*graph,
                                          prefix + "attention_mix",
@@ -259,8 +303,31 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
             ffn_norm_node->metadata["weight"] = prefix + "ffn_norm.weight";
         }
 
-        auto gate = buildLinear(ffn_norm_node, ffn_norm_out, "ffn_gate", "ffn_gate");
-        auto up = buildLinear(ffn_norm_node, ffn_norm_out, "ffn_up", "ffn_up");
+        std::pair<Node*, Tensor*> gate{nullptr, nullptr};
+        std::pair<Node*, Tensor*> up{nullptr, nullptr};
+        Tensor* gate_up_weight = lookupWeight(*graph, prefix + "ffn_gate_up.weight");
+        Tensor* gate_weight = lookupWeight(*graph, prefix + "ffn_gate.weight");
+        Tensor* up_weight = lookupWeight(*graph, prefix + "ffn_up.weight");
+        if (gate_up_weight && gate_weight && up_weight &&
+            gate_weight->shape.size() == 2 && up_weight->shape.size() == 2) {
+            int64_t gate_rows = gate_weight->shape[1];
+            int64_t up_rows = up_weight->shape[1];
+            int64_t total_rows = gate_rows + up_rows;
+            Tensor* gu_out = addActivation(*graph, prefix + "ffn_gate_up.out_stacked", {total_rows});
+            Node* gu_matmul = graph->addNode(ir::OpKind::MatMul, prefix + "ffn_gate_up.matmul");
+            gu_matmul->inputs.push_back(ffn_norm_node);
+            gu_matmul->activation_inputs.push_back(ffn_norm_out);
+            gu_matmul->tensor_inputs.push_back(gate_up_weight);
+            gu_matmul->outputs.push_back(gu_out);
+            gu_matmul->metadata["layer"] = layer_tag;
+            gu_matmul->metadata["role"] = "ffn_gate_up";
+            gu_matmul->metadata["weight"] = prefix + "ffn_gate_up.weight";
+            gate = buildSlice(gu_matmul, gu_out, prefix + "ffn_gate.out", 0, gate_rows);
+            up = buildSlice(gu_matmul, gu_out, prefix + "ffn_up.out", gate_rows, up_rows);
+        } else {
+            gate = buildLinear(ffn_norm_node, ffn_norm_out, "ffn_gate", "ffn_gate");
+            up = buildLinear(ffn_norm_node, ffn_norm_out, "ffn_up", "ffn_up");
+        }
         Tensor* ffn_mix = addActivation(*graph,
                                         prefix + "ffn_mix",
                                         {static_cast<int64_t>(hidden_size)});

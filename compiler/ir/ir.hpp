@@ -41,7 +41,8 @@ enum class OpKind {
     Embedding,
     Attention,
     FeedForward,
-    LayerNorm
+    LayerNorm,
+    Slice
 };
 
 struct Node {

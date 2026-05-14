@@ -184,6 +184,7 @@ std::string toString(ExecOpType op) {
         case ExecOpType::Norm: return "Norm";
         case ExecOpType::Softmax: return "Softmax";
         case ExecOpType::Linear: return "Linear";
+        case ExecOpType::Slice: return "Slice";
         case ExecOpType::Output: return "Output";
         default: return "Unknown";
     }

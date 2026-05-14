@@ -94,6 +94,7 @@ ExecOpType mapOp(ir::OpKind kind) {
         case ir::OpKind::Norm: return ExecOpType::Norm;
         case ir::OpKind::Softmax: return ExecOpType::Softmax;
         case ir::OpKind::Add: return ExecOpType::Add;
+        case ir::OpKind::Slice: return ExecOpType::Slice;
         case ir::OpKind::Transpose: return ExecOpType::MatMul;
         default:
             return ExecOpType::Unknown;
@@ -147,6 +148,8 @@ BackendKind selectBackend(ExecOpType op,
         case ExecOpType::Norm:
         case ExecOpType::Add:
             return BackendKind::Metal;
+        case ExecOpType::Slice:
+            return BackendKind::CPU;
         default:
             return BackendKind::Auto;
     }

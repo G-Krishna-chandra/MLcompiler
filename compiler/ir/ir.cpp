@@ -139,6 +139,7 @@ std::string opKindToString(OpKind kind) {
         case OpKind::Attention: return "Attention";
         case OpKind::FeedForward: return "FeedForward";
         case OpKind::LayerNorm: return "LayerNorm";
+        case OpKind::Slice: return "Slice";
         default: return "UNKNOWN";
     }
 }

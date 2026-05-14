@@ -82,14 +82,27 @@ public:
     }
 
     uint32_t quantizationVersion() const { return quant_version_; }
-    
+
     std::vector<uint8_t> loadTensorData(const GGUFTensorInfo& t) const;
+
+    // Build synthetic fused weights (per-block attn_qkv, ffn_gate_up) by
+    // byte-concatenating their components. Skips blocks where the triplet/pair
+    // is missing, the dtype isn't Q4_0, or the column dimension doesn't match.
+    // Called after load().
+    void concatenateBlockWeights();
+
+    // Returns true iff the tensor is a synthetic fused tensor produced by
+    // concatenateBlockWeights().
+    bool isSyntheticTensor(const std::string& name) const {
+        return synthetic_data_.find(name) != synthetic_data_.end();
+    }
 
 private:
     std::string path_;
     GGUFHeader header_;
     std::unordered_map<std::string, GGUFTensorInfo> tensor_map_;
     std::unordered_map<std::string, GGUFValue> kv_metadata_;  // Store KV metadata for introspection
+    std::unordered_map<std::string, std::vector<uint8_t>> synthetic_data_;  // Concatenated fused weights.
     bool verbose_ = false;
     uint32_t quant_version_ = 1;
     size_t alignment_ = 32;

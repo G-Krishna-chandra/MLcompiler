@@ -165,6 +165,9 @@ Session::Session(const std::string& gguf_path) : loader_(gguf_path) {
     if (!loader_.load()) {
         throw std::runtime_error("Failed to load GGUF file: " + gguf_path);
     }
+    if (!std::getenv("MLC_DISABLE_QKV_FUSION")) {
+        loader_.concatenateBlockWeights();
+    }
 }
 
 const std::vector<uint8_t>& Session::tensorData(const frontend::GGUFTensorInfo& tensor) const {
