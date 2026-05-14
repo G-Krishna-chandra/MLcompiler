@@ -2604,17 +2604,10 @@ bool matmulQ4_K(const std::string& weight_name,
                     size_t row_stride,
                     const std::vector<float>* bias,
                     std::vector<float>& output) const {
-        (void)weight_name;  // CPU reference path; no Metal weight upload.
 #if defined(__APPLE__)
-        // CPU reference for exact parity until GPU kernel is fully bit-accurate.
-        if (input.size() != cols || weights.size() < row_stride * rows) return false;
-        output.resize(rows, 0.0f);
-        for (size_t r = 0; r < rows; ++r) {
-            const uint8_t* row_ptr = weights.data() + r * row_stride;
-            output[r] = dotProductRowQ6_K(row_ptr, cols, input.data());
-            if (bias && r < bias->size()) output[r] += (*bias)[r];
-        }
-        return true;
+        if (!available() || !q6KMatmulPipeline) return false;
+        return matmulQuantK(weight_name, weights, input, rows, cols, row_stride,
+                            q6KMatmulPipeline, bias, output);
 #else
         (void)weights;
         (void)input;
