@@ -1152,6 +1152,139 @@ kernel void dequant_q8_1_block(
     const device int8_t* qs = reinterpret_cast<const device int8_t*>(row + 4);
     dst[gid] = d * static_cast<float>(qs[local]) + bias;
 }
+
+// ============================================================================
+// flash_attention_v1: skeleton single-tile flash attention.
+//
+// Dispatch: one threadgroup per Q head, head_dim threads per threadgroup.
+// Thread t owns feature dim t for the loads/stores, and computes scores at
+// kv positions {t, t+D, t+2D, ...} (stride-D loop) so each score is a full
+// dot product locally — no per-score reduction needed.
+//
+// Threadgroup memory (passed via setThreadgroupMemoryLength):
+//   [0, D)        shared_q       — Q[head, :] loaded once per threadgroup
+//   [D, D+S)      shared_scores  — Q·K^T → softmax weights, in place
+//   [D+S, 2D+S)   partial_buf    — per-thread scratch for max/sum reductions
+// where D = head_dim, S = kv_seq.
+//
+// Determinism: reductions use fixed-stride tree (NOT simd_max/simd_sum) so the
+// floating-point reduction order is bit-stable across runs. This is what the
+// harness's cosine-1.0 results require to be meaningful.
+//
+// Causal mask: TODO when q_seq > 1 cases are exercised. For q_seq=1 (this
+// session) causal is a no-op (the single Q sees all kv positions).
+//
+// Requires head_dim to be a power of 2. Asserted host-side.
+// ============================================================================
+struct FlashAttnParams {
+    uint num_heads;
+    uint kv_heads;
+    uint head_dim;
+    uint kv_seq;
+    float inv_sqrt_d;
+    uint debug_dump;   // 0 or 1; when 1, qk_out/sm_out are written
+};
+
+kernel void flash_attention_v1(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    device float* qk_out [[buffer(4)]],
+    device float* sm_out [[buffer(5)]],
+    constant FlashAttnParams& params [[buffer(6)]],
+    threadgroup float* tg_buf [[threadgroup(0)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint t [[thread_position_in_threadgroup]]
+) {
+    const uint D = params.head_dim;
+    const uint S = params.kv_seq;
+    const uint kv = (head * params.kv_heads) / params.num_heads;
+
+    threadgroup float* shared_q     = tg_buf;             // [D]
+    threadgroup float* shared_scores = tg_buf + D;        // [S]
+    threadgroup float* partial_buf   = tg_buf + D + S;    // [D]
+
+    // 1. Load Q for this head into threadgroup memory (one element per thread).
+    shared_q[t] = Q[head * D + t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Q·K^T — each thread computes whole-dot-products for its strided scores.
+    //    Score at kv position s is the dot product of Q with K[s, kv, :].
+    for (uint s = t; s < S; s += D) {
+        float score = 0.0f;
+        const device float* k_row = K + s * params.kv_heads * D + kv * D;
+        for (uint d = 0; d < D; ++d) {
+            score += shared_q[d] * k_row[d];
+        }
+        shared_scores[s] = score * params.inv_sqrt_d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Optional intermediate dump: post-Q·K, pre-softmax.
+    if (params.debug_dump != 0u) {
+        for (uint s = t; s < S; s += D) {
+            qk_out[head * S + s] = shared_scores[s];
+        }
+    }
+
+    // 3. Softmax part 1 — max reduction across S.
+    float my_max = -INFINITY;
+    for (uint s = t; s < S; s += D) {
+        my_max = fmax(my_max, shared_scores[s]);
+    }
+    partial_buf[t] = my_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = D / 2u; stride >= 1u; stride /= 2u) {
+        if (t < stride) {
+            partial_buf[t] = fmax(partial_buf[t], partial_buf[t + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (stride == 1u) break;
+    }
+    float max_val = partial_buf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 4. Softmax part 2 — exp(score - max) into shared_scores, sum-reduce.
+    float my_sum = 0.0f;
+    for (uint s = t; s < S; s += D) {
+        float e = exp(shared_scores[s] - max_val);
+        shared_scores[s] = e;
+        my_sum += e;
+    }
+    partial_buf[t] = my_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = D / 2u; stride >= 1u; stride /= 2u) {
+        if (t < stride) {
+            partial_buf[t] += partial_buf[t + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (stride == 1u) break;
+    }
+    float total = partial_buf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 5. Softmax part 3 — normalize.
+    float inv = (total > 0.0f) ? (1.0f / total) : 0.0f;
+    for (uint s = t; s < S; s += D) {
+        shared_scores[s] *= inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Optional intermediate dump: post-softmax weights.
+    if (params.debug_dump != 0u) {
+        for (uint s = t; s < S; s += D) {
+            sm_out[head * S + s] = shared_scores[s];
+        }
+    }
+
+    // 6. Output = weights · V. Thread t accumulates output dim t.
+    float acc = 0.0f;
+    for (uint s = 0; s < S; ++s) {
+        acc += shared_scores[s] * V[s * params.kv_heads * D + kv * D + t];
+    }
+    O[head * D + t] = acc;
+}
 )";
 } // namespace
 #endif
@@ -1223,6 +1356,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> dequantQKPipeline = nil;
     id<MTLComputePipelineState> biasAddPipeline = nil;
     id<MTLComputePipelineState> kvWritePipeline = nil;
+    id<MTLComputePipelineState> flashAttentionPipeline = nil;
     bool debug_log = false;
 
     // Persistent device-side weight cache. Weights are immutable for the
@@ -1429,6 +1563,7 @@ struct MetalExecutor::Impl {
                 dequantQKPipeline = buildPipeline(@"dequant_qk_row");
                 biasAddPipeline = buildPipeline(@"add_bias_strided");
                 kvWritePipeline = buildPipeline(@"scatter_kv");
+                flashAttentionPipeline = buildPipeline(@"flash_attention_v1");
             }
         }
 #endif
@@ -3873,6 +4008,115 @@ bool matmulQ4_K(const std::string& weight_name,
 #endif
         return false;
     }
+
+    // Skeleton single-tile flash-attention. Math correctness only; not yet
+    // wired into the production attention dispatch. See the kernel comment
+    // for layout details. If qk_debug or sm_debug is non-null, the kernel
+    // dumps post-Q·K scores and post-softmax weights into them for harness
+    // sub-step parity reporting.
+    bool flashAttention(const std::vector<float>& q,
+                        const std::vector<float>& k,
+                        const std::vector<float>& v,
+                        size_t num_heads,
+                        size_t kv_heads,
+                        size_t head_dim,
+                        size_t kv_seq,
+                        std::vector<float>& output,
+                        std::vector<float>* qk_debug,
+                        std::vector<float>* sm_debug) const {
+#if defined(__APPLE__)
+        if (!available() || !flashAttentionPipeline) return false;
+        if (num_heads == 0 || head_dim == 0 || kv_seq == 0) return false;
+        size_t effective_kv_heads = kv_heads > 0 ? kv_heads : num_heads;
+        if (num_heads % effective_kv_heads != 0) return false;
+        // head_dim must be a power of 2 (tree reduction assumption).
+        if ((head_dim & (head_dim - 1)) != 0) return false;
+        size_t q_per = num_heads * head_dim;
+        size_t kv_per = effective_kv_heads * head_dim;
+        if (q.size() != q_per) return false;
+        if (k.size() != kv_seq * kv_per || v.size() != kv_seq * kv_per) return false;
+
+        size_t tg_floats = 2 * head_dim + kv_seq;
+        size_t tg_bytes = tg_floats * sizeof(float);
+        if (head_dim > flashAttentionPipeline.maxTotalThreadsPerThreadgroup) return false;
+        if (tg_bytes > device.maxThreadgroupMemoryLength) return false;
+
+        output.assign(q_per, 0.0f);
+        bool dump = (qk_debug != nullptr) || (sm_debug != nullptr);
+        if (qk_debug) qk_debug->assign(num_heads * kv_seq, 0.0f);
+        if (sm_debug) sm_debug->assign(num_heads * kv_seq, 0.0f);
+        // Always bind a valid buffer at slots 4/5 even when not dumping.
+        size_t dump_bytes = num_heads * kv_seq * sizeof(float);
+        if (dump_bytes == 0) dump_bytes = sizeof(float);
+
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> qBuf = [device newBufferWithBytes:q.data()
+                                                          length:q.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> kBuf = [device newBufferWithBytes:k.data()
+                                                          length:k.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> vBuf = [device newBufferWithBytes:v.data()
+                                                          length:v.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+                id<MTLBuffer> oBuf = [device newBufferWithLength:output.size() * sizeof(float)
+                                                          options:MTLResourceStorageModeShared];
+                id<MTLBuffer> qkBuf = [device newBufferWithLength:dump_bytes
+                                                           options:MTLResourceStorageModeShared];
+                id<MTLBuffer> smBuf = [device newBufferWithLength:dump_bytes
+                                                           options:MTLResourceStorageModeShared];
+                if (!qBuf || !kBuf || !vBuf || !oBuf || !qkBuf || !smBuf) return false;
+
+                struct FlashAttnParams {
+                    uint32_t num_heads;
+                    uint32_t kv_heads;
+                    uint32_t head_dim;
+                    uint32_t kv_seq;
+                    float inv_sqrt_d;
+                    uint32_t debug_dump;
+                } params;
+                params.num_heads = static_cast<uint32_t>(num_heads);
+                params.kv_heads = static_cast<uint32_t>(effective_kv_heads);
+                params.head_dim = static_cast<uint32_t>(head_dim);
+                params.kv_seq = static_cast<uint32_t>(kv_seq);
+                params.inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
+                params.debug_dump = dump ? 1u : 0u;
+
+                id<MTLCommandBuffer> cb = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:flashAttentionPipeline];
+                [enc setBuffer:qBuf offset:0 atIndex:0];
+                [enc setBuffer:kBuf offset:0 atIndex:1];
+                [enc setBuffer:vBuf offset:0 atIndex:2];
+                [enc setBuffer:oBuf offset:0 atIndex:3];
+                [enc setBuffer:qkBuf offset:0 atIndex:4];
+                [enc setBuffer:smBuf offset:0 atIndex:5];
+                [enc setBytes:&params length:sizeof(params) atIndex:6];
+                [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
+                MTLSize tg = MTLSizeMake(num_heads, 1, 1);
+                MTLSize th = MTLSizeMake(head_dim, 1, 1);
+                [enc dispatchThreadgroups:tg threadsPerThreadgroup:th];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                if (cb.status != MTLCommandBufferStatusCompleted) return false;
+
+                std::memcpy(output.data(), [oBuf contents], output.size() * sizeof(float));
+                if (dump) {
+                    if (qk_debug) std::memcpy(qk_debug->data(), [qkBuf contents],
+                                              qk_debug->size() * sizeof(float));
+                    if (sm_debug) std::memcpy(sm_debug->data(), [smBuf contents],
+                                              sm_debug->size() * sizeof(float));
+                }
+                return true;
+            }
+        }
+#endif
+        (void)q; (void)k; (void)v; (void)num_heads; (void)kv_heads;
+        (void)head_dim; (void)kv_seq; (void)output; (void)qk_debug; (void)sm_debug;
+        return false;
+    }
 };
 
 MetalExecutor& MetalExecutor::Instance() {
@@ -4674,6 +4918,21 @@ bool MetalExecutor::runAttention(const std::vector<float>& q,
                             context_length, mask, alibi_slopes, position,
                             rotary_dim, rope_freq_base, rope_freq_scale,
                             cache_k, cache_v, output);
+}
+
+bool MetalExecutor::runFlashAttention(const std::vector<float>& q,
+                                       const std::vector<float>& k,
+                                       const std::vector<float>& v,
+                                       size_t num_heads,
+                                       size_t kv_heads,
+                                       size_t head_dim,
+                                       size_t kv_seq,
+                                       std::vector<float>& output,
+                                       std::vector<float>* qk_debug,
+                                       std::vector<float>* sm_debug) const {
+    if (!impl_) return false;
+    return impl_->flashAttention(q, k, v, num_heads, kv_heads, head_dim,
+                                 kv_seq, output, qk_debug, sm_debug);
 }
 
 bool MetalExecutor::hasFeedForwardKernel() const {

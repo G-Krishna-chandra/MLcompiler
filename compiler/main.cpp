@@ -3113,6 +3113,23 @@ AttnSubSteps handwrittenAttention(const AttnConfig& cfg, const AttnTensors& t) {
     return r;
 }
 
+// Flash-attention slot (skeleton v1, single-tile, naive softmax). Lives in
+// MetalExecutor::runFlashAttention; this wrapper exists so the harness can
+// treat it the same way as the canonical path. Optional debug pointers
+// surface the post-Q·K scores and post-softmax weights when set.
+bool flashAttention(const AttnConfig& cfg, const AttnTensors& t,
+                     std::vector<float>& out,
+                     std::vector<float>* qk_debug = nullptr,
+                     std::vector<float>* sm_debug = nullptr) {
+    using namespace mlc::runtime;
+    if (!MetalExecutor::Instance().isAvailable()) return false;
+    out.clear();
+    return MetalExecutor::Instance().runFlashAttention(
+        t.q, t.k, t.v,
+        cfg.num_heads, cfg.kv_heads, cfg.head_dim, cfg.kv_seq,
+        out, qk_debug, sm_debug);
+}
+
 // Canonical path: hand the same Q/K/V to the production batched-heads MPS
 // attention via the existing public runAttention helper. RoPE is turned off
 // (rotary_dim=0). The kernel writes K/V into a zeroed float cache at
@@ -3159,13 +3176,17 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
                      "  --causal          (apply causal mask; no-op for q_seq=1)\n"
                      "  --verify-tiny     (run the 4-elem hand-verified sanity case)\n"
                      "  --sweep           (run a small sweep of GQA / shape configs)\n"
-                     "Three-way parity harness: handwritten naive attention vs the\n"
-                     "production MPS attention. The new-kernel slot is empty until\n"
-                     "the flash-attention bring-up commit.\n";
+                     "  --dump-flash-intermediates  (compare flash kernel's QK + softmax\n"
+                     "                               against handwritten reference)\n"
+                     "Three-way parity harness: handwritten naive attention (H), production\n"
+                     "MPS attention (C), and skeleton flash-attention v1 (N). With\n"
+                     "--dump-flash-intermediates, also reports H<->N parity on the post-Q·K\n"
+                     "scores and post-softmax weights for sub-step localization.\n";
     };
     attndiag::AttnConfig cfg;
     bool verify_tiny = false;
     bool sweep = false;
+    bool dump_intermediates = false;
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         auto need = [&](const char* who) -> std::string {
@@ -3184,6 +3205,7 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
             else if (a == "--causal")   cfg.causal = true;
             else if (a == "--verify-tiny") verify_tiny = true;
             else if (a == "--sweep")    sweep = true;
+            else if (a == "--dump-flash-intermediates") dump_intermediates = true;
             else if (a == "--help" || a == "-h") { usage(); return 0; }
             else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
         } catch (const std::exception& e) {
@@ -3242,9 +3264,21 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
         } else {
             std::printf("%-12s | %-10s | (canonical MPS unavailable)\n", "full", "H<->C");
         }
-        std::printf("%-12s | %-10s | (reserved for flash-attention slot)\n", "qk", "H<->N");
-        std::printf("%-12s | %-10s | (reserved for flash-attention slot)\n", "softmax", "H<->N");
-        std::printf("%-12s | %-10s | (reserved for flash-attention slot)\n", "attv", "H<->N");
+        std::vector<float> flash_out;
+        std::vector<float> flash_qk, flash_sm;
+        bool flash_ok = dump_intermediates
+            ? attndiag::flashAttention(c, inputs, flash_out, &flash_qk, &flash_sm)
+            : attndiag::flashAttention(c, inputs, flash_out);
+        if (flash_ok) {
+            report("full", "H<->N", handwritten.output, flash_out);
+            if (canonical_ok) report("full", "C<->N", canonical_out, flash_out);
+            if (dump_intermediates) {
+                report("flash-qk", "H<->N", handwritten.qk_scores, flash_qk);
+                report("flash-sm", "H<->N", handwritten.softmax_w, flash_sm);
+            }
+        } else {
+            std::printf("%-12s | %-10s | (flash kernel unavailable)\n", "full", "H<->N");
+        }
         std::printf("\n");
         return canonical_ok;
     };

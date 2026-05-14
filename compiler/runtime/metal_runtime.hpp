@@ -310,6 +310,24 @@ public:
                       const CacheDescriptor& cache_v,
                       std::vector<float>& output) const;
 
+    // Skeleton flash-attention v1 (single-tile, no cache, no RoPE, no mask).
+    // Math correctness only — not yet wired into the production attention path.
+    // q:        [num_heads, head_dim]
+    // k, v:     [kv_seq, kv_heads, head_dim]   (token-major)
+    // output:   [num_heads, head_dim]
+    // qk_debug: optional [num_heads, kv_seq] — pre-softmax scores when non-null
+    // sm_debug: optional [num_heads, kv_seq] — post-softmax weights when non-null
+    bool runFlashAttention(const std::vector<float>& q,
+                            const std::vector<float>& k,
+                            const std::vector<float>& v,
+                            size_t num_heads,
+                            size_t kv_heads,
+                            size_t head_dim,
+                            size_t kv_seq,
+                            std::vector<float>& output,
+                            std::vector<float>* qk_debug = nullptr,
+                            std::vector<float>* sm_debug = nullptr) const;
+
     bool ensureSharedBuffer(std::vector<float>& data, MetalBufferHandle& handle) const;
     void releaseBuffer(MetalBufferHandle& handle) const;
     void markHostModified(MetalBufferHandle& handle,
