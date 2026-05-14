@@ -1025,6 +1025,19 @@ kernel void apply_rotary_batch(
     }
 }
 
+// Slice: contiguous range copy. Used to lift CPU Slice ops onto the
+// open forward-pass CB so they don't force a flush mid-layer (commit C2).
+// Reads `length` floats from `src + offset_elems`, writes to `dst + 0`.
+kernel void slice_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& offset_elems [[buffer(2)]],
+    constant uint& length [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= length) return;
+    dst[gid] = src[offset_elems + gid];
+}
+
 // fp16 → fp32 cast. Used to materialize Tier-2 attention's fp16 result
 // buffer as fp32 so downstream fusable consumers (Add, Norm) reading from
 // pass_outputs see the expected dtype. Convention: every op's pass_outputs
@@ -1453,6 +1466,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> kvWritePipeline = nil;
     id<MTLComputePipelineState> flashAttentionPipeline = nil;
     id<MTLComputePipelineState> castF16toF32Pipeline = nil;
+    id<MTLComputePipelineState> sliceF32Pipeline = nil;
     bool debug_log = false;
 
     // Persistent device-side weight cache. Weights are immutable for the
@@ -1695,6 +1709,7 @@ struct MetalExecutor::Impl {
                 kvWritePipeline = buildPipeline(@"scatter_kv");
                 flashAttentionPipeline = buildPipeline(@"flash_attention_v1");
                 castF16toF32Pipeline = buildPipeline(@"cast_f16_to_f32");
+                sliceF32Pipeline = buildPipeline(@"slice_f32");
             }
         }
 #endif
@@ -4811,6 +4826,116 @@ size_t MetalExecutor::lastDeferredOutputElementCount() const {
 #else
     return 0;
 #endif
+}
+
+namespace {
+inline bool encodeSliceImpl(void* impl_void, void* device_void, void* pipeline_void,
+                            void* cb_void, void* in_buf, void* out_buf,
+                            uint32_t offset_elems, uint32_t length) {
+    (void)impl_void; (void)device_void;
+#if defined(__APPLE__)
+    if (@available(macOS 11.0, *)) {
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)cb_void;
+        id<MTLComputePipelineState> pipe = (__bridge id<MTLComputePipelineState>)pipeline_void;
+        id<MTLBuffer> src = (__bridge id<MTLBuffer>)in_buf;
+        id<MTLBuffer> dst = (__bridge id<MTLBuffer>)out_buf;
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:pipe];
+        [enc setBuffer:src offset:0 atIndex:0];
+        [enc setBuffer:dst offset:0 atIndex:1];
+        [enc setBytes:&offset_elems length:sizeof(uint32_t) atIndex:2];
+        [enc setBytes:&length length:sizeof(uint32_t) atIndex:3];
+        NSUInteger threadWidth = pipe.threadExecutionWidth;
+        if (threadWidth == 0) threadWidth = 32;
+        NSUInteger threadgroups = (length + threadWidth - 1) / threadWidth;
+        if (threadgroups == 0) threadgroups = 1;
+        [enc dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)cb_void; (void)pipeline_void; (void)in_buf; (void)out_buf;
+    (void)offset_elems; (void)length;
+    return false;
+}
+} // namespace
+
+bool MetalExecutor::encodeSliceFromBuffer(void* input_buffer, size_t input_count,
+                                           size_t offset_elems, size_t length,
+                                           void* output_buffer,
+                                           const std::string& output_tensor_name,
+                                           std::vector<float>* host_dst,
+                                           bool needs_host) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->sliceF32Pipeline) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (!input_buffer || !output_buffer) return false;
+    if (offset_elems + length > input_count) return false;
+    if (length > std::numeric_limits<uint32_t>::max()) return false;
+    bool ok = encodeSliceImpl(impl_.get(), nullptr,
+                              (__bridge void*)impl_->sliceF32Pipeline,
+                              (__bridge void*)impl_->open_forward_pass_cb_,
+                              input_buffer, output_buffer,
+                              static_cast<uint32_t>(offset_elems),
+                              static_cast<uint32_t>(length));
+    if (!ok) return false;
+    id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
+    if (!output_tensor_name.empty()) {
+        impl_->recordReadbackByName(outBuf, output_tensor_name, length * sizeof(float), needs_host);
+    } else {
+        impl_->recordReadback(outBuf, host_dst, length * sizeof(float), needs_host);
+    }
+    impl_->last_deferred_output_buffer_ = outBuf;
+    impl_->last_deferred_output_element_count_ = length;
+    return true;
+#else
+    (void)input_buffer; (void)input_count; (void)offset_elems; (void)length;
+    (void)output_buffer; (void)output_tensor_name; (void)host_dst; (void)needs_host;
+    return false;
+#endif
+}
+
+bool MetalExecutor::encodeSliceFromHost(const std::vector<float>& host_input,
+                                         size_t offset_elems, size_t length,
+                                         void* output_buffer,
+                                         const std::string& output_tensor_name,
+                                         std::vector<float>* host_dst,
+                                         bool needs_host) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->sliceF32Pipeline) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (!output_buffer) return false;
+    if (offset_elems + length > host_input.size()) return false;
+    if (length > std::numeric_limits<uint32_t>::max()) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLBuffer> upload = [impl_->device newBufferWithBytes:host_input.data()
+                                                          length:host_input.size() * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+        if (!upload) return false;
+        impl_->pass_retained_.push_back(upload);
+        bool ok = encodeSliceImpl(impl_.get(), nullptr,
+                                  (__bridge void*)impl_->sliceF32Pipeline,
+                                  (__bridge void*)impl_->open_forward_pass_cb_,
+                                  (__bridge void*)upload, output_buffer,
+                                  static_cast<uint32_t>(offset_elems),
+                                  static_cast<uint32_t>(length));
+        if (!ok) return false;
+        id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
+        if (!output_tensor_name.empty()) {
+            impl_->recordReadbackByName(outBuf, output_tensor_name, length * sizeof(float), needs_host);
+        } else {
+            impl_->recordReadback(outBuf, host_dst, length * sizeof(float), needs_host);
+        }
+        impl_->last_deferred_output_buffer_ = outBuf;
+        impl_->last_deferred_output_element_count_ = length;
+        return true;
+    }
+#endif
+    (void)host_input; (void)offset_elems; (void)length;
+    (void)output_buffer; (void)output_tensor_name; (void)host_dst; (void)needs_host;
+    return false;
 }
 
 bool MetalExecutor::hasDeferredReadback(const std::string& tensor_name) const {

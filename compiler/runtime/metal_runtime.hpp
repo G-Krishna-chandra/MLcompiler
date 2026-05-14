@@ -199,6 +199,24 @@ public:
     // signal "needs flush" without populating pass_outputs.
     bool hasDeferredReadback(const std::string& tensor_name) const;
 
+    // Slice on GPU. Encodes a contiguous-range copy onto the open
+    // forward-pass CB so Slice ops don't force a flush + CPU memcpy
+    // mid-layer. host_dst is the readback target; tensor_name
+    // re-resolves it at flush time. Returns false if no open CB or
+    // pipeline unavailable.
+    bool encodeSliceFromBuffer(void* input_buffer, size_t input_count,
+                               size_t offset_elems, size_t length,
+                               void* output_buffer,
+                               const std::string& output_tensor_name,
+                               std::vector<float>* host_dst,
+                               bool needs_host) const;
+    bool encodeSliceFromHost(const std::vector<float>& host_input,
+                             size_t offset_elems, size_t length,
+                             void* output_buffer,
+                             const std::string& output_tensor_name,
+                             std::vector<float>* host_dst,
+                             bool needs_host) const;
+
     // Encode entry points. Each requires hasForwardPassCB() == true.
     // Output is always a pool-checked-out MTLBuffer (opaque void*; backed
     // by id<MTLBuffer> with ARC strong retention through pass_checked_out_).
