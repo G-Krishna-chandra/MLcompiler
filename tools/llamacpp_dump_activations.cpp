@@ -6,6 +6,12 @@
 //
 // Usage:
 //   llamacpp_dump_activations --model PATH --prompt "..." --out-dir DIR
+//                             [--cache-type-k f16|f32] [--cache-type-v f16|f32]
+//
+// Cache types default to fp16 (matching llama.cpp's own
+// llama_context_default_params() defaults and our fp16 KV cache path).
+// Pass --cache-type-k f32 / --cache-type-v f32 to compare against an
+// fp32-cache configuration explicitly.
 //
 // Tensor name mapping (llama.cpp graph node names → mlc canonical names):
 //
@@ -199,18 +205,32 @@ bool dumpCallback(ggml_tensor* t, bool ask, void* user_data) {
 }
 
 void usage() {
-    std::cerr << "Usage: llamacpp_dump_activations --model PATH --prompt \"...\" --out-dir DIR\n";
+    std::cerr << "Usage: llamacpp_dump_activations --model PATH --prompt \"...\" --out-dir DIR\n"
+                 "                                  [--cache-type-k f16|f32]\n"
+                 "                                  [--cache-type-v f16|f32]\n"
+                 "Cache types default to fp16 (llama.cpp's default; matches our fp16 KV path).\n";
+}
+
+ggml_type parseCacheType(const std::string& s, const char* flag) {
+    if (s == "f16" || s == "fp16" || s == "F16") return GGML_TYPE_F16;
+    if (s == "f32" || s == "fp32" || s == "F32") return GGML_TYPE_F32;
+    std::cerr << flag << ": unknown cache type '" << s << "' (expected f16 or f32)\n";
+    std::exit(1);
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
     std::string model_path, prompt, out_dir;
+    ggml_type type_k = GGML_TYPE_F16;
+    ggml_type type_v = GGML_TYPE_F16;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--model" && i + 1 < argc)        model_path = argv[++i];
         else if (a == "--prompt" && i + 1 < argc)  prompt = argv[++i];
         else if (a == "--out-dir" && i + 1 < argc) out_dir = argv[++i];
+        else if (a == "--cache-type-k" && i + 1 < argc) type_k = parseCacheType(argv[++i], "--cache-type-k");
+        else if (a == "--cache-type-v" && i + 1 < argc) type_v = parseCacheType(argv[++i], "--cache-type-v");
         else if (a == "-h" || a == "--help")       { usage(); return 0; }
         else { usage(); return 1; }
     }
@@ -231,8 +251,14 @@ int main(int argc, char** argv) {
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = 2048;
+    cparams.type_k = type_k;
+    cparams.type_v = type_v;
     cparams.cb_eval = dumpCallback;
     cparams.cb_eval_user_data = &cb_data;
+    std::cerr << "[config] cache_type_k="
+              << (type_k == GGML_TYPE_F16 ? "f16" : "f32")
+              << " cache_type_v="
+              << (type_v == GGML_TYPE_F16 ? "f16" : "f32") << "\n";
 
     llama_context* ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
