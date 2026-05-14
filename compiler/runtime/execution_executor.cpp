@@ -246,20 +246,25 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         }
     }
 
-    // === Fusion + GPU-residency state ===
-    // Open iff MetalExecutor::Instance().hasFusionWindow() returns true.
-    // window_outputs maps output tensor name -> {pool buffer, host_dst,
-    // element_count, needs_host}. A node whose input is in window_outputs
+    // === Forward-pass CB + GPU-residency state ===
+    // Open iff MetalExecutor::Instance().hasForwardPassCB() returns true.
+    // (Naming: this used to be a per-fusion-window CB; commit-A renamed it
+    // to "forward pass" to match the eventual scope of one CB per
+    // executor.run() call. Today the CB still flushes on the first
+    // non-fusable op encountered; later commits add encode entry points
+    // for those ops so the CB stays open for the entire forward pass.)
+    // pass_outputs maps output tensor name -> {pool buffer, host_dst,
+    // element_count, needs_host}. A node whose input is in pass_outputs
     // can read directly from the GPU buffer (FromBuffer variant);
     // otherwise reads via host vec (FromHost variant).
     const bool fuse_layer = fuseLayerEnabled();
-    struct WindowOutput {
+    struct PassOutput {
         void* buffer = nullptr;          // id<MTLBuffer>, opaque
         std::vector<float>* host_dst = nullptr;
         size_t element_count = 0;
         bool needs_host = false;
     };
-    std::unordered_map<std::string, WindowOutput> window_outputs;
+    std::unordered_map<std::string, PassOutput> pass_outputs;
 
     // Pre-analysis: compute (a) per-tensor element count for fusable
     // producers and (b) per-tensor needs_host_output flag. needs_host=true
@@ -519,18 +524,18 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
     }
 
     auto flushWindow = [&]() {
-        if (MetalExecutor::Instance().hasFusionWindow()) {
-            MetalExecutor::Instance().flushFusionWindow();
+        if (MetalExecutor::Instance().hasForwardPassCB()) {
+            MetalExecutor::Instance().flushForwardPassCB();
         }
-        window_outputs.clear();
+        pass_outputs.clear();
     };
     // RAII discard on abnormal exit (exception): drop the window without
     // committing. Normal close path is flushWindow() called explicitly
     // below before each non-fusable node and once after the loop.
     struct WindowDiscardGuard {
         ~WindowDiscardGuard() {
-            if (MetalExecutor::Instance().hasFusionWindow()) {
-                MetalExecutor::Instance().discardFusionWindow();
+            if (MetalExecutor::Instance().hasForwardPassCB()) {
+                MetalExecutor::Instance().discardForwardPassCB();
             }
         }
     } discard_guard;
@@ -562,7 +567,7 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         // Fusion decision. A node is "fusable" if MLC_FUSE_LAYER is set,
         // it's a supported op type, and it dispatches to Metal. For
         // fusable nodes we open a window, checkout an output buffer from
-        // the pool, look up any GPU-resident inputs from window_outputs,
+        // the pool, look up any GPU-resident inputs from pass_outputs,
         // and call backend.encode() with FusionInputs. Non-fusable nodes
         // force a window flush (drains any pending readbacks) then run
         // synchronously via execute().
@@ -592,8 +597,8 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             flushWindow();
         } else {
             // Open window if needed.
-            if (!MetalExecutor::Instance().hasFusionWindow()) {
-                if (!MetalExecutor::Instance().beginFusionWindow()) {
+            if (!MetalExecutor::Instance().hasForwardPassCB()) {
+                if (!MetalExecutor::Instance().beginForwardPassCB()) {
                     fusable = false;
                 }
             }
@@ -625,15 +630,15 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             // input 0 (input 1 is weight, fetched from session).
             FusionInputs fi;
             if (!node->inputs.empty() && !node->inputs[0].empty()) {
-                auto wit = window_outputs.find(node->inputs[0]);
-                if (wit != window_outputs.end()) {
+                auto wit = pass_outputs.find(node->inputs[0]);
+                if (wit != pass_outputs.end()) {
                     fi.primary_input_buffer = wit->second.buffer;
                     fi.primary_input_count = wit->second.element_count;
                 }
             }
             if (node->op == ExecOpType::Add && node->inputs.size() >= 2 && !node->inputs[1].empty()) {
-                auto wit = window_outputs.find(node->inputs[1]);
-                if (wit != window_outputs.end()) {
+                auto wit = pass_outputs.find(node->inputs[1]);
+                if (wit != pass_outputs.end()) {
                     fi.secondary_input_buffer = wit->second.buffer;
                     fi.secondary_input_count = wit->second.element_count;
                 }
@@ -658,18 +663,18 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
                 backend_result = backend.encode(*node, context_, descriptor, fi);
                 if (!backend_result.success) {
                     // Encode rejected. The output buffer is still in
-                    // window_checked_out_ and will be returned at flush;
+                    // pass_checked_out_ and will be returned at flush;
                     // host_dst is allocated and execute() will repopulate
                     // via context->setTensor (which replaces the entry).
                     flushWindow();
                     backend_result = backend.execute(*node, context_, descriptor);
                 } else {
-                    WindowOutput wo;
+                    PassOutput wo;
                     wo.buffer = out_buf;
                     wo.host_dst = &host_dst;
                     wo.element_count = output_count;
                     wo.needs_host = needs_host;
-                    window_outputs[node->outputs[0]] = wo;
+                    pass_outputs[node->outputs[0]] = wo;
                 }
             }
         } else {
@@ -870,7 +875,7 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             for (const auto& output : node->outputs) {
                 if (!output.empty()
                     && context_->isTapped(output)
-                    && window_outputs.count(output)) {
+                    && pass_outputs.count(output)) {
                     needs_flush_for_tap = true;
                     break;
                 }

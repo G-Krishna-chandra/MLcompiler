@@ -1687,7 +1687,7 @@ BackendExecutionResult MetalExecutionBackend::encode(const ExecutionNode& node,
     if (!context) {
         result.success = false; result.message = "encode: no context"; return result;
     }
-    if (!MetalExecutor::Instance().hasFusionWindow()) {
+    if (!MetalExecutor::Instance().hasForwardPassCB()) {
         result.success = false; result.message = "encode: no fusion window open"; return result;
     }
     if (!fusion.output_buffer || !fusion.host_dst) {

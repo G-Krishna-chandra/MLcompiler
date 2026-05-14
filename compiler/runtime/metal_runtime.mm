@@ -1452,26 +1452,26 @@ struct MetalExecutor::Impl {
     mutable size_t cache_bytes_ = 0;
 
     // === Deferred-commit fusion window state ===
-    // Active iff open_fusion_cb_ != nil. Single-threaded by construction —
+    // Active iff open_forward_pass_cb_ != nil. Single-threaded by construction —
     // the executor opens at most one window at a time on its run() thread.
     //
-    // The "fusion_retained_" vector holds strong refs to transient
+    // The "pass_retained_" vector holds strong refs to transient
     // MTLBuffers (input uploads via newBufferWithBytes for the FromHost
     // path) that must outlive the encode call but only until commit. The
     // pool (intermediate buffer pool below) owns longer-lived output
-    // buffers that carry between ops within a window. window_checked_out_
+    // buffers that carry between ops within a window. pass_checked_out_
     // tracks pool buffers in use by the current window so flush can return
     // them all at once.
-    mutable id<MTLCommandBuffer> open_fusion_cb_ = nil;
-    mutable std::vector<id> fusion_retained_;
-    mutable std::vector<id<MTLBuffer>> window_checked_out_;
+    mutable id<MTLCommandBuffer> open_forward_pass_cb_ = nil;
+    mutable std::vector<id> pass_retained_;
+    mutable std::vector<id<MTLBuffer>> pass_checked_out_;
 
     struct PendingReadback {
         id<MTLBuffer> source;
         std::vector<float>* dst;
         size_t byte_count;
     };
-    mutable std::vector<PendingReadback> fusion_readbacks_;
+    mutable std::vector<PendingReadback> pass_readbacks_;
 
     // === Intermediate buffer pool ===
     // Four size classes cover TinyLlama Q4_0 cleanly:
@@ -1528,7 +1528,7 @@ struct MetalExecutor::Impl {
         rb.source = out_buf;
         rb.dst = host_dst;
         rb.byte_count = byte_count;
-        fusion_readbacks_.push_back(rb);
+        pass_readbacks_.push_back(rb);
     }
 
     id<MTLBuffer> getOrCacheWeight(const std::string& name,
@@ -4544,76 +4544,76 @@ std::string MetalExecutor::weightCacheSummary() const {
     return oss.str();
 }
 
-bool MetalExecutor::hasFusionWindow() const {
+bool MetalExecutor::hasForwardPassCB() const {
 #if defined(__APPLE__)
-    return impl_ && impl_->open_fusion_cb_ != nil;
+    return impl_ && impl_->open_forward_pass_cb_ != nil;
 #else
     return false;
 #endif
 }
 
-bool MetalExecutor::beginFusionWindow() const {
+bool MetalExecutor::beginForwardPassCB() const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available()) return false;
-    if (impl_->open_fusion_cb_ != nil) return true;  // already open, idempotent
+    if (impl_->open_forward_pass_cb_ != nil) return true;  // already open, idempotent
     if (@available(macOS 11.0, *)) {
-        impl_->open_fusion_cb_ = [impl_->queue commandBuffer];
-        return impl_->open_fusion_cb_ != nil;
+        impl_->open_forward_pass_cb_ = [impl_->queue commandBuffer];
+        return impl_->open_forward_pass_cb_ != nil;
     }
 #endif
     return false;
 }
 
-bool MetalExecutor::flushFusionWindow() const {
+bool MetalExecutor::flushForwardPassCB() const {
 #if defined(__APPLE__)
-    if (!impl_ || impl_->open_fusion_cb_ == nil) {
+    if (!impl_ || impl_->open_forward_pass_cb_ == nil) {
         // No open CB but possibly still some pool buffers to return / pending
         // readbacks to drain — defensive cleanup.
         if (impl_) {
-            for (id<MTLBuffer> buf : impl_->window_checked_out_) impl_->poolReturn(buf);
-            impl_->window_checked_out_.clear();
-            impl_->fusion_readbacks_.clear();
-            impl_->fusion_retained_.clear();
+            for (id<MTLBuffer> buf : impl_->pass_checked_out_) impl_->poolReturn(buf);
+            impl_->pass_checked_out_.clear();
+            impl_->pass_readbacks_.clear();
+            impl_->pass_retained_.clear();
         }
         return true;
     }
-    [impl_->open_fusion_cb_ commit];
-    [impl_->open_fusion_cb_ waitUntilCompleted];
-    bool ok = impl_->open_fusion_cb_.status == MTLCommandBufferStatusCompleted;
+    [impl_->open_forward_pass_cb_ commit];
+    [impl_->open_forward_pass_cb_ waitUntilCompleted];
+    bool ok = impl_->open_forward_pass_cb_.status == MTLCommandBufferStatusCompleted;
     // Drain pending host memcpys (pool output buffer -> host vector) only
     // for outputs whose needs_host flag is true. Outputs flagged
     // needs_host=false stay GPU-resident and would have already been
     // consumed by a downstream encoded op via its FromBuffer variant.
-    for (const auto& rb : impl_->fusion_readbacks_) {
+    for (const auto& rb : impl_->pass_readbacks_) {
         if (rb.source && rb.dst) {
             std::memcpy(rb.dst->data(), [rb.source contents], rb.byte_count);
         }
     }
-    impl_->fusion_readbacks_.clear();
+    impl_->pass_readbacks_.clear();
     // Return all pool buffers checked out by this window.
-    for (id<MTLBuffer> buf : impl_->window_checked_out_) impl_->poolReturn(buf);
-    impl_->window_checked_out_.clear();
+    for (id<MTLBuffer> buf : impl_->pass_checked_out_) impl_->poolReturn(buf);
+    impl_->pass_checked_out_.clear();
     // Transient (non-pool) retained buffers — input uploads via
     // newBufferWithBytes, weight uploads — can be released now.
-    impl_->fusion_retained_.clear();
-    impl_->open_fusion_cb_ = nil;
+    impl_->pass_retained_.clear();
+    impl_->open_forward_pass_cb_ = nil;
     return ok;
 #else
     return true;
 #endif
 }
 
-void MetalExecutor::discardFusionWindow() const {
+void MetalExecutor::discardForwardPassCB() const {
 #if defined(__APPLE__)
     if (!impl_) return;
     // Safe to drop without commit: Metal's explicit-commit API keeps the
     // buffer in MTLCommandBufferStatusNotEnqueued state until commit() is
     // called. If we adopt async scheduling, revisit.
-    for (id<MTLBuffer> buf : impl_->window_checked_out_) impl_->poolReturn(buf);
-    impl_->window_checked_out_.clear();
-    impl_->fusion_readbacks_.clear();
-    impl_->fusion_retained_.clear();
-    impl_->open_fusion_cb_ = nil;
+    for (id<MTLBuffer> buf : impl_->pass_checked_out_) impl_->poolReturn(buf);
+    impl_->pass_checked_out_.clear();
+    impl_->pass_readbacks_.clear();
+    impl_->pass_retained_.clear();
+    impl_->open_forward_pass_cb_ = nil;
 #endif
 }
 
@@ -4622,13 +4622,13 @@ void* MetalExecutor::checkoutPoolBuffer(size_t bytes) const {
     if (!impl_) return nullptr;
     id<MTLBuffer> buf = impl_->poolCheckout(bytes);
     if (!buf) return nullptr;
-    // Atomically transfer the strong reference into window_checked_out_
+    // Atomically transfer the strong reference into pass_checked_out_
     // so the buffer survives the C++ void* round-trip back to the caller.
-    // The (__bridge void*) cast is unretained; window_checked_out_'s
+    // The (__bridge void*) cast is unretained; pass_checked_out_'s
     // std::vector<id<MTLBuffer>> is the actual owner under ARC. Without
     // this, the local `buf` would drop on function return and the void*
     // would point at freed memory by the time the caller used it.
-    impl_->window_checked_out_.push_back(buf);
+    impl_->pass_checked_out_.push_back(buf);
     return (__bridge void*)buf;
 #else
     (void)bytes;
@@ -4659,7 +4659,7 @@ bool MetalExecutor::encodeMatMulQ4_0FromHost(const std::string& weight_name,
                                              bool needs_host) const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available() || !impl_->q4MatmulPipeline) return false;
-    if (impl_->open_fusion_cb_ == nil) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
     if (host_input.size() != cols) return false;
     if (weights.size() < row_stride * rows) return false;
     if (!output_buffer) return false;
@@ -4670,7 +4670,7 @@ bool MetalExecutor::encodeMatMulQ4_0FromHost(const std::string& weight_name,
                                                               options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!weightBuffer || !inputBuffer) return false;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_fusion_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
         [encoder setComputePipelineState:impl_->q4MatmulPipeline];
         [encoder setBuffer:weightBuffer offset:0 atIndex:0];
@@ -4688,7 +4688,7 @@ bool MetalExecutor::encodeMatMulQ4_0FromHost(const std::string& weight_name,
         [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
         [encoder endEncoding];
-        impl_->fusion_retained_.push_back(inputBuffer);
+        impl_->pass_retained_.push_back(inputBuffer);
         impl_->recordReadback(outBuf, host_dst, rows * sizeof(float), needs_host);
         return true;
     }
@@ -4711,7 +4711,7 @@ bool MetalExecutor::encodeMatMulQ4_0FromBuffer(const std::string& weight_name,
                                                bool needs_host) const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available() || !impl_->q4MatmulPipeline) return false;
-    if (impl_->open_fusion_cb_ == nil) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
     if (input_count != cols) return false;
     if (weights.size() < row_stride * rows) return false;
     if (!input_buffer || !output_buffer) return false;
@@ -4720,7 +4720,7 @@ bool MetalExecutor::encodeMatMulQ4_0FromBuffer(const std::string& weight_name,
         id<MTLBuffer> inputBuf = (__bridge id<MTLBuffer>)input_buffer;
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!weightBuffer) return false;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_fusion_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
         [encoder setComputePipelineState:impl_->q4MatmulPipeline];
         [encoder setBuffer:weightBuffer offset:0 atIndex:0];
@@ -4756,7 +4756,7 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
                                           bool needs_host) const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available() || !impl_->normPipeline) return false;
-    if (impl_->open_fusion_cb_ == nil) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
     if (host_input.size() != weight.size() || host_input.empty()) return false;
     if (host_input.size() > std::numeric_limits<uint32_t>::max()) return false;
     if (!output_buffer) return false;
@@ -4770,7 +4770,7 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
                                                           options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!inBuffer || !wBuffer) return false;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_fusion_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
         [encoder setComputePipelineState:impl_->normPipeline];
         [encoder setBuffer:inBuffer offset:0 atIndex:0];
@@ -4783,8 +4783,8 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
         [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         [encoder endEncoding];
-        impl_->fusion_retained_.push_back(inBuffer);
-        impl_->fusion_retained_.push_back(wBuffer);
+        impl_->pass_retained_.push_back(inBuffer);
+        impl_->pass_retained_.push_back(wBuffer);
         impl_->recordReadback(outBuf, host_dst, bytes, needs_host);
         return true;
     }
@@ -4803,7 +4803,7 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
                                             bool needs_host) const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available() || !impl_->normPipeline) return false;
-    if (impl_->open_fusion_cb_ == nil) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
     if (input_count != weight.size() || input_count == 0) return false;
     if (input_count > std::numeric_limits<uint32_t>::max()) return false;
     if (!input_buffer || !output_buffer) return false;
@@ -4815,7 +4815,7 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
                                                           options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!wBuffer) return false;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_fusion_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
         [encoder setComputePipelineState:impl_->normPipeline];
         [encoder setBuffer:inBuf offset:0 atIndex:0];
@@ -4828,7 +4828,7 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
         [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         [encoder endEncoding];
-        impl_->fusion_retained_.push_back(wBuffer);
+        impl_->pass_retained_.push_back(wBuffer);
         impl_->recordReadback(outBuf, host_dst, bytes, needs_host);
         return true;
     }
@@ -4855,7 +4855,7 @@ bool MetalExecutor::encodeAddMixed(const std::vector<float>* host_a, void* buffe
                                    bool needs_host) const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available() || !impl_->addPipeline) return false;
-    if (impl_->open_fusion_cb_ == nil) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
     if (element_count == 0) return false;
     if (element_count > std::numeric_limits<uint32_t>::max()) return false;
     if (!output_buffer) return false;
@@ -4871,7 +4871,7 @@ bool MetalExecutor::encodeAddMixed(const std::vector<float>* host_a, void* buffe
                                                               length:bytes
                                                              options:MTLResourceStorageModeShared];
             if (!upload) return false;
-            impl_->fusion_retained_.push_back(upload);
+            impl_->pass_retained_.push_back(upload);
             aBuf = upload;
         } else {
             aBuf = (__bridge id<MTLBuffer>)buffer_a;
@@ -4882,13 +4882,13 @@ bool MetalExecutor::encodeAddMixed(const std::vector<float>* host_a, void* buffe
                                                               length:bytes
                                                              options:MTLResourceStorageModeShared];
             if (!upload) return false;
-            impl_->fusion_retained_.push_back(upload);
+            impl_->pass_retained_.push_back(upload);
             bBuf = upload;
         } else {
             bBuf = (__bridge id<MTLBuffer>)buffer_b;
         }
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_fusion_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
         [encoder setComputePipelineState:impl_->addPipeline];
         [encoder setBuffer:aBuf offset:0 atIndex:0];

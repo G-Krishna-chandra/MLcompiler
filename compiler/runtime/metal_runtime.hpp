@@ -170,21 +170,21 @@ public:
     std::string weightCacheSummary() const;
 
     // === Deferred-commit fusion window ===
-    // Open a window with beginFusionWindow(), encode supported ops onto its
+    // Open a window with beginForwardPassCB(), encode supported ops onto its
     // shared MTLCommandBuffer with encodeMatMulQ4_0 / encodeRmsNorm /
-    // encodeAdd, then either flushFusionWindow() (commit + wait + drain
-    // pending host memcpys + clear retention) or discardFusionWindow()
+    // encodeAdd, then either flushForwardPassCB() (commit + wait + drain
+    // pending host memcpys + clear retention) or discardForwardPassCB()
     // (drop without commit on abnormal exit). Always callable on non-Metal
     // builds — returns false for begin/encode and is a no-op for
     // flush/discard.
-    bool beginFusionWindow() const;
-    bool hasFusionWindow() const;
-    bool flushFusionWindow() const;
-    void discardFusionWindow() const;
+    bool beginForwardPassCB() const;
+    bool hasForwardPassCB() const;
+    bool flushForwardPassCB() const;
+    void discardForwardPassCB() const;
 
-    // Encode entry points. Each requires hasFusionWindow() == true.
+    // Encode entry points. Each requires hasForwardPassCB() == true.
     // Output is always a pool-checked-out MTLBuffer (opaque void*; backed
-    // by id<MTLBuffer> with ARC strong retention through window_checked_out_).
+    // by id<MTLBuffer> with ARC strong retention through pass_checked_out_).
     // The host_dst vector is the eventual host destination — its address is
     // captured for the flush drain; it must outlive the window. If
     // needs_host is true, flush memcpys outBuffer contents into *host_dst;
@@ -247,9 +247,9 @@ public:
     // next size class internally. Returned pointer is opaque (id<MTLBuffer>
     // bridged); the executor must record it in its window state so that
     // returnPoolBuffer is called at flush time. ARC strong retention is
-    // maintained by Impl's window_checked_out_ vector.
+    // maintained by Impl's pass_checked_out_ vector.
     void* checkoutPoolBuffer(size_t bytes) const;
-    void  trackWindowBuffer(void* buffer) const;  // adds to window_checked_out_
+    void  trackWindowBuffer(void* buffer) const;  // adds to pass_checked_out_
 
     // Capability helpers (Metal availability of specific kernels).
     bool hasBiasAddKernel() const;
