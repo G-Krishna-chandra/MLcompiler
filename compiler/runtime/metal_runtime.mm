@@ -1193,6 +1193,18 @@ struct FlashAttnParams {
     uint debug_dump;        // 0 or 1; when 1, qk_out/sm_out are written
     uint apply_causal;      // 0 or 1; when 1, mask scores for kv_pos > q_position
     uint q_position;        // for q_seq=1, the kv position of the active query
+    // K and V stride parameters. Address of (token=s, kv_head=kv, dim=d) is:
+    //   base + s * stride_token + kv * stride_kv_head + d * stride_feature
+    // Harness layout [kv_seq, kv_heads, head_dim]:
+    //   stride_token = kv_heads * head_dim, stride_kv_head = head_dim, stride_feature = 1
+    // Production cache layout [kv_heads, context_length, head_dim]:
+    //   stride_token = head_dim, stride_kv_head = context_length * head_dim, stride_feature = 1
+    uint k_stride_token;
+    uint k_stride_kv_head;
+    uint k_stride_feature;
+    uint v_stride_token;
+    uint v_stride_kv_head;
+    uint v_stride_feature;
 };
 
 constant uint FLASH_TILE_SIZE = 32u;
@@ -1235,11 +1247,20 @@ kernel void flash_attention_v1(
         uint tile_n = (S - tile_start < T) ? (S - tile_start) : T;
 
         // Cooperative load: each thread loads its column (feature dim t)
-        // across all positions in the tile.
+        // across all positions in the tile. K and V address calc uses the
+        // explicit per-axis strides so the same kernel works for the
+        // harness's [kv_seq, kv_heads, head_dim] layout and the production
+        // KV cache's [kv_heads, context_length, head_dim] layout.
         for (uint i = 0u; i < tile_n; ++i) {
             uint kv_pos = tile_start + i;
-            tile_K[i * D + t] = K[kv_pos * params.kv_heads * D + kv * D + t];
-            tile_V[i * D + t] = V[kv_pos * params.kv_heads * D + kv * D + t];
+            uint k_idx = kv_pos * params.k_stride_token
+                       + kv * params.k_stride_kv_head
+                       + t * params.k_stride_feature;
+            uint v_idx = kv_pos * params.v_stride_token
+                       + kv * params.v_stride_kv_head
+                       + t * params.v_stride_feature;
+            tile_K[i * D + t] = K[k_idx];
+            tile_V[i * D + t] = V[v_idx];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -4075,14 +4096,16 @@ bool matmulQ4_K(const std::string& weight_name,
     // dumps post-Q·K scores and post-softmax weights into them for harness
     // sub-step parity reporting.
     bool flashAttention(const std::vector<float>& q,
-                        const std::vector<float>& k,
-                        const std::vector<float>& v,
+                        const float* k_data, size_t k_size,
+                        const float* v_data, size_t v_size,
                         size_t num_heads,
                         size_t kv_heads,
                         size_t head_dim,
                         size_t kv_seq,
                         bool apply_causal,
                         size_t q_position,
+                        size_t k_stride_token, size_t k_stride_kv_head, size_t k_stride_feature,
+                        size_t v_stride_token, size_t v_stride_kv_head, size_t v_stride_feature,
                         std::vector<float>& output,
                         std::vector<float>* qk_debug,
                         std::vector<float>* sm_debug) const {
@@ -4094,9 +4117,11 @@ bool matmulQ4_K(const std::string& weight_name,
         // head_dim must be a power of 2 (tree reduction assumption).
         if ((head_dim & (head_dim - 1)) != 0) return false;
         size_t q_per = num_heads * head_dim;
-        size_t kv_per = effective_kv_heads * head_dim;
         if (q.size() != q_per) return false;
-        if (k.size() != kv_seq * kv_per || v.size() != kv_seq * kv_per) return false;
+        // K/V sizes depend on the layout. Caller passes both pointer and
+        // total size so the kernel can bind the right buffer length.
+        if (k_data == nullptr || v_data == nullptr) return false;
+        if (k_size == 0 || v_size == 0) return false;
 
         // TG memory layout must match the kernel's. Tile size hard-coded to 32
         // here and in the kernel (`FLASH_TILE_SIZE`); they're a paired constant.
@@ -4119,11 +4144,11 @@ bool matmulQ4_K(const std::string& weight_name,
                 id<MTLBuffer> qBuf = [device newBufferWithBytes:q.data()
                                                           length:q.size() * sizeof(float)
                                                          options:MTLResourceStorageModeShared];
-                id<MTLBuffer> kBuf = [device newBufferWithBytes:k.data()
-                                                          length:k.size() * sizeof(float)
+                id<MTLBuffer> kBuf = [device newBufferWithBytes:k_data
+                                                          length:k_size * sizeof(float)
                                                          options:MTLResourceStorageModeShared];
-                id<MTLBuffer> vBuf = [device newBufferWithBytes:v.data()
-                                                          length:v.size() * sizeof(float)
+                id<MTLBuffer> vBuf = [device newBufferWithBytes:v_data
+                                                          length:v_size * sizeof(float)
                                                          options:MTLResourceStorageModeShared];
                 id<MTLBuffer> oBuf = [device newBufferWithLength:output.size() * sizeof(float)
                                                           options:MTLResourceStorageModeShared];
@@ -4142,6 +4167,12 @@ bool matmulQ4_K(const std::string& weight_name,
                     uint32_t debug_dump;
                     uint32_t apply_causal;
                     uint32_t q_position;
+                    uint32_t k_stride_token;
+                    uint32_t k_stride_kv_head;
+                    uint32_t k_stride_feature;
+                    uint32_t v_stride_token;
+                    uint32_t v_stride_kv_head;
+                    uint32_t v_stride_feature;
                 } params;
                 params.num_heads = static_cast<uint32_t>(num_heads);
                 params.kv_heads = static_cast<uint32_t>(effective_kv_heads);
@@ -4151,6 +4182,12 @@ bool matmulQ4_K(const std::string& weight_name,
                 params.debug_dump = dump ? 1u : 0u;
                 params.apply_causal = apply_causal ? 1u : 0u;
                 params.q_position = static_cast<uint32_t>(q_position);
+                params.k_stride_token = static_cast<uint32_t>(k_stride_token);
+                params.k_stride_kv_head = static_cast<uint32_t>(k_stride_kv_head);
+                params.k_stride_feature = static_cast<uint32_t>(k_stride_feature);
+                params.v_stride_token = static_cast<uint32_t>(v_stride_token);
+                params.v_stride_kv_head = static_cast<uint32_t>(v_stride_kv_head);
+                params.v_stride_feature = static_cast<uint32_t>(v_stride_feature);
 
                 id<MTLCommandBuffer> cb = [queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -4182,8 +4219,11 @@ bool matmulQ4_K(const std::string& weight_name,
             }
         }
 #endif
-        (void)q; (void)k; (void)v; (void)num_heads; (void)kv_heads;
-        (void)head_dim; (void)kv_seq; (void)apply_causal; (void)q_position;
+        (void)q; (void)k_data; (void)k_size; (void)v_data; (void)v_size;
+        (void)num_heads; (void)kv_heads; (void)head_dim; (void)kv_seq;
+        (void)apply_causal; (void)q_position;
+        (void)k_stride_token; (void)k_stride_kv_head; (void)k_stride_feature;
+        (void)v_stride_token; (void)v_stride_kv_head; (void)v_stride_feature;
         (void)output; (void)qk_debug; (void)sm_debug;
         return false;
     }
@@ -5003,9 +5043,40 @@ bool MetalExecutor::runFlashAttention(const std::vector<float>& q,
                                        std::vector<float>* qk_debug,
                                        std::vector<float>* sm_debug) const {
     if (!impl_) return false;
-    return impl_->flashAttention(q, k, v, num_heads, kv_heads, head_dim,
-                                 kv_seq, apply_causal, q_position,
+    // Harness layout: K/V are [kv_seq, kv_heads, head_dim] token-major.
+    size_t effective_kv_heads = kv_heads > 0 ? kv_heads : num_heads;
+    size_t k_stride_token = effective_kv_heads * head_dim;
+    size_t k_stride_kv_head = head_dim;
+    size_t k_stride_feature = 1;
+    return impl_->flashAttention(q, k.data(), k.size(), v.data(), v.size(),
+                                 num_heads, kv_heads, head_dim, kv_seq,
+                                 apply_causal, q_position,
+                                 k_stride_token, k_stride_kv_head, k_stride_feature,
+                                 k_stride_token, k_stride_kv_head, k_stride_feature,
                                  output, qk_debug, sm_debug);
+}
+
+bool MetalExecutor::runFlashAttentionStrided(const std::vector<float>& q,
+                                              const float* k_data, size_t k_size,
+                                              const float* v_data, size_t v_size,
+                                              size_t num_heads,
+                                              size_t kv_heads,
+                                              size_t head_dim,
+                                              size_t kv_seq,
+                                              bool apply_causal,
+                                              size_t q_position,
+                                              size_t k_stride_token,
+                                              size_t k_stride_kv_head,
+                                              size_t v_stride_token,
+                                              size_t v_stride_kv_head,
+                                              std::vector<float>& output) const {
+    if (!impl_) return false;
+    return impl_->flashAttention(q, k_data, k_size, v_data, v_size,
+                                 num_heads, kv_heads, head_dim, kv_seq,
+                                 apply_causal, q_position,
+                                 k_stride_token, k_stride_kv_head, 1,
+                                 v_stride_token, v_stride_kv_head, 1,
+                                 output, nullptr, nullptr);
 }
 
 bool MetalExecutor::hasFeedForwardKernel() const {

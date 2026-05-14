@@ -335,6 +335,25 @@ public:
                             std::vector<float>* qk_debug = nullptr,
                             std::vector<float>* sm_debug = nullptr) const;
 
+    // Strided variant for the production path. Callers pass K/V from a
+    // non-contiguous buffer (e.g., the persistent KV cache laid out as
+    // [kv_heads, context_length, head_dim]) plus the per-axis strides
+    // measured in floats. Feature stride is assumed to be 1.
+    bool runFlashAttentionStrided(const std::vector<float>& q,
+                                   const float* k_data, size_t k_size,
+                                   const float* v_data, size_t v_size,
+                                   size_t num_heads,
+                                   size_t kv_heads,
+                                   size_t head_dim,
+                                   size_t kv_seq,
+                                   bool apply_causal,
+                                   size_t q_position,
+                                   size_t k_stride_token,
+                                   size_t k_stride_kv_head,
+                                   size_t v_stride_token,
+                                   size_t v_stride_kv_head,
+                                   std::vector<float>& output) const;
+
     bool ensureSharedBuffer(std::vector<float>& data, MetalBufferHandle& handle) const;
     void releaseBuffer(MetalBufferHandle& handle) const;
     void markHostModified(MetalBufferHandle& handle,
