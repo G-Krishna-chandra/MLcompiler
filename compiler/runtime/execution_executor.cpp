@@ -1,5 +1,7 @@
 #include "runtime/execution_executor.hpp"
 
+#include "frontends/ggml_types.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -244,21 +246,281 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         }
     }
 
-    // === Fusion window state ===
+    // === Fusion + GPU-residency state ===
     // Open iff MetalExecutor::Instance().hasFusionWindow() returns true.
-    // tensors_produced_in_window holds output names of every node encoded
-    // into the current window — cleared on every flush. The set is the
-    // dependency-tracking mechanism that keeps deferred-commit correct:
-    // if any of the next node's inputs is in the set, we must flush before
-    // encoding/executing it, because that tensor's host vec is still
-    // un-populated until the current command buffer commits.
+    // window_outputs maps output tensor name -> {pool buffer, host_dst,
+    // element_count, needs_host}. A node whose input is in window_outputs
+    // can read directly from the GPU buffer (FromBuffer variant);
+    // otherwise reads via host vec (FromHost variant).
     const bool fuse_layer = fuseLayerEnabled();
-    std::unordered_set<std::string> tensors_produced_in_window;
+    struct WindowOutput {
+        void* buffer = nullptr;          // id<MTLBuffer>, opaque
+        std::vector<float>* host_dst = nullptr;
+        size_t element_count = 0;
+        bool needs_host = false;
+    };
+    std::unordered_map<std::string, WindowOutput> window_outputs;
+
+    // Pre-analysis: compute (a) per-tensor element count for fusable
+    // producers and (b) per-tensor needs_host_output flag. needs_host=true
+    // forces a host memcpy at flush; needs_host=false lets the buffer stay
+    // in the pool and be consumed by a later FromBuffer encode.
+    //
+    // needs_host rule: a tensor needs host materialization if any consumer
+    // is non-fusable (CPU op, non-fusable Metal op, or fusable op that
+    // happens AFTER a non-fusable op in topo order — that mid-block flush
+    // would have already returned the buffer to the pool), or if it's a
+    // tap target, or if it has no consumers (final output).
+    std::unordered_map<std::string, size_t> tensor_count;
+    std::unordered_map<std::string, bool> tensor_needs_host;
+    // Predicate must MIRROR what backend.encode() actually accepts. If
+    // pre-analysis thinks an op is fusable but encode() rejects it at
+    // runtime, the executor falls back to execute() — and execute()
+    // reads inputs from context host vecs. If the predecessor was marked
+    // needs_host=false because its consumer was thought fusable, the
+    // host vec stays at the allocateTensor zero placeholder and execute()
+    // reads zeros. Caught with lm_head (Q6_K matmul rejected at the
+    // dtype gate in encode()).
+    auto encodeWillAccept = [&](const ExecutionNode* n) -> bool {
+        if (!n) return false;
+        switch (n->op) {
+            case ExecOpType::MatMul:
+            case ExecOpType::Linear: {
+                // Encode requires Q4_0 weight, no bias, non-transposed shape.
+                auto wit = n->annotations.find("weight");
+                if (wit == n->annotations.end()) return false;
+                if (!context_) return false;
+                const auto& tensors = context_->session().loader().tensors();
+                auto t = tensors.find(wit->second);
+                if (t == tensors.end() || t->second.shape.size() != 2) return false;
+                if (t->second.dtype != frontend::GGML_TYPE_Q4_0) return false;
+                if (n->annotations.count("bias")) return false;
+                return true;
+            }
+            case ExecOpType::Norm: {
+                // Encode requires RMS variety, no bias.
+                auto wit = n->annotations.find("weight");
+                if (wit == n->annotations.end()) return false;
+                auto nk = n->annotations.find("norm_kind");
+                if (nk != n->annotations.end() && nk->second == "layer") return false;
+                if (n->annotations.count("bias")) return false;
+                return true;
+            }
+            case ExecOpType::Add: {
+                if (n->annotations.count("bias")) return false;
+                return n->inputs.size() >= 2;
+            }
+            default: return false;
+        }
+    };
+    std::vector<bool> is_nonfusable;
+    is_nonfusable.reserve(order.size());
+    std::unordered_map<std::string, size_t> node_topo_pos;
+    for (size_t i = 0; i < order.size(); ++i) {
+        node_topo_pos[order[i]] = i;
+        auto it = node_lookup.find(order[i]);
+        if (it == node_lookup.end()) { is_nonfusable.push_back(true); continue; }
+        const auto* n = it->second;
+        bool fus = fuse_layer
+                && isFusableOp(n->op)
+                && n->backend == BackendKind::Metal
+                && MetalExecutor::Instance().shouldUseFor(*n)
+                && encodeWillAccept(n);
+        is_nonfusable.push_back(!fus);
+    }
+    // Prefix sum of is_nonfusable: nonfusable_prefix[i] = count in [0, i).
+    std::vector<size_t> nonfusable_prefix(order.size() + 1, 0);
+    for (size_t i = 0; i < order.size(); ++i) {
+        nonfusable_prefix[i+1] = nonfusable_prefix[i] + (is_nonfusable[i] ? 1 : 0);
+    }
+    // Per-tensor consumer positions.
+    std::unordered_map<std::string, std::vector<size_t>> tensor_consumers;
+    for (size_t ci = 0; ci < order.size(); ++ci) {
+        auto it = node_lookup.find(order[ci]);
+        if (it == node_lookup.end()) continue;
+        for (const auto& in : it->second->inputs) {
+            if (!in.empty()) tensor_consumers[in].push_back(ci);
+        }
+    }
+    // Fill tensor_count for fusable ops.
+    //
+    // For MatMul/Linear we read shape[1] (rows) from the weight tensor in
+    // the GGUF loader — this is the authoritative output dim, and notably
+    // is the only correct source for GQA outputs (graph_.tensors() stores a
+    // placeholder hidden_size for attn_k.out/attn_v.out, not the real
+    // [kv_heads * head_dim] count).
+    //
+    // For Norm/Add we read the graph tensor's stored shape, which IS
+    // reliable for these element-wise ops (single dim = hidden_size).
+    // We do NOT chain through n->inputs[0]'s tensor_count: residual_add
+    // nodes order their inputs as [residual_stream, new_addend] so input[0]
+    // is the stream — which for block 0 has no tensor_count (it's the
+    // embedding output, produced by a non-fusable op). Reading the graph
+    // shape avoids that input-order trap.
+    const auto& graph_tensors = graph_.tensors();
+    auto elementCountFromGraphShape = [&](const std::string& name) -> size_t {
+        auto git = graph_tensors.find(name);
+        if (git == graph_tensors.end()) return 0;
+        const auto& sh = git->second.shape;
+        if (sh.empty()) return 0;
+        size_t count = 1;
+        for (int64_t d : sh) count *= static_cast<size_t>(std::max<int64_t>(1, d));
+        return count;
+    };
+    for (size_t pi = 0; pi < order.size(); ++pi) {
+        auto it = node_lookup.find(order[pi]);
+        if (it == node_lookup.end()) continue;
+        const auto* n = it->second;
+        if (is_nonfusable[pi]) continue;
+        if (n->outputs.empty()) continue;
+        const auto& out = n->outputs[0];
+        if (out.empty()) continue;
+        size_t out_count = 0;
+        switch (n->op) {
+            case ExecOpType::MatMul:
+            case ExecOpType::Linear: {
+                auto wit = n->annotations.find("weight");
+                if (wit == n->annotations.end()) break;
+                if (!context_) break;
+                const auto& tensors = context_->session().loader().tensors();
+                auto t = tensors.find(wit->second);
+                if (t == tensors.end() || t->second.shape.size() != 2) break;
+                out_count = static_cast<size_t>(t->second.shape[1]);
+                break;
+            }
+            case ExecOpType::Norm:
+            case ExecOpType::Add: {
+                out_count = elementCountFromGraphShape(out);
+                if (out_count == 0) {
+                    // Belt + suspenders: if graph shape is missing, fall
+                    // back to searching ALL inputs for a known tensor_count.
+                    for (const auto& in : n->inputs) {
+                        if (in.empty()) continue;
+                        auto cit = tensor_count.find(in);
+                        if (cit != tensor_count.end()) { out_count = cit->second; break; }
+                    }
+                }
+                break;
+            }
+            default: break;
+        }
+        if (out_count > 0) tensor_count[out] = out_count;
+    }
+    // Compute needs_host per tensor produced by a fusable op.
+    for (size_t pi = 0; pi < order.size(); ++pi) {
+        auto it = node_lookup.find(order[pi]);
+        if (it == node_lookup.end()) continue;
+        const auto* n = it->second;
+        if (is_nonfusable[pi]) continue;
+        for (const auto& out : n->outputs) {
+            if (out.empty()) continue;
+            bool host = false;
+            auto cit = tensor_consumers.find(out);
+            if (cit == tensor_consumers.end() || cit->second.empty()) {
+                host = true;   // no consumers — final output, must materialize
+            } else {
+                for (size_t ci : cit->second) {
+                    // Any non-fusable at positions in (pi, ci] forces flush.
+                    if (ci > pi && nonfusable_prefix[ci+1] - nonfusable_prefix[pi+1] > 0) {
+                        host = true; break;
+                    }
+                }
+            }
+            if (!host && context_ && context_->isTapped(out)) host = true;
+            tensor_needs_host[out] = host;
+        }
+    }
+
+    // Pre-analysis dump for needs_host debugging. Writes one line per
+    // tensor in tensor_needs_host to stderr (or MLC_DUMP_PREANALYSIS=
+    // <path>) when set. Columns: name | needs_host | n_consumers |
+    // first_consumer_node | first_consumer_op | first_consumer_backend |
+    // first_consumer_fusable. Used to find pre-analysis bugs where a
+    // tensor classified needs_host=false actually has a host-vec
+    // reader downstream.
+    if (const char* env = std::getenv("MLC_DUMP_PREANALYSIS")) {
+        FILE* out = stderr;
+        FILE* opened = nullptr;
+        if (env[0] && env[0] != '1') {
+            opened = std::fopen(env, "w");
+            if (opened) out = opened;
+        }
+        std::fprintf(out, "# pre-analysis dump: tensor | needs_host | n_consumers | first_consumer (node, op, backend, fusable)\n");
+        // Sort by topo position of producer so the dump reads in graph
+        // order — easier to find the breaking tensor.
+        std::vector<std::pair<size_t, std::string>> sorted;
+        sorted.reserve(tensor_needs_host.size());
+        for (const auto& kv : tensor_needs_host) {
+            size_t producer_pos = order.size();  // unknown -> sort at end
+            for (size_t pi = 0; pi < order.size(); ++pi) {
+                auto nit = node_lookup.find(order[pi]);
+                if (nit == node_lookup.end()) continue;
+                bool found = false;
+                for (const auto& o : nit->second->outputs) {
+                    if (o == kv.first) { found = true; break; }
+                }
+                if (found) { producer_pos = pi; break; }
+            }
+            sorted.emplace_back(producer_pos, kv.first);
+        }
+        std::sort(sorted.begin(), sorted.end());
+        for (const auto& [pos, name] : sorted) {
+            bool needs_host = tensor_needs_host[name];
+            const auto& consumers = tensor_consumers[name];
+            std::string first_node = "(none)";
+            std::string first_op = "-";
+            std::string first_backend = "-";
+            std::string first_fusable = "-";
+            if (!consumers.empty()) {
+                size_t ci = consumers.front();
+                if (ci < order.size()) {
+                    first_node = order[ci];
+                    auto cnit = node_lookup.find(order[ci]);
+                    if (cnit != node_lookup.end()) {
+                        first_op = toString(cnit->second->op);
+                        first_backend = toString(cnit->second->backend);
+                        first_fusable = is_nonfusable[ci] ? "no" : "yes";
+                    }
+                }
+            }
+            std::fprintf(out, "%-40s | needs_host=%-5s | n_cons=%zu | first=%s op=%s backend=%s fusable=%s",
+                         name.c_str(),
+                         needs_host ? "true" : "false",
+                         consumers.size(),
+                         first_node.c_str(),
+                         first_op.c_str(),
+                         first_backend.c_str(),
+                         first_fusable.c_str());
+            // For needs_host=false with multiple consumers, list them all
+            // so we can spot any consumer that's actually after a flush boundary.
+            if (!needs_host && consumers.size() > 1) {
+                std::fprintf(out, " | all_cons=[");
+                for (size_t ix = 0; ix < consumers.size(); ++ix) {
+                    size_t cj = consumers[ix];
+                    if (ix > 0) std::fprintf(out, ", ");
+                    if (cj < order.size()) {
+                        std::fprintf(out, "%s@pi=%zu", order[cj].c_str(), cj);
+                        auto cnit2 = node_lookup.find(order[cj]);
+                        if (cnit2 != node_lookup.end()) {
+                            std::fprintf(out, "(%s,%s)",
+                                         is_nonfusable[cj] ? "nonfusable" : "fusable",
+                                         toString(cnit2->second->op).c_str());
+                        }
+                    }
+                }
+                std::fprintf(out, "]");
+            }
+            std::fprintf(out, "\n");
+        }
+        std::fflush(out);
+        if (opened) std::fclose(opened);
+    }
+
     auto flushWindow = [&]() {
         if (MetalExecutor::Instance().hasFusionWindow()) {
             MetalExecutor::Instance().flushFusionWindow();
         }
-        tensors_produced_in_window.clear();
+        window_outputs.clear();
     };
     // RAII discard on abnormal exit (exception): drop the window without
     // committing. Normal close path is flushWindow() called explicitly
@@ -296,51 +558,92 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         const auto& backend = registry_->backendFor(node->backend);
 
         // Fusion decision. A node is "fusable" if MLC_FUSE_LAYER is set,
-        // it's a supported op type, and it dispatches to Metal (after
-        // forceCpu / availability checks). For fusable nodes: if any
-        // input is in the produced set, flush first; then ensure window
-        // is open; then call backend.encode(). For non-fusable nodes:
-        // unconditionally flush, then call backend.execute().
+        // it's a supported op type, and it dispatches to Metal. For
+        // fusable nodes we open a window, checkout an output buffer from
+        // the pool, look up any GPU-resident inputs from window_outputs,
+        // and call backend.encode() with FusionInputs. Non-fusable nodes
+        // force a window flush (drains any pending readbacks) then run
+        // synchronously via execute().
         bool fusable = fuse_layer
                     && isFusableOp(node->op)
                     && node->backend == BackendKind::Metal
                     && MetalExecutor::Instance().shouldUseFor(*node);
 
-        if (fusable) {
-            bool depends_on_window = false;
-            for (const auto& input : node->inputs) {
-                if (!input.empty() && tensors_produced_in_window.count(input)) {
-                    depends_on_window = true;
-                    break;
-                }
-            }
-            if (depends_on_window) {
-                flushWindow();
-            }
+        // Need the output count to checkout a pool buffer. If unknown,
+        // skip fusion for this node.
+        size_t output_count = 0;
+        if (fusable && !node->outputs.empty() && !node->outputs[0].empty()) {
+            auto cit = tensor_count.find(node->outputs[0]);
+            if (cit != tensor_count.end()) output_count = cit->second;
+        }
+        if (fusable && output_count == 0) {
+            fusable = false;
+        }
+
+        if (!fusable) {
+            flushWindow();
+        } else {
+            // Open window if needed.
             if (!MetalExecutor::Instance().hasFusionWindow()) {
                 if (!MetalExecutor::Instance().beginFusionWindow()) {
-                    fusable = false;  // Metal unavailable or queue failed
+                    fusable = false;
                 }
             }
-        } else {
-            flushWindow();
         }
 
         auto t_op_begin = std::chrono::steady_clock::now();
         BackendExecutionResult backend_result;
         if (fusable) {
-            backend_result = backend.encode(*node, context_, descriptor);
-            if (!backend_result.success) {
-                // Encode rejected the node (unsupported sub-case). Flush
-                // the window and fall back to synchronous execute().
+            // Look up input residency. For Add we may have two inputs that
+            // are independently GPU-or-host. For matmul/norm we only check
+            // input 0 (input 1 is weight, fetched from session).
+            FusionInputs fi;
+            if (!node->inputs.empty() && !node->inputs[0].empty()) {
+                auto wit = window_outputs.find(node->inputs[0]);
+                if (wit != window_outputs.end()) {
+                    fi.primary_input_buffer = wit->second.buffer;
+                    fi.primary_input_count = wit->second.element_count;
+                }
+            }
+            if (node->op == ExecOpType::Add && node->inputs.size() >= 2 && !node->inputs[1].empty()) {
+                auto wit = window_outputs.find(node->inputs[1]);
+                if (wit != window_outputs.end()) {
+                    fi.secondary_input_buffer = wit->second.buffer;
+                    fi.secondary_input_count = wit->second.element_count;
+                }
+            }
+            // Checkout output buffer and track for window-end return.
+            void* out_buf = MetalExecutor::Instance().checkoutPoolBuffer(output_count * sizeof(float));
+            if (!out_buf) {
+                // Pool checkout failed; fall back.
                 flushWindow();
                 backend_result = backend.execute(*node, context_, descriptor);
+                fusable = false;
             } else {
-                // Track outputs so a downstream node that reads them
-                // triggers a flush. CPU-fallback's outputs go to context
-                // directly so they don't need set tracking.
-                for (const auto& out : node->outputs) {
-                    if (!out.empty()) tensors_produced_in_window.insert(out);
+                MetalExecutor::Instance().trackWindowBuffer(out_buf);
+                // Stable host destination for drain.
+                std::vector<float>& host_dst =
+                    context_->allocateTensor(node->outputs[0], output_count, /*zero_initialize=*/false);
+                auto nh_it = tensor_needs_host.find(node->outputs[0]);
+                bool needs_host = (nh_it == tensor_needs_host.end()) ? true : nh_it->second;
+                fi.output_buffer = out_buf;
+                fi.host_dst = &host_dst;
+                fi.needs_host_output = needs_host;
+                backend_result = backend.encode(*node, context_, descriptor, fi);
+                if (!backend_result.success) {
+                    // Encode rejected. The output buffer is still in
+                    // window_checked_out_ and will be returned at flush;
+                    // host_dst is allocated and execute() will repopulate
+                    // via context->setTensor (which replaces the entry).
+                    flushWindow();
+                    backend_result = backend.execute(*node, context_, descriptor);
+                } else {
+                    WindowOutput wo;
+                    wo.buffer = out_buf;
+                    wo.host_dst = &host_dst;
+                    wo.element_count = output_count;
+                    wo.needs_host = needs_host;
+                    window_outputs[node->outputs[0]] = wo;
                 }
             }
         } else {
@@ -541,7 +844,7 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             for (const auto& output : node->outputs) {
                 if (!output.empty()
                     && context_->isTapped(output)
-                    && tensors_produced_in_window.count(output)) {
+                    && window_outputs.count(output)) {
                     needs_flush_for_tap = true;
                     break;
                 }

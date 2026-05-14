@@ -22,6 +22,21 @@ struct BackendExecutionResult {
     std::string kernel_id;
 };
 
+// Bundle of buffer-residency state the executor passes into encode() so the
+// backend can route to FromHost vs FromBuffer kernel variants without
+// having to query the executor's window map directly. Defaults describe
+// "no GPU-resident inputs, drain output to host on flush" — i.e. equivalent
+// to the previous single-variant encode() behavior.
+struct FusionInputs {
+    void* primary_input_buffer = nullptr;    // id<MTLBuffer> if non-null
+    size_t primary_input_count = 0;          // valid when primary_input_buffer != null
+    void* secondary_input_buffer = nullptr;  // Add only
+    size_t secondary_input_count = 0;
+    void* output_buffer = nullptr;           // pool-checked-out; always provided in fusion mode
+    std::vector<float>* host_dst = nullptr;  // stable pointer from allocateTensor; drain target
+    bool needs_host_output = true;
+};
+
 class ExecutionBackend {
 public:
     virtual ~ExecutionBackend() = default;
@@ -38,7 +53,9 @@ public:
     // to execute() after a window flush."
     virtual BackendExecutionResult encode(const ExecutionNode& node,
                                           ExecutionContext* context,
-                                          const KernelDescriptor* descriptor) const {
+                                          const KernelDescriptor* descriptor,
+                                          const FusionInputs& fusion) const {
+        (void)fusion;
         return execute(node, context, descriptor);
     }
 };
@@ -57,7 +74,8 @@ public:
                                    const KernelDescriptor* descriptor) const override;
     BackendExecutionResult encode(const ExecutionNode& node,
                                   ExecutionContext* context,
-                                  const KernelDescriptor* descriptor) const override;
+                                  const KernelDescriptor* descriptor,
+                                  const FusionInputs& fusion) const override;
 };
 
 class BackendRegistry {

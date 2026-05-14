@@ -182,26 +182,74 @@ public:
     bool flushFusionWindow() const;
     void discardFusionWindow() const;
 
-    // Encode entry points. Each requires hasFusionWindow() == true and
-    // returns false if the window is closed (caller must fall back to the
-    // synchronous runMatMulQ4_0 / runRmsNorm / runAdd path). On success,
-    // the output std::vector<float>& is resized but NOT yet populated —
-    // contents land after flushFusionWindow() returns.
-    bool encodeMatMulQ4_0(const std::string& weight_name,
-                          const std::vector<uint8_t>& weights,
-                          const std::vector<float>& input,
-                          size_t rows, size_t cols, size_t row_stride,
-                          uint32_t quant_version,
-                          std::vector<float>& output,
-                          const std::vector<float>* bias = nullptr) const;
-    bool encodeRmsNorm(const std::vector<float>& input,
-                       const std::vector<float>& weight,
-                       float epsilon,
-                       std::vector<float>& output) const;
-    bool encodeAdd(const std::vector<float>& a,
-                   const std::vector<float>& b,
-                   std::vector<float>& output,
-                   const std::vector<float>* bias = nullptr) const;
+    // Encode entry points. Each requires hasFusionWindow() == true.
+    // Output is always a pool-checked-out MTLBuffer (opaque void*; backed
+    // by id<MTLBuffer> with ARC strong retention through window_checked_out_).
+    // The host_dst vector is the eventual host destination — its address is
+    // captured for the flush drain; it must outlive the window. If
+    // needs_host is true, flush memcpys outBuffer contents into *host_dst;
+    // otherwise the buffer stays in pool (next consumer reads it directly).
+    //
+    // Two variants per op, distinguished on input source:
+    //   *FromHost — read input from std::vector<float>& (uploaded fresh
+    //               via newBufferWithBytes into a transient buffer that
+    //               is retained until flush). Used at window boundaries.
+    //   *FromBuffer — read input from an existing MTLBuffer (presumed to
+    //               carry op-N's output from earlier in the same window).
+    //               No fresh upload.
+    //
+    // For now these reject biased ops (return false) — TinyLlama Q4_0
+    // doesn't carry bias on attn/FFN paths, so callers fall back to
+    // execute() in the rare bias case.
+    bool encodeMatMulQ4_0FromHost(const std::string& weight_name,
+                                  const std::vector<uint8_t>& weights,
+                                  const std::vector<float>& host_input,
+                                  size_t rows, size_t cols, size_t row_stride,
+                                  uint32_t quant_version,
+                                  void* output_buffer,
+                                  std::vector<float>* host_dst,
+                                  bool needs_host) const;
+    bool encodeMatMulQ4_0FromBuffer(const std::string& weight_name,
+                                    const std::vector<uint8_t>& weights,
+                                    void* input_buffer,
+                                    size_t input_count,
+                                    size_t rows, size_t cols, size_t row_stride,
+                                    uint32_t quant_version,
+                                    void* output_buffer,
+                                    std::vector<float>* host_dst,
+                                    bool needs_host) const;
+    bool encodeRmsNormFromHost(const std::vector<float>& host_input,
+                               const std::vector<float>& weight,
+                               float epsilon,
+                               void* output_buffer,
+                               std::vector<float>* host_dst,
+                               bool needs_host) const;
+    bool encodeRmsNormFromBuffer(void* input_buffer,
+                                 size_t input_count,
+                                 const std::vector<float>& weight,
+                                 float epsilon,
+                                 void* output_buffer,
+                                 std::vector<float>* host_dst,
+                                 bool needs_host) const;
+    bool encodeAddFromHost(const std::vector<float>& host_a,
+                           const std::vector<float>& host_b,
+                           void* output_buffer,
+                           std::vector<float>* host_dst,
+                           bool needs_host) const;
+    bool encodeAddMixed(const std::vector<float>* host_a, void* buffer_a,
+                        const std::vector<float>* host_b, void* buffer_b,
+                        size_t element_count,
+                        void* output_buffer,
+                        std::vector<float>* host_dst,
+                        bool needs_host) const;
+
+    // Pool accessors used by the executor. `bytes` is rounded up to the
+    // next size class internally. Returned pointer is opaque (id<MTLBuffer>
+    // bridged); the executor must record it in its window state so that
+    // returnPoolBuffer is called at flush time. ARC strong retention is
+    // maintained by Impl's window_checked_out_ vector.
+    void* checkoutPoolBuffer(size_t bytes) const;
+    void  trackWindowBuffer(void* buffer) const;  // adds to window_checked_out_
 
     // Capability helpers (Metal availability of specific kernels).
     bool hasBiasAddKernel() const;

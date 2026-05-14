@@ -1339,33 +1339,31 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
 
 BackendExecutionResult MetalExecutionBackend::encode(const ExecutionNode& node,
                                                      ExecutionContext* context,
-                                                     const KernelDescriptor* descriptor) const {
-    // Deferred-commit dispatch path: encode onto MetalExecutor's open fusion
-    // command buffer without committing. Only supports the simple, common
-    // sub-cases of MatMul/Linear (Q4_0 weight, non-transposed), Norm
-    // (RMSNorm only — LayerNorm not yet wired), and Add. Anything else
-    // returns success=false; the executor flushes and falls back to
-    // execute() in that case.
+                                                     const KernelDescriptor* descriptor,
+                                                     const FusionInputs& fusion) const {
+    // Deferred-commit dispatch onto MetalExecutor's open fusion command
+    // buffer. The executor pre-allocates the output buffer from the
+    // intermediate buffer pool and passes it via fusion.output_buffer.
+    // When fusion.primary_input_buffer is non-null, the previous op's
+    // output is GPU-resident — dispatch to the FromBuffer variant and
+    // skip the host upload.
     BackendExecutionResult result;
     result.actual_backend = BackendKind::Metal;
     if (descriptor) result.kernel_id = descriptor->id;
     else if (!node.kernel_id.empty()) result.kernel_id = node.kernel_id;
     if (!context) {
-        result.success = false;
-        result.message = "encode: no context";
-        return result;
+        result.success = false; result.message = "encode: no context"; return result;
     }
     if (!MetalExecutor::Instance().hasFusionWindow()) {
-        result.success = false;
-        result.message = "encode: no fusion window open";
-        return result;
+        result.success = false; result.message = "encode: no fusion window open"; return result;
+    }
+    if (!fusion.output_buffer || !fusion.host_dst) {
+        result.success = false; result.message = "encode: missing fusion output_buffer/host_dst"; return result;
     }
 
     switch (node.op) {
         case ExecOpType::MatMul:
         case ExecOpType::Linear: {
-            const std::vector<float>* input = fetchInput(*context, node, 0, result);
-            if (!result.success) return result;
             std::string weight = getAnnotation(node, "weight");
             if (weight.empty()) {
                 result.success = false; result.message = "encode: no weight name"; return result;
@@ -1375,76 +1373,72 @@ BackendExecutionResult MetalExecutionBackend::encode(const ExecutionNode& node,
             if (w_it == tensors.end() || w_it->second.shape.size() != 2) {
                 result.success = false; result.message = "encode: weight not found"; return result;
             }
-            // Only Q4_0, non-transposed is supported on the encode path.
             if (w_it->second.dtype != frontend::GGML_TYPE_Q4_0) {
                 result.success = false; result.message = "encode: dtype not supported"; return result;
             }
             size_t cols = static_cast<size_t>(w_it->second.shape[0]);
             size_t rows = static_cast<size_t>(w_it->second.shape[1]);
-            if (cols != input->size()) {
-                result.success = false; result.message = "encode: shape mismatch (transposed not supported)"; return result;
-            }
-            const std::vector<float>* bias_tensor = nullptr;
-            std::string bias_name = getAnnotation(node, "bias");
-            if (!bias_name.empty()) {
-                try {
-                    const auto& bias = context->getParameter(bias_name);
-                    if (bias.size() != rows) {
-                        result.success = false; result.message = "encode: bias size mismatch"; return result;
-                    }
-                    bias_tensor = &bias;
-                } catch (const std::exception&) {
-                    result.success = false; result.message = "encode: bias param missing"; return result;
-                }
+            // Bias on matmul: TinyLlama doesn't carry it; reject so executor
+            // can fall back to execute() if some future model does.
+            if (!getAnnotation(node, "bias").empty()) {
+                result.success = false; result.message = "encode: matmul with bias not supported"; return result;
             }
             const auto& raw = context->session().tensorData(w_it->second);
             size_t row_stride = raw.size() / rows;
-            if (node.outputs.empty()) {
-                result.success = false; result.message = "encode: no output name"; return result;
+            uint32_t qv = context->session().loader().quantizationVersion();
+            bool ok = false;
+            if (fusion.primary_input_buffer) {
+                if (fusion.primary_input_count != cols) {
+                    result.success = false; result.message = "encode: gpu input count != cols"; return result;
+                }
+                ok = MetalExecutor::Instance().encodeMatMulQ4_0FromBuffer(
+                    weight, raw, fusion.primary_input_buffer, fusion.primary_input_count,
+                    rows, cols, row_stride, qv,
+                    fusion.output_buffer, fusion.host_dst, fusion.needs_host_output);
+            } else {
+                const std::vector<float>* input = fetchInput(*context, node, 0, result);
+                if (!result.success) return result;
+                if (input->size() != cols) {
+                    result.success = false; result.message = "encode: shape mismatch (transposed not supported)"; return result;
+                }
+                ok = MetalExecutor::Instance().encodeMatMulQ4_0FromHost(
+                    weight, raw, *input, rows, cols, row_stride, qv,
+                    fusion.output_buffer, fusion.host_dst, fusion.needs_host_output);
             }
-            // Allocate the destination in the context so its address is stable
-            // across the deferred-commit window — std::unordered_map references
-            // survive rehash and unrelated key inserts/erases. Encode entry
-            // points stash &stable_output into fusion_readbacks_; that pointer
-            // stays valid until flush even though the encode() stack frame
-            // here returns immediately.
-            std::vector<float>& stable_output =
-                context->allocateTensor(node.outputs[0], rows, /*zero_initialize=*/false);
-            bool ok = MetalExecutor::Instance().encodeMatMulQ4_0(
-                weight, raw, *input, rows, cols, row_stride,
-                context->session().loader().quantizationVersion(),
-                stable_output, bias_tensor);
             if (!ok) {
                 result.success = false; result.message = "encode: encodeMatMulQ4_0 failed"; return result;
             }
-            // No std::move — the GPU work writes directly into context's
-            // storage on flush. The tensor is already published.
             result.message = "metal-matmul-encoded";
             return result;
         }
         case ExecOpType::Norm: {
-            const std::vector<float>* input = fetchInput(*context, node, 0, result);
-            if (!result.success) return result;
             std::string weight_name = getAnnotation(node, "weight");
             std::string bias_name = getAnnotation(node, "bias");
             std::string norm_kind = getAnnotation(node, "norm_kind");
             if (weight_name.empty() || norm_kind == "layer") {
                 result.success = false; result.message = "encode: norm kind/weight unsupported"; return result;
             }
-            // RMSNorm with bias is uncommon (TinyLlama: none of the norms
-            // carry bias) and not yet plumbed through the encode readback
-            // record. Reject up front; executor will flush + execute().
             if (!bias_name.empty()) {
-                result.success = false; result.message = "encode: norm with bias not supported on encode path"; return result;
-            }
-            if (node.outputs.empty()) {
-                result.success = false; result.message = "encode: no output name"; return result;
+                result.success = false; result.message = "encode: norm with bias not supported"; return result;
             }
             try {
                 const auto& weight = context->getParameter(weight_name);
-                std::vector<float>& stable_output =
-                    context->allocateTensor(node.outputs[0], input->size(), /*zero_initialize=*/false);
-                bool ok = MetalExecutor::Instance().encodeRmsNorm(*input, weight, 1e-5f, stable_output);
+                bool ok = false;
+                if (fusion.primary_input_buffer) {
+                    if (fusion.primary_input_count != weight.size()) {
+                        result.success = false; result.message = "encode: norm gpu input count != weight size"; return result;
+                    }
+                    ok = MetalExecutor::Instance().encodeRmsNormFromBuffer(
+                        fusion.primary_input_buffer, fusion.primary_input_count,
+                        weight, 1e-5f,
+                        fusion.output_buffer, fusion.host_dst, fusion.needs_host_output);
+                } else {
+                    const std::vector<float>* input = fetchInput(*context, node, 0, result);
+                    if (!result.success) return result;
+                    ok = MetalExecutor::Instance().encodeRmsNormFromHost(
+                        *input, weight, 1e-5f,
+                        fusion.output_buffer, fusion.host_dst, fusion.needs_host_output);
+                }
                 if (!ok) {
                     result.success = false; result.message = "encode: encodeRmsNorm failed"; return result;
                 }
@@ -1458,31 +1452,38 @@ BackendExecutionResult MetalExecutionBackend::encode(const ExecutionNode& node,
             if (node.inputs.size() < 2) {
                 result.success = false; result.message = "encode: add needs 2 inputs"; return result;
             }
-            const std::vector<float>* a = fetchInput(*context, node, 0, result);
-            if (!result.success) return result;
-            const std::vector<float>* b = fetchInput(*context, node, 1, result);
-            if (!result.success) return result;
-            if (a->size() != b->size()) {
-                result.success = false; result.message = "encode: add size mismatch"; return result;
+            // Bias on Add: same story, TinyLlama doesn't carry it.
+            if (!getAnnotation(node, "bias").empty()) {
+                result.success = false; result.message = "encode: add with bias not supported"; return result;
             }
-            std::string bias_name = getAnnotation(node, "bias");
-            const std::vector<float>* bias = nullptr;
-            if (!bias_name.empty()) {
-                try {
-                    bias = &context->getParameter(bias_name);
-                    if (bias->size() != a->size()) {
-                        result.success = false; result.message = "encode: add bias mismatch"; return result;
-                    }
-                } catch (const std::exception&) {
-                    result.success = false; result.message = "encode: add bias missing"; return result;
+            // Determine element count from whichever side we have a host vec
+            // for, OR from the GPU buffer counts if both are GPU-resident.
+            const std::vector<float>* host_a = nullptr;
+            const std::vector<float>* host_b = nullptr;
+            size_t element_count = 0;
+            if (fusion.primary_input_buffer) {
+                element_count = fusion.primary_input_count;
+            } else {
+                host_a = fetchInput(*context, node, 0, result);
+                if (!result.success) return result;
+                element_count = host_a->size();
+            }
+            if (fusion.secondary_input_buffer) {
+                if (fusion.secondary_input_count != element_count) {
+                    result.success = false; result.message = "encode: add gpu input count mismatch"; return result;
+                }
+            } else {
+                host_b = fetchInput(*context, node, 1, result);
+                if (!result.success) return result;
+                if (host_b->size() != element_count) {
+                    result.success = false; result.message = "encode: add size mismatch"; return result;
                 }
             }
-            if (node.outputs.empty()) {
-                result.success = false; result.message = "encode: no output name"; return result;
-            }
-            std::vector<float>& stable_output =
-                context->allocateTensor(node.outputs[0], a->size(), /*zero_initialize=*/false);
-            bool ok = MetalExecutor::Instance().encodeAdd(*a, *b, stable_output, bias);
+            bool ok = MetalExecutor::Instance().encodeAddMixed(
+                host_a, fusion.primary_input_buffer,
+                host_b, fusion.secondary_input_buffer,
+                element_count,
+                fusion.output_buffer, fusion.host_dst, fusion.needs_host_output);
             if (!ok) {
                 result.success = false; result.message = "encode: encodeAdd failed"; return result;
             }
@@ -1490,11 +1491,6 @@ BackendExecutionResult MetalExecutionBackend::encode(const ExecutionNode& node,
             return result;
         }
         default:
-            // Other op types fall through to the base-class default, which
-            // calls execute() — but that would commit its own command
-            // buffer mid-window. The executor is responsible for flushing
-            // before calling execute() on non-fusable ops; this branch
-            // returns success=false to make that contract explicit.
             result.success = false;
             result.message = "encode: op type not supported";
             return result;
