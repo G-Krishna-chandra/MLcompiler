@@ -1025,6 +1025,19 @@ kernel void apply_rotary_batch(
     }
 }
 
+// fp16 → fp32 cast. Used to materialize Tier-2 attention's fp16 result
+// buffer as fp32 so downstream fusable consumers (Add, Norm) reading from
+// pass_outputs see the expected dtype. Convention: every op's pass_outputs
+// entry is fp32 regardless of internal compute precision.
+kernel void cast_f16_to_f32(
+    device const half* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant uint& length [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= length) return;
+    dst[gid] = float(src[gid]);
+}
+
 // Dequantize a single Q4_0 block into a float vector (32 elems)
 kernel void dequant_q4_0_block(
     device const uchar* src [[buffer(0)]],
@@ -1439,6 +1452,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> biasAddPipeline = nil;
     id<MTLComputePipelineState> kvWritePipeline = nil;
     id<MTLComputePipelineState> flashAttentionPipeline = nil;
+    id<MTLComputePipelineState> castF16toF32Pipeline = nil;
     bool debug_log = false;
 
     // Persistent device-side weight cache. Weights are immutable for the
@@ -1646,6 +1660,7 @@ struct MetalExecutor::Impl {
                 biasAddPipeline = buildPipeline(@"add_bias_strided");
                 kvWritePipeline = buildPipeline(@"scatter_kv");
                 flashAttentionPipeline = buildPipeline(@"flash_attention_v1");
+                castF16toF32Pipeline = buildPipeline(@"cast_f16_to_f32");
             }
         }
 #endif
@@ -1825,6 +1840,40 @@ struct MetalExecutor::Impl {
         (void)cols;
         (void)dst;
 #endif
+        return false;
+    }
+
+    // Encode a fp16 → fp32 cast onto the given command buffer. src and dst
+    // must both be MTLBuffer-backed. dst must hold at least element_count
+    // floats. Used to materialize fp16 attention output as fp32 for
+    // downstream fusable consumers via pass_outputs. Caller is responsible
+    // for retaining src/dst buffers until the CB commits.
+    bool encodeCastF16toF32(id<MTLCommandBuffer> cb,
+                             id<MTLBuffer> src,
+                             id<MTLBuffer> dst,
+                             size_t element_count) const {
+#if defined(__APPLE__)
+        if (!cb || !src || !dst || !castF16toF32Pipeline) return false;
+        if (element_count == 0 || element_count > std::numeric_limits<uint32_t>::max()) return false;
+        if (@available(macOS 11.0, *)) {
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+            [enc setComputePipelineState:castF16toF32Pipeline];
+            [enc setBuffer:src offset:0 atIndex:0];
+            [enc setBuffer:dst offset:0 atIndex:1];
+            uint32_t length = static_cast<uint32_t>(element_count);
+            [enc setBytes:&length length:sizeof(uint32_t) atIndex:2];
+            NSUInteger threadWidth = castF16toF32Pipeline.threadExecutionWidth;
+            if (threadWidth == 0) threadWidth = 32;
+            NSUInteger threadgroups = (element_count + threadWidth - 1) / threadWidth;
+            if (threadgroups == 0) threadgroups = 1;
+            [enc dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
+            [enc endEncoding];
+            return true;
+        }
+#endif
+        (void)cb; (void)src; (void)dst; (void)element_count;
         return false;
     }
 
