@@ -16,6 +16,8 @@ ExecutionContext::ExecutionContext(const Session& session,
 
 void ExecutionContext::setToken(uint64_t token_id) {
     token_id_ = token_id;
+    tokens_.assign(1, token_id);
+    seq_len_ = 1;
 }
 
 void ExecutionContext::setTensor(const std::string& name,

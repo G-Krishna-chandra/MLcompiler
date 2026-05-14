@@ -313,6 +313,7 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             default: return false;
         }
     };
+    const size_t preanalysis_seq_len = context_ ? context_->seqLen() : 1;
     std::vector<bool> is_nonfusable;
     is_nonfusable.reserve(order.size());
     std::unordered_map<std::string, size_t> node_topo_pos;
@@ -322,6 +323,7 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         if (it == node_lookup.end()) { is_nonfusable.push_back(true); continue; }
         const auto* n = it->second;
         bool fus = fuse_layer
+                && preanalysis_seq_len <= 1
                 && isFusableOp(n->op)
                 && n->backend == BackendKind::Metal
                 && MetalExecutor::Instance().shouldUseFor(*n)
@@ -564,7 +566,13 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         // and call backend.encode() with FusionInputs. Non-fusable nodes
         // force a window flush (drains any pending readbacks) then run
         // synchronously via execute().
+        // Multi-token forward pass (item 3 prefill batching) disables fusion:
+        // encode() expects single-token tensors and the pool buffers are
+        // single-output-sized. Multi-token traffic flows through execute(),
+        // which falls into per-token loops in each handler.
+        const size_t exec_seq_len = context_ ? context_->seqLen() : 1;
         bool fusable = fuse_layer
+                    && exec_seq_len <= 1
                     && isFusableOp(node->op)
                     && node->backend == BackendKind::Metal
                     && MetalExecutor::Instance().shouldUseFor(*node);
@@ -588,6 +596,24 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
                 if (!MetalExecutor::Instance().beginFusionWindow()) {
                     fusable = false;
                 }
+            }
+        }
+
+        // Decision 4: lm_head computes for final token only by default during
+        // multi-token prefill. MLC_PREFILL_ALL_LOGITS=1 keeps all-tokens for
+        // harness compatibility. Identified by output tensor name "logits"
+        // (lm_head is the last node and the only producer of that tensor).
+        const bool lm_head_truncate = context_ &&
+            context_->seqLen() > 1 &&
+            !node->outputs.empty() && node->outputs[0] == "logits" &&
+            (std::getenv("MLC_PREFILL_ALL_LOGITS") == nullptr);
+        if (lm_head_truncate && !node->inputs.empty()) {
+            const auto* hidden = context_->getTensor(node->inputs[0]);
+            if (hidden && hidden->size() % context_->seqLen() == 0) {
+                size_t per = hidden->size() / context_->seqLen();
+                std::vector<float> last(hidden->end() - per, hidden->end());
+                context_->setTensor(node->inputs[0], std::move(last));
+                context_->setSeqLen(1);
             }
         }
 

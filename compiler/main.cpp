@@ -1956,29 +1956,47 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
             logTokenList(log_cfg, "chat_prompt_tokens", turn_index, history);
 
             std::vector<float> logits;
-            // PART A timing: wall-clock the prefill (token-by-token replay of
-            // the chat-templated prompt) and the generation loop separately.
+            // PART A timing: wall-clock the prefill (item 3: batched
+            // multi-token forward pass) and the generation loop separately.
             using clk = std::chrono::steady_clock;
             mlc::runtime::ExecutionExecutor::clearNodeProfile();
             auto t_prefill_begin = clk::now();
             size_t prompt_tokens_processed = 0;
-            // Feed any unprocessed tokens (including BOS once).
-            for (size_t i = processed; i < history.size(); ++i) {
-                if (pos >= context_len) {
+            if (history.size() > processed) {
+                if (pos + (history.size() - processed) > context_len) {
                     context.clearStateTensors();
-                    // Rebuild KV from scratch when reset.
                     pos = 0;
                     processed = 0;
-                    i = processed;
                 }
-                if (!runStep(history[i], pos, logits)) {
+                std::vector<uint64_t> batch(history.begin() + processed, history.end());
+                context.setTokens(batch);
+                context.setSequencePosition(pos);
+                static const std::vector<std::string> kTokenInputs = {"tokens", "token_ids"};
+                for (const auto& name : kTokenInputs) {
+                    if (graph.tensors().count(name)) {
+                        std::vector<float> tok_floats;
+                        tok_floats.reserve(batch.size());
+                        for (uint64_t t : batch) tok_floats.push_back(static_cast<float>(t));
+                        context.setTensor(name, std::move(tok_floats));
+                    }
+                }
+                auto res = executor.run();
+                if (!res.success) {
+                    std::cerr << "Execution failed\n";
                     return 1;
                 }
-                logLogits(log_cfg, "prompt", turn_index, i, history[i], pos, logits, top_k);
-                pos += 1;
-                ++prompt_tokens_processed;
+                const auto* lp = context.getTensor("logits");
+                if (!lp || lp->empty()) {
+                    std::cerr << "Logits not produced\n";
+                    return 1;
+                }
+                logits = *lp;
+                logLogits(log_cfg, "prompt", turn_index, history.size() - 1,
+                          history.back(), pos + batch.size() - 1, logits, top_k);
+                pos += batch.size();
+                prompt_tokens_processed = batch.size();
+                processed = history.size();
             }
-            processed = history.size();
             auto t_prefill_end = clk::now();
 
             std::vector<uint64_t> generated;

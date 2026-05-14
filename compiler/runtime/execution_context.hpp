@@ -29,6 +29,35 @@ public:
     void setSequencePosition(size_t position) { sequence_position_ = position; }
     size_t sequencePosition() const { return sequence_position_; }
 
+    // Multi-token forward-pass support. seq_len_ is the number of tokens the
+    // current executor.run() is processing in one pass. Single-token decode
+    // uses seq_len_ == 1 (the default); batched prefill sets seq_len_ to the
+    // prompt length and packs all token ids into tokens_. Tensor storage for
+    // activations is seq_len_ * static_dim floats; handlers that pick up the
+    // multi-token path read seq_len() to size their work.
+    void setTokens(const std::vector<uint64_t>& tokens) {
+        if (tokens.empty()) {
+            tokens_.assign(1, 0);
+            token_id_ = 0;
+            seq_len_ = 1;
+            return;
+        }
+        tokens_ = tokens;
+        token_id_ = tokens_.front();
+        seq_len_ = tokens_.size();
+    }
+    const std::vector<uint64_t>& tokens() const { return tokens_; }
+    size_t seqLen() const { return seq_len_; }
+    void setSeqLen(size_t n) { seq_len_ = (n == 0 ? 1 : n); }
+
+    // Sequence-id offset table for the KV cache. Single-stream operation is
+    // a length-1 table mapping sequence 0 to offset 0. Continuous batching
+    // (item 5) extends this to multiple sequences without touching the call
+    // sites that read activeSequenceId() / sequenceCacheBaseOffset().
+    void setActiveSequenceId(size_t seq_id) { active_sequence_id_ = seq_id; }
+    size_t activeSequenceId() const { return active_sequence_id_; }
+    size_t sequenceCacheBaseOffset(size_t /*seq_id*/) const { return 0; }
+
     void setTensor(const std::string& name, std::vector<float> values);
     bool hasTensor(const std::string& name) const;
     const std::vector<float>* getTensor(const std::string& name) const;
@@ -84,7 +113,10 @@ private:
     const Session& session_;
     const ExecutionGraph* graph_ = nullptr;
     uint64_t token_id_ = 0;
+    std::vector<uint64_t> tokens_;
+    size_t seq_len_ = 1;
     size_t sequence_position_ = 0;
+    size_t active_sequence_id_ = 0;
     std::unordered_map<std::string, TensorStorage> tensors_;
     mutable std::unordered_map<std::string, TensorStorage> parameter_cache_;
     std::unordered_set<std::string> tap_names_;

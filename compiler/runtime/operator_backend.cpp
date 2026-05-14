@@ -51,6 +51,81 @@ float gelu(float x) {
     return 0.5f * x * (1.0f + std::tanh(kAlpha * (x + 0.044715f * x * x * x)));
 }
 
+// Loop a single-token execute() over the multi-token input by slicing each
+// listed input into per-token chunks, calling the backend with seq_len
+// temporarily forced to 1, and stacking the per-token output back into
+// node.outputs[0]. Restores tensors and seq_len on exit. Used by Metal
+// MatMul/Linear/Norm/Add execute paths to multi-token-prefill correctly
+// without rewriting any kernels.
+template <typename BackendT>
+BackendExecutionResult LoopExecutePerToken(const BackendT& backend,
+                                            const ExecutionNode& node,
+                                            ExecutionContext* context,
+                                            const KernelDescriptor* descriptor,
+                                            std::initializer_list<size_t> input_indices) {
+    BackendExecutionResult result;
+    result.success = true;
+    if (!context) {
+        result.success = false;
+        result.message = "LoopExecutePerToken needs context";
+        return result;
+    }
+    size_t seq_len = context->seqLen();
+    if (seq_len <= 1) {
+        return backend.execute(node, context, descriptor);
+    }
+    struct SavedInput { size_t index; std::vector<float> data; size_t per_token; };
+    std::vector<SavedInput> saved;
+    saved.reserve(input_indices.size());
+    for (size_t idx : input_indices) {
+        if (idx >= node.inputs.size()) continue;
+        const auto* t = context->getTensor(node.inputs[idx]);
+        if (!t || t->size() % seq_len != 0) {
+            result.success = false;
+            result.message = "LoopExecutePerToken: input size not divisible by seq_len";
+            return result;
+        }
+        saved.push_back({idx, *t, t->size() / seq_len});
+    }
+    std::string out_name = node.outputs.empty() ? std::string() : node.outputs[0];
+    std::vector<float> stacked;
+    size_t per_token_out = 0;
+    BackendExecutionResult last;
+    last.success = true;
+    last.actual_backend = BackendKind::Metal;
+    for (size_t t = 0; t < seq_len; ++t) {
+        for (const auto& s : saved) {
+            std::vector<float> sub(s.data.begin() + t * s.per_token,
+                                   s.data.begin() + (t + 1) * s.per_token);
+            context->setTensor(node.inputs[s.index], std::move(sub));
+        }
+        context->setSeqLen(1);
+        last = backend.execute(node, context, descriptor);
+        context->setSeqLen(seq_len);
+        if (!last.success) break;
+        if (!out_name.empty()) {
+            const auto* out_t = context->getTensor(out_name);
+            if (out_t) {
+                if (t == 0) {
+                    per_token_out = out_t->size();
+                    stacked.resize(seq_len * per_token_out, 0.0f);
+                }
+                if (out_t->size() == per_token_out) {
+                    std::copy(out_t->begin(), out_t->end(),
+                              stacked.begin() + t * per_token_out);
+                }
+            }
+        }
+    }
+    for (auto& s : saved) {
+        context->setTensor(node.inputs[s.index], std::move(s.data));
+    }
+    if (last.success && !out_name.empty()) {
+        context->setTensor(out_name, std::move(stacked));
+    }
+    return last;
+}
+
 bool buildAlibiMask(const ExecutionContext* context,
                     const ExecutionNode& node,
                     std::vector<float>& mask) {
@@ -339,9 +414,21 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                 return result;
             }
             try {
-                auto embedding = context->session().getEmbedding(weight, context->token());
+                size_t seq_len = context->seqLen();
+                std::vector<float> stacked;
+                if (seq_len <= 1) {
+                    stacked = context->session().getEmbedding(weight, context->token());
+                } else {
+                    const auto& toks = context->tokens();
+                    for (size_t t = 0; t < seq_len; ++t) {
+                        uint64_t tok = t < toks.size() ? toks[t] : context->token();
+                        auto e = context->session().getEmbedding(weight, tok);
+                        if (t == 0) stacked.reserve(seq_len * e.size());
+                        stacked.insert(stacked.end(), e.begin(), e.end());
+                    }
+                }
                 if (!node.outputs.empty()) {
-                    context->setTensor(node.outputs[0], std::move(embedding));
+                    context->setTensor(node.outputs[0], std::move(stacked));
                 }
                 result.message = "embedding lookup";
             } catch (const std::exception& e) {
@@ -361,11 +448,27 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                 return result;
             }
             try {
-                auto output = context->session().runLinear(weight, *input);
+                size_t seq_len = context->seqLen();
+                std::vector<float> output;
+                if (seq_len <= 1 || input->size() % seq_len != 0) {
+                    output = context->session().runLinear(weight, *input);
+                } else {
+                    size_t cols = input->size() / seq_len;
+                    std::vector<float> sub(cols);
+                    for (size_t t = 0; t < seq_len; ++t) {
+                        std::copy(input->begin() + t * cols,
+                                  input->begin() + (t + 1) * cols,
+                                  sub.begin());
+                        auto row_out = context->session().runLinear(weight, sub);
+                        if (t == 0) output.reserve(seq_len * row_out.size());
+                        output.insert(output.end(), row_out.begin(), row_out.end());
+                    }
+                }
                 std::string bias_name = getAnnotation(node, "bias");
                 if (!bias_name.empty()) {
                     const auto& bias = context->getParameter(bias_name);
-                    if (bias.size() != output.size()) {
+                    size_t per = bias.size();
+                    if (per == 0 || output.size() % per != 0) {
                         result.success = false;
                         std::ostringstream oss;
                         oss << "Bias tensor '" << bias_name << "' size mismatch";
@@ -373,7 +476,7 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                         return result;
                     }
                     for (size_t i = 0; i < output.size(); ++i) {
-                        output[i] += bias[i];
+                        output[i] += bias[i % per];
                     }
                 }
                 if (!node.outputs.empty()) {
@@ -399,42 +502,53 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             }
             try {
                 const auto& weight = context->getParameter(weight_name);
+                size_t seq_len = context->seqLen();
+                if (seq_len < 1) seq_len = 1;
+                size_t per_token = input->size() / seq_len;
+                if (per_token == 0) per_token = input->size();
                 const std::vector<float>* bias_ptr = nullptr;
                 if (!bias_name.empty()) {
                     bias_ptr = &context->getParameter(bias_name);
-                    if (bias_ptr->size() != input->size()) {
+                    if (bias_ptr->size() != per_token) {
                         result.success = false;
                         result.message = "LayerNorm bias size mismatch";
                         return result;
                     }
                 }
                 std::vector<float> output(input->size(), 0.0f);
+                std::vector<float> tok_in(per_token);
+                std::vector<float> tok_out(per_token);
+                auto applyOne = [&](size_t off) {
+                    std::copy(input->begin() + off,
+                              input->begin() + off + per_token,
+                              tok_in.begin());
 #if defined(__APPLE__)
-                if (norm_kind != "layer" && input->size() >= 32) {
-                    float mean_sq = 0.0f;
-                    vDSP_measqv(input->data(), 1, &mean_sq, input->size());
-                    float inv = 1.0f / std::sqrt(mean_sq + 1e-5f);
-                    vDSP_vsmul(input->data(), 1, &inv, output.data(), 1, input->size());
-                    for (size_t i = 0; i < output.size(); ++i) {
-                        float gamma = i < weight.size() ? weight[i] : 1.0f;
-                        output[i] *= gamma;
-                    }
-                    if (!node.outputs.empty()) {
-                        context->setTensor(node.outputs[0], std::move(output));
-                    }
-                    result.message = "rms-norm-accelerate";
-                    return result;
-                }
-#endif
-                if (norm_kind == "layer") {
-                    layerNorm(*input, weight, output);
-                    if (bias_ptr) {
-                        for (size_t i = 0; i < output.size(); ++i) {
-                            output[i] += (*bias_ptr)[i];
+                    if (norm_kind != "layer" && per_token >= 32) {
+                        float mean_sq = 0.0f;
+                        vDSP_measqv(tok_in.data(), 1, &mean_sq, per_token);
+                        float inv = 1.0f / std::sqrt(mean_sq + 1e-5f);
+                        vDSP_vsmul(tok_in.data(), 1, &inv, tok_out.data(), 1, per_token);
+                        for (size_t i = 0; i < per_token; ++i) {
+                            float gamma = i < weight.size() ? weight[i] : 1.0f;
+                            tok_out[i] *= gamma;
                         }
+                        return;
                     }
-                } else {
-                    rmsNorm(*input, weight, output);
+#endif
+                    if (norm_kind == "layer") {
+                        layerNorm(tok_in, weight, tok_out);
+                        if (bias_ptr) {
+                            for (size_t i = 0; i < per_token; ++i) {
+                                tok_out[i] += (*bias_ptr)[i];
+                            }
+                        }
+                    } else {
+                        rmsNorm(tok_in, weight, tok_out);
+                    }
+                };
+                for (size_t t = 0; t < seq_len; ++t) {
+                    applyOne(t * per_token);
+                    std::copy(tok_out.begin(), tok_out.end(), output.begin() + t * per_token);
                 }
                 if (!node.outputs.empty()) {
                     context->setTensor(node.outputs[0], std::move(output));
@@ -702,6 +816,75 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             const std::vector<float>* v_new = fetchInput(*context, node, 2, result);
             if (!result.success) return result;
 
+            // Multi-token path (item 3 wedge-prep): loop single-token attention
+            // seq_len times. Each iteration writes one token's K/V into the
+            // cache at base_position + t and computes its attention output.
+            // Single-token (decode) skips this entirely and falls through to
+            // the existing path below.
+            if (context->seqLen() > 1) {
+                size_t seq_len = context->seqLen();
+                size_t num_heads = static_cast<size_t>(node.attributes.count("heads") ? node.attributes.at("heads") : 0.0f);
+                size_t head_dim = static_cast<size_t>(node.attributes.count("head_dim") ? node.attributes.at("head_dim") : 0.0f);
+                size_t kv_heads = static_cast<size_t>(node.attributes.count("kv_heads") ? node.attributes.at("kv_heads") : num_heads);
+                size_t q_per = num_heads * head_dim;
+                size_t kv_per = (kv_heads > 0 ? kv_heads : num_heads) * head_dim;
+                if (q_per == 0 || kv_per == 0 || q->size() != seq_len * q_per ||
+                    k_new->size() != seq_len * kv_per || v_new->size() != seq_len * kv_per) {
+                    result.success = false;
+                    result.message = "Attention multi-token size mismatch";
+                    return result;
+                }
+                size_t base_pos = context->sequencePosition();
+                std::string out_name = node.outputs.empty() ? std::string() : node.outputs[0];
+                std::vector<float> stacked(seq_len * q_per, 0.0f);
+                // Take a local copy of the activations (setTensor below would
+                // invalidate q/k_new/v_new pointers under reentry).
+                std::vector<float> q_full = *q;
+                std::vector<float> k_full = *k_new;
+                std::vector<float> v_full = *v_new;
+                BackendExecutionResult last;
+                last.success = true;
+                last.actual_backend = BackendKind::CPU;
+                for (size_t t = 0; t < seq_len; ++t) {
+                    std::vector<float> q_t(q_full.begin() + t * q_per,
+                                           q_full.begin() + (t + 1) * q_per);
+                    std::vector<float> k_t(k_full.begin() + t * kv_per,
+                                           k_full.begin() + (t + 1) * kv_per);
+                    std::vector<float> v_t(v_full.begin() + t * kv_per,
+                                           v_full.begin() + (t + 1) * kv_per);
+                    context->setTensor(node.inputs[0], std::move(q_t));
+                    context->setTensor(node.inputs[1], std::move(k_t));
+                    context->setTensor(node.inputs[2], std::move(v_t));
+                    context->setSeqLen(1);
+                    context->setSequencePosition(base_pos + t);
+                    last = execute(node, context, descriptor);
+                    if (!last.success) {
+                        context->setSeqLen(seq_len);
+                        context->setSequencePosition(base_pos);
+                        return last;
+                    }
+                    if (!out_name.empty()) {
+                        const auto* out_t = context->getTensor(out_name);
+                        if (out_t && out_t->size() == q_per) {
+                            std::copy(out_t->begin(), out_t->end(),
+                                      stacked.begin() + t * q_per);
+                        }
+                    }
+                }
+                context->setSeqLen(seq_len);
+                context->setSequencePosition(base_pos);
+                context->setTensor(node.inputs[0], std::move(q_full));
+                context->setTensor(node.inputs[1], std::move(k_full));
+                context->setTensor(node.inputs[2], std::move(v_full));
+                if (!out_name.empty()) {
+                    context->setTensor(out_name, std::move(stacked));
+                }
+                result.actual_backend = last.actual_backend;
+                result.kernel_id = last.kernel_id;
+                result.message = "attention-multi-loop";
+                return result;
+            }
+
             std::vector<float> mask;
             bool has_mask = loadMask(node, context, mask);
             if (!has_mask && context && context->graph()) {
@@ -923,12 +1106,21 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
             auto attr_len = node.attributes.find("slice_length");
             size_t offset = attr_off != node.attributes.end() ? static_cast<size_t>(attr_off->second) : 0;
             size_t length = attr_len != node.attributes.end() ? static_cast<size_t>(attr_len->second) : input->size();
-            if (offset + length > input->size()) {
+            size_t seq_len = context->seqLen();
+            if (seq_len < 1) seq_len = 1;
+            size_t per_token_in = input->size() / seq_len;
+            if (per_token_in == 0) per_token_in = input->size();
+            if (offset + length > per_token_in) {
                 result.success = false;
                 result.message = "Slice out of range";
                 return result;
             }
-            std::vector<float> out(input->begin() + offset, input->begin() + offset + length);
+            std::vector<float> out(seq_len * length);
+            for (size_t t = 0; t < seq_len; ++t) {
+                std::copy(input->begin() + t * per_token_in + offset,
+                          input->begin() + t * per_token_in + offset + length,
+                          out.begin() + t * length);
+            }
             if (!node.outputs.empty()) {
                 context->setTensor(node.outputs[0], std::move(out));
             }
@@ -974,6 +1166,9 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
     switch (node.op) {
         case ExecOpType::MatMul:
         case ExecOpType::Linear: {
+            if (context->seqLen() > 1) {
+                return LoopExecutePerToken(*this, node, context, descriptor, {0});
+            }
             const std::vector<float>* input = fetchInput(*context, node, 0, result);
             if (!result.success) return result;
             std::string weight = getAnnotation(node, "weight");
@@ -1258,6 +1453,9 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
             return result;
         }
         case ExecOpType::Norm: {
+            if (context->seqLen() > 1) {
+                return LoopExecutePerToken(*this, node, context, descriptor, {0});
+            }
             const std::vector<float>* input = fetchInput(*context, node, 0, result);
             if (!result.success) return result;
             std::string weight_name = getAnnotation(node, "weight");
@@ -1302,6 +1500,9 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
             }
         }
         case ExecOpType::Add: {
+            if (context->seqLen() > 1) {
+                return LoopExecutePerToken(*this, node, context, descriptor, {0, 1});
+            }
             const std::vector<float>* a = fetchInput(*context, node, 0, result);
             if (!result.success) return result;
             const std::vector<float>* b = fetchInput(*context, node, 1, result);
