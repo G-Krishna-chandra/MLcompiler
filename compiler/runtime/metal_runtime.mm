@@ -100,6 +100,64 @@ kernel void rms_norm_kernel(
     }
 }
 
+// RMSNorm v2 (Sink 2 commit D1). Multi-threaded with simd_sum reductions,
+// strided per-thread reads, fused gamma multiply. Designed for 256 threads
+// per threadgroup (8 simdgroups × 32 lanes); cross-simdgroup partial sums
+// reduced via threadgroup memory. Caller must allocate at least
+// (ntg/32)*sizeof(float) of threadgroup memory, slot 0. Length must be a
+// multiple of the simd width or larger than ntg; see C++ caller invariants.
+kernel void rms_norm_kernel_v2(
+    device const float* input    [[buffer(0)]],
+    device const float* weight   [[buffer(1)]],
+    device       float* output   [[buffer(2)]],
+    constant uint&     length    [[buffer(3)]],
+    constant float&    epsilon   [[buffer(4)]],
+    threadgroup float* shmem     [[threadgroup(0)]],
+    uint  tid_local [[thread_position_in_threadgroup]],
+    uint  sg_idx    [[simdgroup_index_in_threadgroup]],
+    uint  lane_idx  [[thread_index_in_simdgroup]],
+    uint  ntg       [[threads_per_threadgroup]]) {
+    if (length == 0) return;
+
+    // Phase 1: parallel sum-of-squares with strided reads (coalesced).
+    float sumf = 0.0f;
+    for (uint i = tid_local; i < length; i += ntg) {
+        float v = input[i];
+        sumf += v * v;
+    }
+
+    // Phase 2: within-simdgroup tree reduction.
+    sumf = simd_sum(sumf);
+
+    // Phase 3: cross-simdgroup reduction via shared memory. Each simdgroup
+    // writes its partial sum (lane 0 of that simdgroup); first simdgroup
+    // re-reduces.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane_idx == 0u) {
+        shmem[sg_idx] = sumf;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0u) {
+        uint num_sg = ntg / 32u;
+        sumf = (lane_idx < num_sg) ? shmem[lane_idx] : 0.0f;
+        sumf = simd_sum(sumf);
+        if (lane_idx == 0u) {
+            // Broadcast scale via shmem[0]. mean is fp32 to preserve
+            // precision when length is large (long-vector overflow guard).
+            float mean = sumf / static_cast<float>(length);
+            shmem[0] = rsqrt(mean + epsilon);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = shmem[0];
+
+    // Phase 5: parallel write with fused gamma multiply.
+    for (uint i = tid_local; i < length; i += ntg) {
+        float gamma = weight[i];
+        output[i] = input[i] * scale * gamma;
+    }
+}
+
 kernel void layer_norm_kernel(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
@@ -1438,6 +1496,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> addPipeline = nil;
     id<MTLComputePipelineState> addResidualPipeline = nil;
     id<MTLComputePipelineState> normPipeline = nil;
+    id<MTLComputePipelineState> normPipelineV2 = nil;
     id<MTLComputePipelineState> layerNormPipeline = nil;
     id<MTLComputePipelineState> softmaxPipeline = nil;
     id<MTLComputePipelineState> q4MatmulPipeline = nil;
@@ -1681,6 +1740,7 @@ struct MetalExecutor::Impl {
                 addPipeline = buildPipeline(@"add_vectors");
                 addResidualPipeline = buildPipeline(@"add_residual_bias");
                 normPipeline = buildPipeline(@"rms_norm_kernel");
+                normPipelineV2 = buildPipeline(@"rms_norm_kernel_v2");
                 layerNormPipeline = buildPipeline(@"layer_norm_kernel");
                 softmaxPipeline = buildPipeline(@"vector_softmax");
                 q4MatmulPipeline = buildPipeline(@"q4_0_matmul");
@@ -3270,9 +3330,14 @@ bool matmulQ4_K(const std::string& weight_name,
                  float epsilon,
                  std::vector<float>& output) const {
 #if defined(__APPLE__)
-        if (!available() || !normPipeline) return false;
+        if (!available()) return false;
         if (input.size() != weight.size() || input.empty()) return false;
         if (input.size() > std::numeric_limits<uint32_t>::max()) return false;
+        // Use v2 (multi-threaded simd_sum) when length >= 32 (a single
+        // simdgroup's worth of elements). Smaller lengths fall back to v1
+        // since the parallel-reduction overhead exceeds the gain.
+        const bool use_v2 = normPipelineV2 != nil && input.size() >= 32;
+        if (!use_v2 && !normPipeline) return false;
         size_t bytes = input.size() * sizeof(float);
         output.resize(input.size());
         if (@available(macOS 11.0, *)) {
@@ -3289,7 +3354,7 @@ bool matmulQ4_K(const std::string& weight_name,
                 id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
                 id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
                 if (!encoder) return false;
-                [encoder setComputePipelineState:normPipeline];
+                [encoder setComputePipelineState:(use_v2 ? normPipelineV2 : normPipeline)];
                 [encoder setBuffer:inBuffer offset:0 atIndex:0];
                 [encoder setBuffer:wBuffer offset:0 atIndex:1];
                 [encoder setBuffer:outBuffer offset:0 atIndex:2];
@@ -3298,9 +3363,17 @@ bool matmulQ4_K(const std::string& weight_name,
                 float eps = epsilon;
                 [encoder setBytes:&eps length:sizeof(float) atIndex:4];
 
-                MTLSize tgSize = MTLSizeMake(1, 1, 1);
-                MTLSize thSize = MTLSizeMake(1, 1, 1);
-                [encoder dispatchThreadgroups:tgSize threadsPerThreadgroup:thSize];
+                if (use_v2) {
+                    // 256 threads = 8 simdgroups × 32 lanes. Threadgroup
+                    // memory: 8 floats for cross-simdgroup partial sums
+                    // (also reused for scale broadcast at slot 0).
+                    [encoder setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
+                    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                } else {
+                    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+                }
                 [encoder endEncoding];
                 [commandBuffer commit];
                 [commandBuffer waitUntilCompleted];
@@ -5120,7 +5193,8 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
         if (!inBuffer || !wBuffer) return false;
         id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
-        [encoder setComputePipelineState:impl_->normPipeline];
+        const bool use_v2 = impl_->normPipelineV2 != nil && host_input.size() >= 32;
+        [encoder setComputePipelineState:(use_v2 ? impl_->normPipelineV2 : impl_->normPipeline)];
         [encoder setBuffer:inBuffer offset:0 atIndex:0];
         [encoder setBuffer:wBuffer offset:0 atIndex:1];
         [encoder setBuffer:outBuf offset:0 atIndex:2];
@@ -5128,8 +5202,14 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
         [encoder setBytes:&length length:sizeof(uint32_t) atIndex:3];
         float eps = epsilon;
         [encoder setBytes:&eps length:sizeof(float) atIndex:4];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        if (use_v2) {
+            [encoder setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        }
         [encoder endEncoding];
         impl_->pass_retained_.push_back(inBuffer);
         impl_->pass_retained_.push_back(wBuffer);
@@ -5165,7 +5245,8 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
         if (!wBuffer) return false;
         id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
-        [encoder setComputePipelineState:impl_->normPipeline];
+        const bool use_v2 = impl_->normPipelineV2 != nil && input_count >= 32;
+        [encoder setComputePipelineState:(use_v2 ? impl_->normPipelineV2 : impl_->normPipeline)];
         [encoder setBuffer:inBuf offset:0 atIndex:0];
         [encoder setBuffer:wBuffer offset:0 atIndex:1];
         [encoder setBuffer:outBuf offset:0 atIndex:2];
@@ -5173,8 +5254,14 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
         [encoder setBytes:&length length:sizeof(uint32_t) atIndex:3];
         float eps = epsilon;
         [encoder setBytes:&eps length:sizeof(float) atIndex:4];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        if (use_v2) {
+            [encoder setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        }
         [encoder endEncoding];
         impl_->pass_retained_.push_back(wBuffer);
         impl_->recordReadback(outBuf, host_dst, bytes, needs_host);
