@@ -15,6 +15,12 @@ struct TensorStorage {
     size_t row_stride_bytes = 0;
     std::vector<uint8_t> raw_data;
     std::vector<float> float_data;
+    // Shadow fp32 buffer for non-F32 storage (e.g., F16 KV cache). Reused
+    // across calls to avoid per-call alloc + zero-init of large buffers.
+    // Populated by decodeCacheTensor; consumed by attention; re-quantized
+    // back into raw_data by encodeCacheTensor. Empty for F32 storage (which
+    // uses float_data directly).
+    std::vector<float> dequant_shadow;
 
     TensorStorage() = default;
 

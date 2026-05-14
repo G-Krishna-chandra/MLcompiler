@@ -268,10 +268,14 @@ size_t inferHeadDim(const ExecutionTensor* tensor, size_t fallback) {
 }
 
 struct CacheDecodeResult {
-    std::vector<float> buffer;
     std::vector<float>* data = nullptr;
     size_t head_dim = 0;
-    bool owns_buffer = false;
+    bool owns_buffer = false;  // unused now; data lives in storage->dequant_shadow or float_data
+    // Rows beyond this position-per-head were never written and stay at the
+    // value the buffer was zero-initialized to. Setters honor this so the
+    // dequant + re-quant per attention call is O(active context) rather than
+    // O(full context_length). 0 = "all rows".
+    size_t valid_positions_per_head = 0;
 };
 
 bool decodeCacheTensor(const ExecutionNode& node,
@@ -301,7 +305,12 @@ bool decodeCacheTensor(const ExecutionNode& node,
     if (storage->raw_data.size() != required) {
         storage->raw_data.resize(required, 0);
     }
-    result.buffer.resize(elements);
+    // Persistent shadow buffer in storage avoids per-call 2 MB alloc + zero-init.
+    // First-use sizes it; subsequent calls reuse.
+    if (storage->dequant_shadow.size() != elements) {
+        storage->dequant_shadow.assign(elements, 0.0f);
+    }
+    std::vector<float>& shadow = storage->dequant_shadow;
 #if defined(__APPLE__)
     // Dequant via Metal only when the owning node would itself run on Metal —
     // routes through MetalExecutor::shouldUseFor so force-CPU is honored.
@@ -310,42 +319,79 @@ bool decodeCacheTensor(const ExecutionNode& node,
         const size_t cols = result.head_dim * rows;
         switch (storage->dtype) {
         case frontend::GGML_TYPE_Q4_0:
-            ok = MetalExecutor::Instance().dequantQ4Block(storage->raw_data, cols, result.buffer);
+            ok = MetalExecutor::Instance().dequantQ4Block(storage->raw_data, cols, shadow);
             break;
         case frontend::GGML_TYPE_Q4_1:
-            ok = MetalExecutor::Instance().dequantQ4_1Block(storage->raw_data, cols, result.buffer);
+            ok = MetalExecutor::Instance().dequantQ4_1Block(storage->raw_data, cols, shadow);
             break;
         case frontend::GGML_TYPE_Q5_0:
-            ok = MetalExecutor::Instance().dequantQ5_0Block(storage->raw_data, cols, result.buffer);
+            ok = MetalExecutor::Instance().dequantQ5_0Block(storage->raw_data, cols, shadow);
             break;
         case frontend::GGML_TYPE_Q5_1:
-            ok = MetalExecutor::Instance().dequantQ5_1Block(storage->raw_data, cols, result.buffer);
+            ok = MetalExecutor::Instance().dequantQ5_1Block(storage->raw_data, cols, shadow);
             break;
         case frontend::GGML_TYPE_Q8_0:
-            ok = MetalExecutor::Instance().dequantQ8Block(storage->raw_data, cols, result.buffer);
+            ok = MetalExecutor::Instance().dequantQ8Block(storage->raw_data, cols, shadow);
             break;
         case frontend::GGML_TYPE_Q8_1:
-            ok = MetalExecutor::Instance().dequantQ8_1Block(storage->raw_data, cols, result.buffer);
+            ok = MetalExecutor::Instance().dequantQ8_1Block(storage->raw_data, cols, shadow);
             break;
         default:
             break;
         }
         if (ok) {
-            result.data = &result.buffer;
+            result.data = &shadow;
             result.owns_buffer = true;
             return true;
         }
     }
 #endif
     const uint8_t* ptr = storage->raw_data.data();
-    for (size_t row = 0; row < rows; ++row) {
-        dequantizeRowTo(ptr + row * stride,
-                        storage->dtype,
-                        result.head_dim,
-                        storage->quant_version,
-                        result.buffer.data() + row * result.head_dim);
+    // Per-kv-head row range: when `valid_positions_per_head` is non-zero, only
+    // dequant the first `valid_positions` rows per kv_head — the rest of the
+    // cache has never been written and remains at the buffer's zero-init.
+    // For TinyLlama at decode position 80 / context 2048 that's a 25× cut.
+    size_t valid_per_head = result.valid_positions_per_head;
+    if (valid_per_head == 0 || result.head_dim == 0) {
+        for (size_t row = 0; row < rows; ++row) {
+            dequantizeRowTo(ptr + row * stride,
+                            storage->dtype,
+                            result.head_dim,
+                            storage->quant_version,
+                            shadow.data() + row * result.head_dim);
+        }
+    } else {
+        size_t context_length = result.head_dim ? rows : 0;
+        size_t kv_heads = 0;
+        if (info && info->shape.size() >= 3) {
+            kv_heads = static_cast<size_t>(std::max<int64_t>(1, info->shape[0]));
+            context_length = static_cast<size_t>(std::max<int64_t>(1, info->shape[1]));
+        }
+        if (kv_heads == 0 || context_length == 0) {
+            // Shape unknown; fall back to full dequant.
+            for (size_t row = 0; row < rows; ++row) {
+                dequantizeRowTo(ptr + row * stride,
+                                storage->dtype,
+                                result.head_dim,
+                                storage->quant_version,
+                                shadow.data() + row * result.head_dim);
+            }
+        } else {
+            size_t cap = std::min(valid_per_head, context_length);
+            for (size_t kvh = 0; kvh < kv_heads; ++kvh) {
+                size_t base_row = kvh * context_length;
+                for (size_t r = 0; r < cap; ++r) {
+                    size_t row = base_row + r;
+                    dequantizeRowTo(ptr + row * stride,
+                                    storage->dtype,
+                                    result.head_dim,
+                                    storage->quant_version,
+                                    shadow.data() + row * result.head_dim);
+                }
+            }
+        }
     }
-    result.data = &result.buffer;
+    result.data = &shadow;
     result.owns_buffer = true;
     return true;
 }
@@ -369,12 +415,48 @@ void encodeCacheTensor(const ExecutionTensor* info,
     }
     storage->raw_data.resize(rows * stride);
     uint8_t* dst = storage->raw_data.data();
-    for (size_t row = 0; row < rows; ++row) {
-        quantizeRowFrom(decoded.data->data() + row * decoded.head_dim,
-                        storage->dtype,
-                        decoded.head_dim,
-                        storage->quant_version,
-                        dst + row * stride);
+    // Mirror the per-kv-head row range from decodeCacheTensor — rows that
+    // were never read also weren't written, so they stay zero in the storage
+    // (raw_data starts zero-init from ensureStateTensor) and don't need
+    // re-encoding. This is the encode-side half of the active-rows
+    // optimization that keeps fp16 cache perf-neutral at low context.
+    size_t valid_per_head = decoded.valid_positions_per_head;
+    if (valid_per_head == 0) {
+        for (size_t row = 0; row < rows; ++row) {
+            quantizeRowFrom(decoded.data->data() + row * decoded.head_dim,
+                            storage->dtype,
+                            decoded.head_dim,
+                            storage->quant_version,
+                            dst + row * stride);
+        }
+        return;
+    }
+    size_t context_length = rows;
+    size_t kv_heads = 1;
+    if (info->shape.size() >= 3) {
+        kv_heads = static_cast<size_t>(std::max<int64_t>(1, info->shape[0]));
+        context_length = static_cast<size_t>(std::max<int64_t>(1, info->shape[1]));
+    } else {
+        for (size_t row = 0; row < rows; ++row) {
+            quantizeRowFrom(decoded.data->data() + row * decoded.head_dim,
+                            storage->dtype,
+                            decoded.head_dim,
+                            storage->quant_version,
+                            dst + row * stride);
+        }
+        return;
+    }
+    size_t cap = std::min(valid_per_head, context_length);
+    for (size_t kvh = 0; kvh < kv_heads; ++kvh) {
+        size_t base_row = kvh * context_length;
+        for (size_t r = 0; r < cap; ++r) {
+            size_t row = base_row + r;
+            quantizeRowFrom(decoded.data->data() + row * decoded.head_dim,
+                            storage->dtype,
+                            decoded.head_dim,
+                            storage->quant_version,
+                            dst + row * stride);
+        }
     }
 }
 
@@ -923,6 +1005,19 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                 CacheDecodeResult cache_k_decoded;
                 CacheDecodeResult cache_v_decoded;
                 size_t head_dim_attr = static_cast<size_t>(node.attributes.count("head_dim") ? node.attributes.at("head_dim") : 0.0f);
+                // Active-rows hint: the cache rows beyond
+                // (sequencePosition + 1) per kv_head have never been written
+                // and stay at zero. Plumbed only when the cache storage is
+                // non-F32 (decode/encode are no-ops at F32 because the
+                // float_data IS the storage); for F16 it's the bulk of the
+                // commit-1 perf preservation.
+                size_t pre_position = context->sequencePosition();
+                if (cache_k_storage && cache_k_storage->dtype != frontend::GGML_TYPE_F32) {
+                    cache_k_decoded.valid_positions_per_head = pre_position + 1;
+                }
+                if (cache_v_storage && cache_v_storage->dtype != frontend::GGML_TYPE_F32) {
+                    cache_v_decoded.valid_positions_per_head = pre_position + 1;
+                }
                 if (!decodeCacheTensor(node, cache_k_info, cache_k_storage, head_dim_attr, cache_k_decoded) ||
                     !decodeCacheTensor(node, cache_v_info, cache_v_storage, head_dim_attr, cache_v_decoded)) {
                     use_gpu = false;
@@ -950,21 +1045,39 @@ BackendExecutionResult CpuExecutionBackend::execute(const ExecutionNode& node,
                             }
                         }
                     }
+                    // decodeCacheTensor has already produced fp32 buffers in
+                    // cache_*_decoded.data (regardless of underlying storage
+                    // dtype). Tell runAttention's prepareCache the descriptor
+                    // is fp32 so it short-circuits the redundant per-row dequant.
+                    // Underlying storage dtype is preserved on the storage
+                    // pointer for encodeCacheTensor's re-encode at the end.
                     MetalExecutor::CacheDescriptor cache_k_desc;
-                    cache_k_desc.dtype = cache_k_storage ? cache_k_storage->dtype : frontend::GGML_TYPE_F32;
+                    cache_k_desc.dtype = frontend::GGML_TYPE_F32;
                     cache_k_desc.quant_version = cache_k_storage ? cache_k_storage->quant_version : 1;
-                    cache_k_desc.row_stride_bytes = cache_k_storage ? cache_k_storage->row_stride_bytes : 0;
+                    cache_k_desc.row_stride_bytes = cache_k_decoded.head_dim * sizeof(float);
                     cache_k_desc.raw_quant = cache_k_storage ? &cache_k_storage->raw_data : nullptr;
                     cache_k_desc.float_data = cache_k_decoded.data;
                     MetalExecutor::CacheDescriptor cache_v_desc;
-                    cache_v_desc.dtype = cache_v_storage ? cache_v_storage->dtype : frontend::GGML_TYPE_F32;
+                    cache_v_desc.dtype = frontend::GGML_TYPE_F32;
                     cache_v_desc.quant_version = cache_v_storage ? cache_v_storage->quant_version : 1;
-                    cache_v_desc.row_stride_bytes = cache_v_storage ? cache_v_storage->row_stride_bytes : 0;
+                    cache_v_desc.row_stride_bytes = cache_v_decoded.head_dim * sizeof(float);
                     cache_v_desc.raw_quant = cache_v_storage ? &cache_v_storage->raw_data : nullptr;
                     cache_v_desc.float_data = cache_v_decoded.data;
 #if defined(__APPLE__)
-                    cache_k_desc.handle = context->ensureMetalBuffer(cache_k_name, *cache_k_decoded.data);
-                    cache_v_desc.handle = context->ensureMetalBuffer(cache_v_name, *cache_v_decoded.data);
+                    // Only wrap a persistent MTLBuffer when the cache lives in
+                    // its own stable float_data (F32 storage). For non-F32
+                    // storage (e.g., F16 with MLC_FP16_KVCACHE) the dequant
+                    // produces a buffer in cache_*_decoded that goes out of
+                    // scope at the end of this attention call, so caching the
+                    // wrap by name would store a stale pointer. The dead GPU
+                    // cache path (sharedCacheValid force-pinned false) doesn't
+                    // consume the handle today, so this is defensive.
+                    if (cache_k_storage && cache_k_storage->dtype == frontend::GGML_TYPE_F32) {
+                        cache_k_desc.handle = context->ensureMetalBuffer(cache_k_name, *cache_k_decoded.data);
+                    }
+                    if (cache_v_storage && cache_v_storage->dtype == frontend::GGML_TYPE_F32) {
+                        cache_v_desc.handle = context->ensureMetalBuffer(cache_v_name, *cache_v_decoded.data);
+                    }
 #endif
                     if (context_length > 0 && num_heads > 0 && head_dim > 0) {
                         std::vector<float> mask;

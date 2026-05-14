@@ -3,6 +3,7 @@
 #include "runtime/quant_utils.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -134,6 +135,21 @@ void ExecutionContext::ensureStateTensor(const ExecutionTensor& tensor_info) {
     uint32_t dtype = tensor_info.has_ggml_dtype ? tensor_info.ggml_dtype : frontend::GGML_TYPE_F32;
     uint32_t quant_version = tensor_info.quant_version;
     if (quant_version == 0) quant_version = 1;
+    // KV cache fp16 override. Promote F32 cache_k / cache_v allocations to F16
+    // packed bytes so steady-state cache footprint halves. The decode/encode
+    // paths in operator_backend already round-trip via dequantizeRowTo /
+    // quantizeRowFrom (now F16-aware), so the attention compute sees fp32
+    // throughout. Net effect: storage-only fp16 with one fp32→fp16→fp32 round
+    // trip per token written into the cache.
+    if (dtype == frontend::GGML_TYPE_F32) {
+        static const bool kvcache_fp16 = (std::getenv("MLC_FP16_KVCACHE") != nullptr);
+        if (kvcache_fp16) {
+            auto role_it = tensor_info.metadata.find("role");
+            if (role_it != tensor_info.metadata.end() && role_it->second == "kv_cache") {
+                dtype = frontend::GGML_TYPE_F16;
+            }
+        }
+    }
     size_t head_dim = 1;
     if (!tensor_info.shape.empty()) {
         head_dim = static_cast<size_t>(std::max<int64_t>(1, tensor_info.shape.back()));
