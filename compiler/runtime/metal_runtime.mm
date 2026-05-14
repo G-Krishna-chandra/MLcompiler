@@ -1211,22 +1211,22 @@ kernel void flash_attention_v1(
 
     // 2. Q·K^T — each thread computes whole-dot-products for its strided scores.
     //    Score at kv position s is the dot product of Q with K[s, kv, :].
+    //    qk_out (debug only) is written inline per-position; this matches the
+    //    per-tile-slice write pattern the multi-tile rewrite uses, so the
+    //    single-tile kernel exercises the same dump path.
     for (uint s = t; s < S; s += D) {
         float score = 0.0f;
         const device float* k_row = K + s * params.kv_heads * D + kv * D;
         for (uint d = 0; d < D; ++d) {
             score += shared_q[d] * k_row[d];
         }
-        shared_scores[s] = score * params.inv_sqrt_d;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Optional intermediate dump: post-Q·K, pre-softmax.
-    if (params.debug_dump != 0u) {
-        for (uint s = t; s < S; s += D) {
-            qk_out[head * S + s] = shared_scores[s];
+        float scaled = score * params.inv_sqrt_d;
+        shared_scores[s] = scaled;
+        if (params.debug_dump != 0u) {
+            qk_out[head * S + s] = scaled;
         }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // 3. Softmax part 1 — max reduction across S.
     float my_max = -INFINITY;
@@ -1271,19 +1271,27 @@ kernel void flash_attention_v1(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Optional intermediate dump: post-softmax weights.
-    if (params.debug_dump != 0u) {
-        for (uint s = t; s < S; s += D) {
-            sm_out[head * S + s] = shared_scores[s];
-        }
-    }
-
     // 6. Output = weights · V. Thread t accumulates output dim t.
     float acc = 0.0f;
     for (uint s = 0; s < S; ++s) {
         acc += shared_scores[s] * V[s * params.kv_heads * D + kv * D + t];
     }
     O[head * D + t] = acc;
+
+    // 7. sm_out: softmax weights RECOMPUTED from raw scores in qk_out and the
+    // final (max_val, inv). Mathematically equivalent to running softmax
+    // weights at the final tile (same m, l), but NOT a tap of intermediate-
+    // tile running state. Validates that final m, l are correct; does not
+    // validate per-tile updates.
+    // For per-tile-state validation, see TODO: add option C harness
+    // (partial-tile reference) when intermediate-state debugging is needed.
+    if (params.debug_dump != 0u) {
+        for (uint s = t; s < S; s += D) {
+            float raw = qk_out[head * S + s];
+            float e = exp(raw - max_val);
+            sm_out[head * S + s] = e * inv;
+        }
+    }
 }
 )";
 } // namespace
