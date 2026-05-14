@@ -1570,15 +1570,24 @@ BackendExecutionResult MetalExecutionBackend::execute(const ExecutionNode& node,
                 CpuExecutionBackend cpu;
                 return cpu.execute(node, context, descriptor);
             }
-            std::vector<float> output;
-            if (!MetalExecutor::Instance().runFeedForward(*gate, *up, output)) {
+            // Pre-allocate output for stable host_dst (single-CB defer
+            // path, commit C1). runFeedForward dual-modes: when the open
+            // forward-pass CB is set it encodes onto it and defers the
+            // result download to flush; otherwise commits its own CB.
+            std::string out_name = node.outputs.empty() ? std::string() : node.outputs[0];
+            std::vector<float> tmp_out;
+            std::vector<float>* ffn_out = &tmp_out;
+            if (!out_name.empty()) {
+                ffn_out = &context->allocateTensor(out_name, gate->size(), /*zero=*/false);
+            }
+            MetalExecutor::Instance().clearLastDeferredOutput();
+            if (!MetalExecutor::Instance().runFeedForward(*gate, *up, *ffn_out, out_name)) {
                 CpuExecutionBackend cpu;
                 return cpu.execute(node, context, descriptor);
             }
-            if (!node.outputs.empty()) {
-                context->setTensor(node.outputs[0], std::move(output));
-            }
             result.message = "metal-ffn";
+            result.gpu_output_buffer = MetalExecutor::Instance().lastDeferredOutputBuffer();
+            result.gpu_output_element_count = MetalExecutor::Instance().lastDeferredOutputElementCount();
             return result;
         }
         case ExecOpType::Norm: {

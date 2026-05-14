@@ -275,7 +275,8 @@ public:
 
     bool runFeedForward(const std::vector<float>& gate,
                         const std::vector<float>& up,
-                        std::vector<float>& output) const;
+                        std::vector<float>& output,
+                        const std::string& output_tensor_name = "") const;
 
     bool runAdd(const std::vector<float>& a,
                 const std::vector<float>& b,

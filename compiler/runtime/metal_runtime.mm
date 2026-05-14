@@ -3099,8 +3099,11 @@ bool matmulQ4_K(const std::string& weight_name,
 
     bool feedForward(const std::vector<float>& gate,
                      const std::vector<float>& up,
-                     std::vector<float>& output) const {
+                     std::vector<float>& output,
+                     const std::string& output_tensor_name = "") const {
 #if defined(__APPLE__)
+        last_deferred_output_buffer_ = nil;
+        last_deferred_output_element_count_ = 0;
         if (!available() || !ffnPipeline) return false;
         if (gate.size() != up.size() || gate.empty()) return false;
         if (gate.size() > std::numeric_limits<uint32_t>::max()) return false;
@@ -3108,6 +3111,7 @@ bool matmulQ4_K(const std::string& weight_name,
         size_t bytes = gate.size() * sizeof(float);
         output.resize(gate.size());
         if (@available(macOS 11.0, *)) {
+            const bool deferred_mode = (open_forward_pass_cb_ != nil);
             @autoreleasepool {
                 id<MTLBuffer> gateBuffer = [device newBufferWithBytes:gate.data()
                                                                length:bytes
@@ -3121,7 +3125,9 @@ bool matmulQ4_K(const std::string& weight_name,
                     return false;
                 }
 
-                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLCommandBuffer> commandBuffer = deferred_mode
+                    ? open_forward_pass_cb_
+                    : [queue commandBuffer];
                 id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
                 if (!encoder) return false;
                 [encoder setComputePipelineState:ffnPipeline];
@@ -3140,10 +3146,24 @@ bool matmulQ4_K(const std::string& weight_name,
                 MTLSize thSize = MTLSizeMake(threadsPerGroup, 1, 1);
                 [encoder dispatchThreadgroups:tgSize threadsPerThreadgroup:thSize];
                 [encoder endEncoding];
-                [commandBuffer commit];
-                [commandBuffer waitUntilCompleted];
 
-                std::memcpy(output.data(), [outBuffer contents], bytes);
+                if (deferred_mode) {
+                    pass_retained_.push_back((id)gateBuffer);
+                    pass_retained_.push_back((id)upBuffer);
+                    pass_retained_.push_back((id)outBuffer);
+                    if (!output_tensor_name.empty()) {
+                        recordReadbackByName(outBuffer, output_tensor_name, bytes,
+                                             /*needs_host=*/true);
+                    } else {
+                        recordReadback(outBuffer, &output, bytes, /*needs_host=*/true);
+                    }
+                    last_deferred_output_buffer_ = outBuffer;
+                    last_deferred_output_element_count_ = gate.size();
+                } else {
+                    [commandBuffer commit];
+                    [commandBuffer waitUntilCompleted];
+                    std::memcpy(output.data(), [outBuffer contents], bytes);
+                }
                 return true;
             }
         }
@@ -5271,9 +5291,10 @@ bool MetalExecutor::dequantQKRow(const std::vector<uint8_t>& src,
 
 bool MetalExecutor::runFeedForward(const std::vector<float>& gate,
                                    const std::vector<float>& up,
-                                   std::vector<float>& output) const {
+                                   std::vector<float>& output,
+                                   const std::string& output_tensor_name) const {
     if (!impl_) return false;
-    return impl_->feedForward(gate, up, output);
+    return impl_->feedForward(gate, up, output, output_tensor_name);
 }
 
 bool MetalExecutor::runAdd(const std::vector<float>& a,
