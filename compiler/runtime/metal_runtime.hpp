@@ -310,13 +310,18 @@ public:
                       const CacheDescriptor& cache_v,
                       std::vector<float>& output) const;
 
-    // Skeleton flash-attention v1 (single-tile, no cache, no RoPE, no mask).
-    // Math correctness only — not yet wired into the production attention path.
-    // q:        [num_heads, head_dim]
-    // k, v:     [kv_seq, kv_heads, head_dim]   (token-major)
-    // output:   [num_heads, head_dim]
-    // qk_debug: optional [num_heads, kv_seq] — pre-softmax scores when non-null
-    // sm_debug: optional [num_heads, kv_seq] — post-softmax weights when non-null
+    // Flash-attention v1 (multi-tile online softmax, no cache, no RoPE).
+    // Math correctness validated by mlc test-attention; gated default-off in
+    // the production attention path until session-C perf measurement.
+    // q:            [num_heads, head_dim]
+    // k, v:         [kv_seq, kv_heads, head_dim]   (token-major)
+    // output:       [num_heads, head_dim]
+    // apply_causal: when true, scores at kv positions > q_position are masked
+    //               to -INFINITY. For q_seq=1 decode at position kv_seq-1 the
+    //               mask is a no-op.
+    // q_position:   the kv position of the active query for causal masking.
+    // qk_debug:     optional [num_heads, kv_seq] — pre-softmax scores when non-null
+    // sm_debug:     optional [num_heads, kv_seq] — post-softmax weights when non-null
     bool runFlashAttention(const std::vector<float>& q,
                             const std::vector<float>& k,
                             const std::vector<float>& v,
@@ -324,6 +329,8 @@ public:
                             size_t kv_heads,
                             size_t head_dim,
                             size_t kv_seq,
+                            bool apply_causal,
+                            size_t q_position,
                             std::vector<float>& output,
                             std::vector<float>* qk_debug = nullptr,
                             std::vector<float>* sm_debug = nullptr) const;

@@ -1190,7 +1190,9 @@ struct FlashAttnParams {
     uint head_dim;
     uint kv_seq;
     float inv_sqrt_d;
-    uint debug_dump;   // 0 or 1; when 1, qk_out/sm_out are written
+    uint debug_dump;        // 0 or 1; when 1, qk_out/sm_out are written
+    uint apply_causal;      // 0 or 1; when 1, mask scores for kv_pos > q_position
+    uint q_position;        // for q_seq=1, the kv position of the active query
 };
 
 constant uint FLASH_TILE_SIZE = 32u;
@@ -1243,7 +1245,9 @@ kernel void flash_attention_v1(
 
         // 2. Tile scores: each thread computes whole-dot-products for its
         // strided positions within the tile. qk_out (debug) is written
-        // inline per-position.
+        // inline per-position. Causal mask sets the score to -INFINITY when
+        // kv_pos > q_position; downstream max-reduce and exp pass treat
+        // masked positions as zero-weighted (exp(-INF - finite_max) = 0).
         for (uint s_local = t; s_local < tile_n; s_local += D) {
             float score = 0.0f;
             threadgroup const float* k_row = tile_K + s_local * D;
@@ -1251,9 +1255,13 @@ kernel void flash_attention_v1(
                 score += shared_q[d] * k_row[d];
             }
             float scaled = score * params.inv_sqrt_d;
+            uint kv_pos = tile_start + s_local;
+            if (params.apply_causal != 0u && kv_pos > params.q_position) {
+                scaled = -INFINITY;
+            }
             tile_scores[s_local] = scaled;
             if (params.debug_dump != 0u) {
-                qk_out[head * S + tile_start + s_local] = scaled;
+                qk_out[head * S + kv_pos] = scaled;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1283,9 +1291,13 @@ kernel void flash_attention_v1(
         float alpha = (m == -INFINITY) ? 0.0f : exp(m - m_new);
 
         // 5. exp(score - m_new) into tile_scores; tile sum via tree reduce.
+        // Guard against -INFINITY scores (from causal mask or an all-masked
+        // tile with m_new == -INFINITY): exp(NaN) would propagate. Treating
+        // masked scores as exp = 0 keeps the recurrence clean.
         float my_sum = 0.0f;
         for (uint s = t; s < tile_n; s += D) {
-            float e = exp(tile_scores[s] - m_new);
+            float ts = tile_scores[s];
+            float e = (ts == -INFINITY) ? 0.0f : exp(ts - m_new);
             tile_scores[s] = e;
             my_sum += e;
         }
@@ -1328,7 +1340,7 @@ kernel void flash_attention_v1(
     if (params.debug_dump != 0u) {
         for (uint s = t; s < S; s += D) {
             float raw = qk_out[head * S + s];
-            float e = exp(raw - m);
+            float e = (raw == -INFINITY) ? 0.0f : exp(raw - m);
             sm_out[head * S + s] = e * inv_l;
         }
     }
@@ -4069,6 +4081,8 @@ bool matmulQ4_K(const std::string& weight_name,
                         size_t kv_heads,
                         size_t head_dim,
                         size_t kv_seq,
+                        bool apply_causal,
+                        size_t q_position,
                         std::vector<float>& output,
                         std::vector<float>* qk_debug,
                         std::vector<float>* sm_debug) const {
@@ -4126,6 +4140,8 @@ bool matmulQ4_K(const std::string& weight_name,
                     uint32_t kv_seq;
                     float inv_sqrt_d;
                     uint32_t debug_dump;
+                    uint32_t apply_causal;
+                    uint32_t q_position;
                 } params;
                 params.num_heads = static_cast<uint32_t>(num_heads);
                 params.kv_heads = static_cast<uint32_t>(effective_kv_heads);
@@ -4133,6 +4149,8 @@ bool matmulQ4_K(const std::string& weight_name,
                 params.kv_seq = static_cast<uint32_t>(kv_seq);
                 params.inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
                 params.debug_dump = dump ? 1u : 0u;
+                params.apply_causal = apply_causal ? 1u : 0u;
+                params.q_position = static_cast<uint32_t>(q_position);
 
                 id<MTLCommandBuffer> cb = [queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -4165,7 +4183,8 @@ bool matmulQ4_K(const std::string& weight_name,
         }
 #endif
         (void)q; (void)k; (void)v; (void)num_heads; (void)kv_heads;
-        (void)head_dim; (void)kv_seq; (void)output; (void)qk_debug; (void)sm_debug;
+        (void)head_dim; (void)kv_seq; (void)apply_causal; (void)q_position;
+        (void)output; (void)qk_debug; (void)sm_debug;
         return false;
     }
 };
@@ -4978,12 +4997,15 @@ bool MetalExecutor::runFlashAttention(const std::vector<float>& q,
                                        size_t kv_heads,
                                        size_t head_dim,
                                        size_t kv_seq,
+                                       bool apply_causal,
+                                       size_t q_position,
                                        std::vector<float>& output,
                                        std::vector<float>* qk_debug,
                                        std::vector<float>* sm_debug) const {
     if (!impl_) return false;
     return impl_->flashAttention(q, k, v, num_heads, kv_heads, head_dim,
-                                 kv_seq, output, qk_debug, sm_debug);
+                                 kv_seq, apply_causal, q_position,
+                                 output, qk_debug, sm_debug);
 }
 
 bool MetalExecutor::hasFeedForwardKernel() const {

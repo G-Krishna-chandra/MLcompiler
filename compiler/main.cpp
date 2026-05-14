@@ -2659,7 +2659,26 @@ DiagMetrics metrics(const std::vector<float>& a, const std::vector<float>& b, in
     double max_abs = 0, sum_abs = 0, sum_sq = 0, dot = 0, na2 = 0, nb2 = 0;
     std::vector<std::pair<float, size_t>> errs;
     errs.reserve(a.size());
+    size_t finite_count = 0;
     for (size_t i = 0; i < a.size(); ++i) {
+        bool af = std::isfinite(a[i]);
+        bool bf = std::isfinite(b[i]);
+        if (!af && !bf) {
+            // Both sides masked to ±INFINITY at the same position — agreement,
+            // contributes nothing to error or cosine. Comes up with causal
+            // attention where matching -INFINITY in both sides means "both
+            // agree this position is masked."
+            errs.push_back({0.0f, i});
+            continue;
+        }
+        if (!af || !bf) {
+            // One side -INFINITY, the other finite — real divergence.
+            max_abs = std::numeric_limits<double>::infinity();
+            sum_abs = std::numeric_limits<double>::infinity();
+            sum_sq = std::numeric_limits<double>::infinity();
+            errs.push_back({std::numeric_limits<float>::infinity(), i});
+            continue;
+        }
         double d  = double(a[i]) - double(b[i]);
         double ad = std::fabs(d);
         if (ad > max_abs) max_abs = ad;
@@ -2669,10 +2688,12 @@ DiagMetrics metrics(const std::vector<float>& a, const std::vector<float>& b, in
         na2 += double(a[i]) * double(a[i]);
         nb2 += double(b[i]) * double(b[i]);
         errs.push_back({static_cast<float>(ad), i});
+        ++finite_count;
     }
+    if (finite_count == 0) finite_count = 1;  // avoid divide-by-zero below
     m.max_abs  = static_cast<float>(max_abs);
-    m.mean_abs = static_cast<float>(sum_abs / a.size());
-    m.rms      = static_cast<float>(std::sqrt(sum_sq / a.size()));
+    m.mean_abs = static_cast<float>(sum_abs / static_cast<double>(finite_count));
+    m.rms      = static_cast<float>(std::sqrt(sum_sq / static_cast<double>(finite_count)));
     m.cosine   = (na2 > 0 && nb2 > 0)
                      ? static_cast<float>(dot / (std::sqrt(na2) * std::sqrt(nb2)))
                      : std::numeric_limits<float>::quiet_NaN();
@@ -3018,6 +3039,10 @@ struct AttnConfig {
     size_t head_dim  = 64;
     size_t kv_seq    = 16;
     bool causal      = false;
+    // For causal mode with q_seq=1, the kv position of the active query.
+    // Scores at kv positions > q_position get masked. Default kv_seq-1 means
+    // the query is the latest token (sees everything, mask is a no-op).
+    size_t q_position = SIZE_MAX;  // SIZE_MAX → set to kv_seq-1 at use
     uint64_t seed    = 42;
 };
 
@@ -3116,15 +3141,19 @@ AttnSubSteps handwrittenAttention(const AttnConfig& cfg, const AttnTensors& t) {
         const size_t hk = (Hk > 0) ? (h / heads_per_kv) : h;
         const float* q_row = t.q.data() + h * D;
         // Q · K^T per timestep, with 1/sqrt(d) scale (matches metal_runtime).
+        // Causal mask (cfg.causal): kv positions > q_position get -INFINITY.
+        const size_t q_pos = (cfg.q_position == SIZE_MAX) ? (S - 1) : cfg.q_position;
         for (size_t s = 0; s < S; ++s) {
+            if (cfg.causal && s > q_pos) {
+                r.qk_scores[h * S + s] = -std::numeric_limits<float>::infinity();
+                continue;
+            }
             const float* k_row = t.k.data() + s * Hk * D + hk * D;
             float dot = 0.0f;
             for (size_t d = 0; d < D; ++d) dot += q_row[d] * k_row[d];
             r.qk_scores[h * S + s] = dot * inv_sqrt_d;
         }
-        // Softmax (numerically stable). Causal for q_seq=1 at position S-1
-        // is a no-op (all kv positions are in the past); kept here for the
-        // moment q_seq > 1 lands.
+        // Softmax (numerically stable).
         float max_v = r.qk_scores[h * S];
         for (size_t s = 1; s < S; ++s) max_v = std::max(max_v, r.qk_scores[h * S + s]);
         float sum = 0.0f;
@@ -3158,9 +3187,11 @@ bool flashAttention(const AttnConfig& cfg, const AttnTensors& t,
     using namespace mlc::runtime;
     if (!MetalExecutor::Instance().isAvailable()) return false;
     out.clear();
+    const size_t q_pos = (cfg.q_position == SIZE_MAX) ? (cfg.kv_seq - 1) : cfg.q_position;
     return MetalExecutor::Instance().runFlashAttention(
         t.q, t.k, t.v,
         cfg.num_heads, cfg.kv_heads, cfg.head_dim, cfg.kv_seq,
+        cfg.causal, q_pos,
         out, qk_debug, sm_debug);
 }
 
@@ -3224,6 +3255,7 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
     bool sweep = false;
     bool dump_intermediates = false;
     bool stress_online = false;
+    bool causal_prefill = false;
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         auto need = [&](const char* who) -> std::string {
@@ -3243,6 +3275,7 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
             else if (a == "--verify-tiny") verify_tiny = true;
             else if (a == "--sweep")    sweep = true;
             else if (a == "--stress-online") stress_online = true;
+            else if (a == "--causal-prefill") causal_prefill = true;
             else if (a == "--dump-flash-intermediates") dump_intermediates = true;
             else if (a == "--help" || a == "-h") { usage(); return 0; }
             else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
@@ -3268,7 +3301,10 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
         }
         auto handwritten = attndiag::handwrittenAttention(c, inputs);
         std::vector<float> canonical_out;
-        bool canonical_ok = attndiag::canonicalAttention(c, inputs, canonical_out);
+        // The canonical MPS path's mask plumbing doesn't take a custom
+        // q_position; skip H<->C when causal is on (handwritten vs flash is
+        // the comparison that matters for the masked case).
+        bool canonical_ok = !c.causal && attndiag::canonicalAttention(c, inputs, canonical_out);
 
         std::printf("# heads=%zu kv_heads=%zu head_dim=%zu kv_seq=%zu causal=%s seed=%llu mode=%s\n",
                     c.num_heads, c.kv_heads, c.head_dim, c.kv_seq,
@@ -3351,6 +3387,32 @@ int handleTestAttentionCommand(const std::vector<std::string>& args) {
         c.num_heads = 32; c.kv_heads = 4; c.head_dim = 64; c.kv_seq = 128;
         std::printf("=== stress-online (multi-tile rescale) ===\n");
         runOne(c, InputMode::StressOnline);
+        return 0;
+    }
+
+    if (causal_prefill) {
+        // Causal mask exercise: kv_seq=64 with q_position varying through
+        // the early-mid-late positions. The handwritten reference masks
+        // positions > q_position; flash kernel does the same in-kernel.
+        // Tests both single-tile (q_position < 32) and multi-tile (>= 32)
+        // boundary cases.
+        struct Case { size_t q_pos; const char* label; };
+        std::vector<Case> cases = {
+            {0,  "q_position=0 (single visible token)"},
+            {4,  "q_position=4 (early prefill)"},
+            {31, "q_position=31 (end of tile 0)"},
+            {32, "q_position=32 (start of tile 1)"},
+            {47, "q_position=47 (mid tile 1)"},
+            {63, "q_position=63 (no mask — full visibility)"},
+        };
+        for (const auto& cs : cases) {
+            std::printf("=== causal-prefill: %s ===\n", cs.label);
+            attndiag::AttnConfig c = cfg;
+            c.num_heads = 32; c.kv_heads = 4; c.head_dim = 64; c.kv_seq = 64;
+            c.causal = true;
+            c.q_position = cs.q_pos;
+            runOne(c, InputMode::Random);
+        }
         return 0;
     }
 
