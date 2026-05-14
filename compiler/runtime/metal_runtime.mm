@@ -2553,7 +2553,16 @@ bool matmulQ4_K(const std::string& weight_name,
                 std::vector<float>& output) const {
     (void)weight_name;  // CPU reference path; no Metal weight upload.
 #if defined(__APPLE__)
-    // Use CPU reference for exact parity with host path (avoids tiny GPU rounding drift).
+    // Q4_K matches the K-quant kernel template that matmulQ6_K uses. That
+    // path was validated and shipped in 748ff30 with full logits-cosine
+    // parity on TinyLlama Q4_0 (the model has one Q6_K tensor: lm_head). The
+    // identical one-line wiring works here too:
+    //     return matmulQuantK(weight_name, weights, input, rows, cols,
+    //                         row_stride, q4KMatmulPipeline, bias, output);
+    // Flip it when a Q4_K-quantized model is on the bench AND you have run
+    // `mlc compare --metal-vs-cpu` against it to confirm cosine 1.0 at the
+    // logits boundary. Until then we keep the host scalar loop so callers
+    // of an untested Metal path can't get silently-wrong tokens.
     if (input.size() != cols || weights.size() < row_stride * rows) return false;
     output.resize(rows, 0.0f);
     for (size_t r = 0; r < rows; ++r) {
