@@ -3001,6 +3001,283 @@ int handleTestMatmulQ4Command(const std::vector<std::string>& args) {
         return 1;
     }
 }
+
+// ============================================================================
+// test-attention: parity harness for the flash-attention bring-up coming in
+// item 4. No model load; deterministic Q/K/V from a seed; compare a
+// handwritten naive softmax(QK^T/sqrt(d))·V reference against the existing
+// batched-heads MPS attention from metal_runtime. The "new kernel" slot is
+// intentionally empty in this session — it gets filled in the next.
+// ============================================================================
+
+namespace attndiag {
+
+struct AttnConfig {
+    size_t num_heads = 32;
+    size_t kv_heads  = 4;
+    size_t head_dim  = 64;
+    size_t kv_seq    = 16;
+    bool causal      = false;
+    uint64_t seed    = 42;
+};
+
+struct AttnTensors {
+    // q is [num_heads, head_dim]  (q_seq = 1 in this session).
+    // k, v are [kv_seq, kv_heads, head_dim] — token-major to match the
+    // input layout `MetalExecutor::runAttention` expects for k_new/v_new.
+    std::vector<float> q;
+    std::vector<float> k;
+    std::vector<float> v;
+};
+
+struct AttnSubSteps {
+    std::vector<float> qk_scores;  // [num_heads, kv_seq]
+    std::vector<float> softmax_w;  // [num_heads, kv_seq]
+    std::vector<float> output;     // [num_heads, head_dim]
+};
+
+AttnTensors generateInputs(const AttnConfig& cfg) {
+    AttnTensors t;
+    std::mt19937_64 rng(cfg.seed);
+    std::normal_distribution<float> dist(0.0f, 0.1f);
+    t.q.resize(cfg.num_heads * cfg.head_dim);
+    for (auto& x : t.q) x = dist(rng);
+    size_t kv_per_token = cfg.kv_heads * cfg.head_dim;
+    t.k.resize(cfg.kv_seq * kv_per_token);
+    for (auto& x : t.k) x = dist(rng);
+    t.v.resize(cfg.kv_seq * kv_per_token);
+    for (auto& x : t.v) x = dist(rng);
+    return t;
+}
+
+// Hand-verifiable inputs: num_heads=1, kv_heads=1, head_dim=4, kv_seq=4
+// with Q=[1,0,0,0], K=I, V=I. Expected output for the one head:
+//   scores = [1,0,0,0] / sqrt(4) = [0.5, 0, 0, 0]
+//   weights = softmax(scores) = [e^0.5, 1, 1, 1] / (e^0.5 + 3)
+//                             ≈ [0.354661, 0.215113, 0.215113, 0.215113]
+//   output = weights · I = weights itself.
+AttnTensors tinyVerifyInputs() {
+    AttnTensors t;
+    t.q = {1.0f, 0.0f, 0.0f, 0.0f};
+    t.k = {1, 0, 0, 0,
+           0, 1, 0, 0,
+           0, 0, 1, 0,
+           0, 0, 0, 1};
+    t.v = t.k;
+    return t;
+}
+
+AttnSubSteps handwrittenAttention(const AttnConfig& cfg, const AttnTensors& t) {
+    AttnSubSteps r;
+    const size_t H = cfg.num_heads;
+    const size_t Hk = cfg.kv_heads;
+    const size_t D = cfg.head_dim;
+    const size_t S = cfg.kv_seq;
+    r.qk_scores.assign(H * S, 0.0f);
+    r.softmax_w.assign(H * S, 0.0f);
+    r.output.assign(H * D, 0.0f);
+    const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(D));
+    const size_t heads_per_kv = (Hk > 0) ? (H / Hk) : H;
+    for (size_t h = 0; h < H; ++h) {
+        const size_t hk = (Hk > 0) ? (h / heads_per_kv) : h;
+        const float* q_row = t.q.data() + h * D;
+        // Q · K^T per timestep, with 1/sqrt(d) scale (matches metal_runtime).
+        for (size_t s = 0; s < S; ++s) {
+            const float* k_row = t.k.data() + s * Hk * D + hk * D;
+            float dot = 0.0f;
+            for (size_t d = 0; d < D; ++d) dot += q_row[d] * k_row[d];
+            r.qk_scores[h * S + s] = dot * inv_sqrt_d;
+        }
+        // Softmax (numerically stable). Causal for q_seq=1 at position S-1
+        // is a no-op (all kv positions are in the past); kept here for the
+        // moment q_seq > 1 lands.
+        float max_v = r.qk_scores[h * S];
+        for (size_t s = 1; s < S; ++s) max_v = std::max(max_v, r.qk_scores[h * S + s]);
+        float sum = 0.0f;
+        for (size_t s = 0; s < S; ++s) {
+            float e = std::exp(r.qk_scores[h * S + s] - max_v);
+            r.softmax_w[h * S + s] = e;
+            sum += e;
+        }
+        if (sum > 0.0f) {
+            float inv = 1.0f / sum;
+            for (size_t s = 0; s < S; ++s) r.softmax_w[h * S + s] *= inv;
+        }
+        // Weighted · V.
+        for (size_t s = 0; s < S; ++s) {
+            const float* v_row = t.v.data() + s * Hk * D + hk * D;
+            float w = r.softmax_w[h * S + s];
+            for (size_t d = 0; d < D; ++d) r.output[h * D + d] += w * v_row[d];
+        }
+    }
+    return r;
+}
+
+// Canonical path: hand the same Q/K/V to the production batched-heads MPS
+// attention via the existing public runAttention helper. RoPE is turned off
+// (rotary_dim=0). The kernel writes K/V into a zeroed float cache at
+// positions [0..kv_seq-1], then Q reads from cache over those positions —
+// equivalent to naive softmax(QK^T/sqrt(d))·V without RoPE or masking.
+bool canonicalAttention(const AttnConfig& cfg, const AttnTensors& t,
+                         std::vector<float>& out) {
+    using namespace mlc::runtime;
+    if (!MetalExecutor::Instance().isAvailable()) return false;
+    const size_t context_length = cfg.kv_seq;
+    std::vector<float> cache_k(cfg.kv_heads * context_length * cfg.head_dim, 0.0f);
+    std::vector<float> cache_v(cfg.kv_heads * context_length * cfg.head_dim, 0.0f);
+    MetalExecutor::CacheDescriptor cdk, cdv;
+    cdk.dtype = mlc::frontend::GGML_TYPE_F32;
+    cdk.float_data = &cache_k;
+    cdv.dtype = mlc::frontend::GGML_TYPE_F32;
+    cdv.float_data = &cache_v;
+    std::vector<float> mask;
+    out.clear();
+    return MetalExecutor::Instance().runAttention(
+        t.q, t.k, t.v,
+        cfg.num_heads, cfg.kv_heads, cfg.head_dim,
+        context_length,
+        mask,
+        /*alibi_slopes=*/nullptr,
+        /*position=*/0,
+        /*rotary_dim=*/0,
+        /*rope_freq_base=*/10000.0f,
+        /*rope_freq_scale=*/1.0f,
+        cdk, cdv,
+        out);
+}
+
+} // namespace attndiag
+
+int handleTestAttentionCommand(const std::vector<std::string>& args) {
+    auto usage = []() {
+        std::cerr << "Usage: mlc test-attention [options]\n"
+                     "  --num-heads N     (default 32)\n"
+                     "  --kv-heads N      (default 4; 0 => no GQA)\n"
+                     "  --head-dim N      (default 64)\n"
+                     "  --kv-seq N        (default 16)\n"
+                     "  --seed N          (default 42)\n"
+                     "  --causal          (apply causal mask; no-op for q_seq=1)\n"
+                     "  --verify-tiny     (run the 4-elem hand-verified sanity case)\n"
+                     "  --sweep           (run a small sweep of GQA / shape configs)\n"
+                     "Three-way parity harness: handwritten naive attention vs the\n"
+                     "production MPS attention. The new-kernel slot is empty until\n"
+                     "the flash-attention bring-up commit.\n";
+    };
+    attndiag::AttnConfig cfg;
+    bool verify_tiny = false;
+    bool sweep = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        auto need = [&](const char* who) -> std::string {
+            if (i + 1 >= args.size()) {
+                std::cerr << who << " needs a value\n";
+                return std::string();
+            }
+            return args[++i];
+        };
+        try {
+            if (a == "--num-heads") cfg.num_heads = std::stoul(need("--num-heads"));
+            else if (a == "--kv-heads") cfg.kv_heads = std::stoul(need("--kv-heads"));
+            else if (a == "--head-dim") cfg.head_dim = std::stoul(need("--head-dim"));
+            else if (a == "--kv-seq")   cfg.kv_seq = std::stoul(need("--kv-seq"));
+            else if (a == "--seed")     cfg.seed = std::stoull(need("--seed"));
+            else if (a == "--causal")   cfg.causal = true;
+            else if (a == "--verify-tiny") verify_tiny = true;
+            else if (a == "--sweep")    sweep = true;
+            else if (a == "--help" || a == "-h") { usage(); return 0; }
+            else { std::cerr << "unknown arg: " << a << "\n"; usage(); return 1; }
+        } catch (const std::exception& e) {
+            std::cerr << "arg parse: " << e.what() << "\n";
+            return 1;
+        }
+    }
+
+    auto runOne = [&](attndiag::AttnConfig c, bool tiny) -> bool {
+        if (c.kv_heads == 0) c.kv_heads = c.num_heads;
+        if (c.num_heads % c.kv_heads != 0) {
+            std::cerr << "num_heads must be a multiple of kv_heads (got "
+                      << c.num_heads << " / " << c.kv_heads << ")\n";
+            return false;
+        }
+        attndiag::AttnTensors inputs = tiny
+            ? attndiag::tinyVerifyInputs()
+            : attndiag::generateInputs(c);
+        auto handwritten = attndiag::handwrittenAttention(c, inputs);
+        std::vector<float> canonical_out;
+        bool canonical_ok = attndiag::canonicalAttention(c, inputs, canonical_out);
+
+        std::printf("# heads=%zu kv_heads=%zu head_dim=%zu kv_seq=%zu causal=%s seed=%llu\n",
+                    c.num_heads, c.kv_heads, c.head_dim, c.kv_seq,
+                    c.causal ? "true" : "false",
+                    static_cast<unsigned long long>(c.seed));
+        if (tiny) {
+            std::printf("# tiny-verify expected: [0.354661, 0.215113, 0.215113, 0.215113]\n");
+            std::printf("# handwritten actual:   [");
+            for (size_t d = 0; d < c.head_dim; ++d) {
+                std::printf("%s%.6f", d == 0 ? "" : ", ", handwritten.output[d]);
+            }
+            std::printf("]\n");
+        }
+
+        std::printf("%-12s | %-10s | %12s | %12s | %12s | %12s | %s\n",
+                    "sub-step", "pair", "cosine", "max_abs", "mean_abs", "rms", "flag");
+        std::printf("%s\n", std::string(96, '-').c_str());
+        auto report = [&](const std::string& step,
+                          const std::string& pair,
+                          const std::vector<float>& a,
+                          const std::vector<float>& b) {
+            if (a.size() != b.size() || a.empty()) {
+                std::printf("%-12s | %-10s | (size mismatch a=%zu b=%zu)\n",
+                            step.c_str(), pair.c_str(), a.size(), b.size());
+                return;
+            }
+            auto m = q4diag::metrics(a, b, 0);
+            const char* flag = (std::isfinite(m.cosine) && m.cosine >= 0.999f) ? "OK" : "FAIL";
+            std::printf("%-12s | %-10s | %12.6f | %12.3e | %12.3e | %12.3e | %s\n",
+                        step.c_str(), pair.c_str(),
+                        m.cosine, m.max_abs, m.mean_abs, m.rms, flag);
+        };
+        if (canonical_ok) {
+            report("full", "H<->C", handwritten.output, canonical_out);
+        } else {
+            std::printf("%-12s | %-10s | (canonical MPS unavailable)\n", "full", "H<->C");
+        }
+        std::printf("%-12s | %-10s | (reserved for flash-attention slot)\n", "qk", "H<->N");
+        std::printf("%-12s | %-10s | (reserved for flash-attention slot)\n", "softmax", "H<->N");
+        std::printf("%-12s | %-10s | (reserved for flash-attention slot)\n", "attv", "H<->N");
+        std::printf("\n");
+        return canonical_ok;
+    };
+
+    if (verify_tiny) {
+        attndiag::AttnConfig c = cfg;
+        c.num_heads = 1; c.kv_heads = 1; c.head_dim = 4; c.kv_seq = 4;
+        runOne(c, /*tiny=*/true);
+        return 0;
+    }
+
+    if (sweep) {
+        struct Case { size_t H, Hk, D, S; const char* label; };
+        std::vector<Case> cases = {
+            {1, 1, 64, 16,   "single-head"},
+            {8, 8, 64, 16,   "no-GQA"},
+            {32, 4, 64, 1,   "GQA-kv1"},
+            {32, 4, 64, 16,  "GQA-kv16 (TinyLlama-ish)"},
+            {32, 4, 64, 64,  "GQA-kv64"},
+            {32, 4, 64, 256, "GQA-kv256"},
+        };
+        for (const auto& cs : cases) {
+            std::printf("=== %s ===\n", cs.label);
+            attndiag::AttnConfig c = cfg;
+            c.num_heads = cs.H; c.kv_heads = cs.Hk; c.head_dim = cs.D; c.kv_seq = cs.S;
+            runOne(c, false);
+        }
+        return 0;
+    }
+
+    runOne(cfg, false);
+    return 0;
+}
 }
 
 int main(int argc, char* argv[]) {
@@ -3051,6 +3328,8 @@ int main(int argc, char* argv[]) {
         return handleCompareCommand(args.arguments);
     } else if (args.command == "test-matmul-q4") {
         return handleTestMatmulQ4Command(args.arguments);
+    } else if (args.command == "test-attention") {
+        return handleTestAttentionCommand(args.arguments);
     } else if (args.command == "capabilities") {
         return handleCapabilitiesCommand();
     } else {
