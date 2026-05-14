@@ -525,7 +525,15 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
 
     auto flushWindow = [&]() {
         if (MetalExecutor::Instance().hasForwardPassCB()) {
-            MetalExecutor::Instance().flushForwardPassCB();
+            // Resolver re-looks up host_dst by tensor name at flush time.
+            // Survives unordered_map rehashes between encode and flush —
+            // matters once a single forward-pass CB stays open across
+            // many ops (commit B4). Legacy raw-pointer readbacks (empty
+            // tensor_name) keep working via the captured pointer.
+            auto resolver = [&](const std::string& name) -> std::vector<float>* {
+                return context_ ? context_->mutableTensor(name) : nullptr;
+            };
+            MetalExecutor::Instance().flushForwardPassCB(resolver);
         }
         pass_outputs.clear();
     };

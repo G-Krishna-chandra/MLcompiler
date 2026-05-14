@@ -1482,8 +1482,16 @@ struct MetalExecutor::Impl {
 
     struct PendingReadback {
         id<MTLBuffer> source;
-        std::vector<float>* dst;
-        size_t byte_count;
+        // Two lookup modes:
+        //   - tensor_name non-empty: at flush time, re-resolve the host
+        //     destination by name via the resolver callback passed to
+        //     flushForwardPassCB(). Survives unordered_map rehashes that
+        //     would invalidate a raw pointer captured at encode time.
+        //   - tensor_name empty: fall back to dst pointer (legacy path).
+        //     Caller guarantees no rehash between encode and flush.
+        std::string tensor_name;
+        std::vector<float>* dst = nullptr;
+        size_t byte_count = 0;
     };
     mutable std::vector<PendingReadback> pass_readbacks_;
 
@@ -1533,6 +1541,10 @@ struct MetalExecutor::Impl {
         // Oversized direct allocation — release via ARC by letting it go.
     }
 
+    // Legacy: register a readback by raw pointer. Caller guarantees the
+    // pointer remains valid until flush. Safe inside short-lived fusion
+    // windows (item 1) where no other tensor allocation happens between
+    // encode and flush.
     void recordReadback(id<MTLBuffer> out_buf,
                         std::vector<float>* host_dst,
                         size_t byte_count,
@@ -1541,6 +1553,21 @@ struct MetalExecutor::Impl {
         PendingReadback rb;
         rb.source = out_buf;
         rb.dst = host_dst;
+        rb.byte_count = byte_count;
+        pass_readbacks_.push_back(rb);
+    }
+    // Name-resolved variant: tensor_name is re-resolved by the
+    // resolver passed to flushForwardPassCB. Use across long-lived
+    // forward-pass CBs (commit B4) where the executor's tensor map
+    // may rehash between encode and flush.
+    void recordReadbackByName(id<MTLBuffer> out_buf,
+                              const std::string& tensor_name,
+                              size_t byte_count,
+                              bool needs_host) const {
+        if (!needs_host) return;
+        PendingReadback rb;
+        rb.source = out_buf;
+        rb.tensor_name = tensor_name;
         rb.byte_count = byte_count;
         pass_readbacks_.push_back(rb);
     }
@@ -4614,6 +4641,11 @@ bool MetalExecutor::beginForwardPassCB() const {
 }
 
 bool MetalExecutor::flushForwardPassCB() const {
+    return flushForwardPassCB(nullptr);
+}
+
+bool MetalExecutor::flushForwardPassCB(
+    const std::function<std::vector<float>*(const std::string&)>& resolver) const {
 #if defined(__APPLE__)
     if (!impl_ || impl_->open_forward_pass_cb_ == nil) {
         // No open CB but possibly still some pool buffers to return / pending
@@ -4634,9 +4666,17 @@ bool MetalExecutor::flushForwardPassCB() const {
     // needs_host=false stay GPU-resident and would have already been
     // consumed by a downstream encoded op via its FromBuffer variant.
     for (const auto& rb : impl_->pass_readbacks_) {
-        if (rb.source && rb.dst) {
-            std::memcpy(rb.dst->data(), [rb.source contents], rb.byte_count);
+        if (!rb.source) continue;
+        // Re-resolve host_dst by name when one was supplied; falls back to
+        // the captured pointer otherwise. The name path is the one that
+        // survives an unordered_map rehash between encode and flush.
+        std::vector<float>* dst = rb.dst;
+        if (!rb.tensor_name.empty() && resolver) {
+            std::vector<float>* fresh = resolver(rb.tensor_name);
+            if (fresh) dst = fresh;
         }
+        if (!dst) continue;
+        std::memcpy(dst->data(), [rb.source contents], rb.byte_count);
     }
     impl_->pass_readbacks_.clear();
     // Return all pool buffers checked out by this window.
@@ -4648,6 +4688,7 @@ bool MetalExecutor::flushForwardPassCB() const {
     impl_->open_forward_pass_cb_ = nil;
     return ok;
 #else
+    (void)resolver;
     return true;
 #endif
 }

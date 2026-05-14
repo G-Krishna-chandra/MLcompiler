@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -180,6 +181,14 @@ public:
     bool beginForwardPassCB() const;
     bool hasForwardPassCB() const;
     bool flushForwardPassCB() const;
+    // Variant that re-resolves deferred-readback host destinations by tensor
+    // name at flush time. Each PendingReadback that was registered with a
+    // non-empty tensor_name calls `resolver(name)` to get the current
+    // host_dst pointer. Use when the executor's tensor map may have
+    // rehashed between encode and flush — invalidating any raw pointers
+    // captured at encode time. The fallback (empty tensor_name) still uses
+    // the captured pointer.
+    bool flushForwardPassCB(const std::function<std::vector<float>*(const std::string&)>& resolver) const;
     void discardForwardPassCB() const;
 
     // Encode entry points. Each requires hasForwardPassCB() == true.
