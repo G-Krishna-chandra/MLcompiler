@@ -3652,6 +3652,44 @@ bool matmulQ4_K(const std::string& weight_name,
                     }
                 }
 
+                // === Flash-attention v1 dispatch (Session C, gated default-off) ===
+                // MLC_FLASH_ATTN=1 routes through the custom Metal kernel that
+                // does Q·K + softmax + ·V in one launch. Reads K/V directly
+                // from the KV cache via strided addressing; no GQA broadcast
+                // needed (the kernel maps q_head → kv_head internally).
+                // For q_seq=1 (decode and item-3 batched prefill, which loops
+                // per-token externally), the Q sees all cached positions
+                // [0, tokens) and causal masking is a no-op.
+                static const bool use_flash_attn = (std::getenv("MLC_FLASH_ATTN") != nullptr);
+                if (use_flash_attn && flashAttentionPipeline && kv_cache_k && kv_cache_v) {
+                    // Q rotation (CPU; cheap for num_heads × head_dim floats).
+                    std::vector<float> q_for_flash(q.begin(),
+                                                    q.begin() + num_heads * head_dim);
+                    if (use_rotary && !q_single_cos.empty()) {
+                        for (size_t h = 0; h < num_heads; ++h) {
+                            applyRotaryEmbedding(q_for_flash.data() + h * head_dim,
+                                                 q_single_cos, q_single_sin,
+                                                 head_dim, effective_rotary);
+                        }
+                    }
+                    bool ok = MetalExecutor::Instance().runFlashAttentionStrided(
+                        q_for_flash,
+                        kv_cache_k->data(), kv_cache_k->size(),
+                        kv_cache_v->data(), kv_cache_v->size(),
+                        num_heads, effective_kv_heads, head_dim,
+                        /*kv_seq=*/tokens,
+                        /*apply_causal=*/false,
+                        /*q_position=*/tokens > 0 ? tokens - 1 : 0,
+                        /*k_stride_token=*/head_dim,
+                        /*k_stride_kv_head=*/kv_stride,
+                        /*v_stride_token=*/head_dim,
+                        /*v_stride_kv_head=*/kv_stride,
+                        output);
+                    if (ok) return true;
+                    // Fall through to MPS path on kernel failure (shape outside
+                    // the kernel's accepted range, etc.).
+                }
+
                 // === Attention dispatch path selection ===
                 // Default: batched-heads path (Tier 2) — one command buffer per
                 // attention call, all num_heads matmuls fused via MPS batching,
