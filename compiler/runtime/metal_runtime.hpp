@@ -169,6 +169,40 @@ public:
     // count since process start.
     std::string weightCacheSummary() const;
 
+    // === Deferred-commit fusion window ===
+    // Open a window with beginFusionWindow(), encode supported ops onto its
+    // shared MTLCommandBuffer with encodeMatMulQ4_0 / encodeRmsNorm /
+    // encodeAdd, then either flushFusionWindow() (commit + wait + drain
+    // pending host memcpys + clear retention) or discardFusionWindow()
+    // (drop without commit on abnormal exit). Always callable on non-Metal
+    // builds — returns false for begin/encode and is a no-op for
+    // flush/discard.
+    bool beginFusionWindow() const;
+    bool hasFusionWindow() const;
+    bool flushFusionWindow() const;
+    void discardFusionWindow() const;
+
+    // Encode entry points. Each requires hasFusionWindow() == true and
+    // returns false if the window is closed (caller must fall back to the
+    // synchronous runMatMulQ4_0 / runRmsNorm / runAdd path). On success,
+    // the output std::vector<float>& is resized but NOT yet populated —
+    // contents land after flushFusionWindow() returns.
+    bool encodeMatMulQ4_0(const std::string& weight_name,
+                          const std::vector<uint8_t>& weights,
+                          const std::vector<float>& input,
+                          size_t rows, size_t cols, size_t row_stride,
+                          uint32_t quant_version,
+                          std::vector<float>& output,
+                          const std::vector<float>* bias = nullptr) const;
+    bool encodeRmsNorm(const std::vector<float>& input,
+                       const std::vector<float>& weight,
+                       float epsilon,
+                       std::vector<float>& output) const;
+    bool encodeAdd(const std::vector<float>& a,
+                   const std::vector<float>& b,
+                   std::vector<float>& output,
+                   const std::vector<float>* bias = nullptr) const;
+
     // Capability helpers (Metal availability of specific kernels).
     bool hasBiasAddKernel() const;
     bool hasKVWriteKernel() const;

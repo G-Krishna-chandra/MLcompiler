@@ -28,6 +28,19 @@ public:
     virtual BackendExecutionResult execute(const ExecutionNode& node,
                                            ExecutionContext* context,
                                            const KernelDescriptor* descriptor) const = 0;
+    // Deferred-commit dispatch. A backend that supports fusion encodes work
+    // onto MetalExecutor's open fusion command buffer and does NOT commit;
+    // the executor drives the commit at window-flush time. The default impl
+    // falls back to synchronous execute(); only MetalExecutionBackend
+    // overrides for ops it has an encodeX entry point for. Callers that want
+    // the deferred semantics must check the returned actual_backend /
+    // success and treat a non-overridden default as "not fusable, fall back
+    // to execute() after a window flush."
+    virtual BackendExecutionResult encode(const ExecutionNode& node,
+                                          ExecutionContext* context,
+                                          const KernelDescriptor* descriptor) const {
+        return execute(node, context, descriptor);
+    }
 };
 
 class CpuExecutionBackend : public ExecutionBackend {
@@ -42,6 +55,9 @@ public:
     BackendExecutionResult execute(const ExecutionNode& node,
                                    ExecutionContext* context,
                                    const KernelDescriptor* descriptor) const override;
+    BackendExecutionResult encode(const ExecutionNode& node,
+                                  ExecutionContext* context,
+                                  const KernelDescriptor* descriptor) const override;
 };
 
 class BackendRegistry {

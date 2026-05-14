@@ -25,6 +25,23 @@ std::unordered_map<ExecOpType, ExecutionExecutor::OpProfileEntry>& mutableNodePr
     static std::unordered_map<ExecOpType, ExecutionExecutor::OpProfileEntry> table;
     return table;
 }
+
+bool fuseLayerEnabled() {
+    static const bool enabled = (std::getenv("MLC_FUSE_LAYER") != nullptr);
+    return enabled;
+}
+
+bool isFusableOp(ExecOpType op) {
+    switch (op) {
+        case ExecOpType::MatMul:
+        case ExecOpType::Linear:
+        case ExecOpType::Norm:
+        case ExecOpType::Add:
+            return true;
+        default:
+            return false;
+    }
+}
 } // namespace
 
 const std::unordered_map<ExecOpType, ExecutionExecutor::OpProfileEntry>&
@@ -227,6 +244,34 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         }
     }
 
+    // === Fusion window state ===
+    // Open iff MetalExecutor::Instance().hasFusionWindow() returns true.
+    // tensors_produced_in_window holds output names of every node encoded
+    // into the current window — cleared on every flush. The set is the
+    // dependency-tracking mechanism that keeps deferred-commit correct:
+    // if any of the next node's inputs is in the set, we must flush before
+    // encoding/executing it, because that tensor's host vec is still
+    // un-populated until the current command buffer commits.
+    const bool fuse_layer = fuseLayerEnabled();
+    std::unordered_set<std::string> tensors_produced_in_window;
+    auto flushWindow = [&]() {
+        if (MetalExecutor::Instance().hasFusionWindow()) {
+            MetalExecutor::Instance().flushFusionWindow();
+        }
+        tensors_produced_in_window.clear();
+    };
+    // RAII discard on abnormal exit (exception): drop the window without
+    // committing. Normal close path is flushWindow() called explicitly
+    // below before each non-fusable node and once after the loop.
+    struct WindowDiscardGuard {
+        ~WindowDiscardGuard() {
+            if (MetalExecutor::Instance().hasFusionWindow()) {
+                MetalExecutor::Instance().discardFusionWindow();
+            }
+        }
+    } discard_guard;
+    (void)discard_guard;
+
     for (const auto& node_name : order) {
         auto it = node_lookup.find(node_name);
         if (it == node_lookup.end()) continue;
@@ -249,8 +294,58 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             descriptor = KernelDescriptorRegistry::Instance().findById(node->kernel_id);
         }
         const auto& backend = registry_->backendFor(node->backend);
+
+        // Fusion decision. A node is "fusable" if MLC_FUSE_LAYER is set,
+        // it's a supported op type, and it dispatches to Metal (after
+        // forceCpu / availability checks). For fusable nodes: if any
+        // input is in the produced set, flush first; then ensure window
+        // is open; then call backend.encode(). For non-fusable nodes:
+        // unconditionally flush, then call backend.execute().
+        bool fusable = fuse_layer
+                    && isFusableOp(node->op)
+                    && node->backend == BackendKind::Metal
+                    && MetalExecutor::Instance().shouldUseFor(*node);
+
+        if (fusable) {
+            bool depends_on_window = false;
+            for (const auto& input : node->inputs) {
+                if (!input.empty() && tensors_produced_in_window.count(input)) {
+                    depends_on_window = true;
+                    break;
+                }
+            }
+            if (depends_on_window) {
+                flushWindow();
+            }
+            if (!MetalExecutor::Instance().hasFusionWindow()) {
+                if (!MetalExecutor::Instance().beginFusionWindow()) {
+                    fusable = false;  // Metal unavailable or queue failed
+                }
+            }
+        } else {
+            flushWindow();
+        }
+
         auto t_op_begin = std::chrono::steady_clock::now();
-        auto backend_result = backend.execute(*node, context_, descriptor);
+        BackendExecutionResult backend_result;
+        if (fusable) {
+            backend_result = backend.encode(*node, context_, descriptor);
+            if (!backend_result.success) {
+                // Encode rejected the node (unsupported sub-case). Flush
+                // the window and fall back to synchronous execute().
+                flushWindow();
+                backend_result = backend.execute(*node, context_, descriptor);
+            } else {
+                // Track outputs so a downstream node that reads them
+                // triggers a flush. CPU-fallback's outputs go to context
+                // directly so they don't need set tracking.
+                for (const auto& out : node->outputs) {
+                    if (!out.empty()) tensors_produced_in_window.insert(out);
+                }
+            }
+        } else {
+            backend_result = backend.execute(*node, context_, descriptor);
+        }
         if (nodeProfileEnabled()) {
             auto t_op_end = std::chrono::steady_clock::now();
             auto& entry = mutableNodeProfile()[node->op];
@@ -432,7 +527,26 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         }
 
         // Tap: capture per-tensor host snapshots if registered. Cheap when no taps.
+        //
+        // Taps require committed data. When a fused-and-still-pending output is
+        // tapped, force a flush so the tap snapshot reads real GPU output instead
+        // of allocateTensor's zero-initialized placeholder. Consequence: any run
+        // with taps registered (e.g. `mlc compare --metal-vs-cpu`) collapses
+        // fusion windows wherever tapped outputs land, so the per-op profile and
+        // turn timings measured in compare are NOT representative of production
+        // fusion behavior. For perf measurement, use `mlc chat` or `mlc chat-repl`,
+        // not the parity compare path.
         if (context_ && !context_->tapsEmpty()) {
+            bool needs_flush_for_tap = false;
+            for (const auto& output : node->outputs) {
+                if (!output.empty()
+                    && context_->isTapped(output)
+                    && tensors_produced_in_window.count(output)) {
+                    needs_flush_for_tap = true;
+                    break;
+                }
+            }
+            if (needs_flush_for_tap) flushWindow();
             for (const auto& output : node->outputs) {
                 context_->captureTapIfRegistered(output);
             }
@@ -474,6 +588,9 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
 
         result.trace.push_back(entry);
     }
+
+    // End-of-graph flush: any remaining encoded work commits + drains here.
+    flushWindow();
 
     result.executed_nodes = result.trace.size();
     return result;
