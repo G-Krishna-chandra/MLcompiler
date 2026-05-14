@@ -191,6 +191,14 @@ public:
     bool flushForwardPassCB(const std::function<std::vector<float>*(const std::string&)>& resolver) const;
     void discardForwardPassCB() const;
 
+    // Returns true if there is a pending deferred readback for the given
+    // tensor name on the open forward-pass CB. Used by the executor's tap-
+    // flush check: a tap on a tensor whose data is deferred must trigger
+    // a flush before captureTap reads the host slot. Decoupled from
+    // pass_outputs membership so non-fusable ops that defer can also
+    // signal "needs flush" without populating pass_outputs.
+    bool hasDeferredReadback(const std::string& tensor_name) const;
+
     // Encode entry points. Each requires hasForwardPassCB() == true.
     // Output is always a pool-checked-out MTLBuffer (opaque void*; backed
     // by id<MTLBuffer> with ARC strong retention through pass_checked_out_).

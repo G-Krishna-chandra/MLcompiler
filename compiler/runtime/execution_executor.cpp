@@ -881,9 +881,13 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
         if (context_ && !context_->tapsEmpty()) {
             bool needs_flush_for_tap = false;
             for (const auto& output : node->outputs) {
-                if (!output.empty()
-                    && context_->isTapped(output)
-                    && pass_outputs.count(output)) {
+                if (output.empty() || !context_->isTapped(output)) continue;
+                // Two ways the data may not yet be on host:
+                //   (a) fusable encode put the output in pass_outputs;
+                //   (b) non-fusable Metal op deferred its readback (B4).
+                // Either way, flush before captureTap reads stale host slot.
+                if (pass_outputs.count(output) ||
+                    MetalExecutor::Instance().hasDeferredReadback(output)) {
                     needs_flush_for_tap = true;
                     break;
                 }

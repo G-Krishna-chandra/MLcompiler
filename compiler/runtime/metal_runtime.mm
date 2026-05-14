@@ -4693,6 +4693,19 @@ bool MetalExecutor::flushForwardPassCB(
 #endif
 }
 
+bool MetalExecutor::hasDeferredReadback(const std::string& tensor_name) const {
+#if defined(__APPLE__)
+    if (!impl_ || tensor_name.empty()) return false;
+    for (const auto& rb : impl_->pass_readbacks_) {
+        if (rb.tensor_name == tensor_name) return true;
+    }
+    return false;
+#else
+    (void)tensor_name;
+    return false;
+#endif
+}
+
 void MetalExecutor::discardForwardPassCB() const {
 #if defined(__APPLE__)
     if (!impl_) return;
