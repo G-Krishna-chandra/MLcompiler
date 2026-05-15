@@ -968,6 +968,67 @@ kernel void q6_k_matmul(
     output[gid] = acc;
 }
 
+// Q6_K matmul v2 (lever 1 of 40→75 sweep). Same simdgroup-reduction
+// shape as q4_0_matmul_v2: 1 simdgroup (32 threads) per output row,
+// lanes split the K dimension via stride-32 iteration, simd_sum
+// reduces lane partials. Q6_K layout per 256-element superblock
+// (210 bytes): ql 0..127, qh 128..191, scales 192..207, d 208..209.
+kernel void q6_k_matmul_v2(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant QKParams& params   [[buffer(3)]],
+    uint  tg_x      [[threadgroup_position_in_grid]],
+    uint  lane_idx  [[thread_index_in_simdgroup]]) {
+    uint row = tg_x;
+    if (row >= params.rows) return;
+    const device uchar* row_ptr = weights + row * params.row_stride;
+    const uint block_size = 210u;
+    uint cols = params.cols;
+    float partial = 0.0f;
+    for (uint c = lane_idx; c < cols; c += 32u) {
+        uint b           = c / 256u;
+        uint offset      = c % 256u;
+        uint half_idx    = offset / 128u;       // 0=lower 128, 1=upper 128
+        uint after_half  = offset % 128u;
+        uint quarter     = after_half / 32u;    // 0..3
+        uint l           = after_half % 32u;    // 0..31
+
+        const device uchar* block = row_ptr + b * block_size;
+        const device uchar* ql    = block;
+        const device uchar* qh    = block + 128;
+        const device int8_t* sc   = reinterpret_cast<const device int8_t*>(block + 192);
+        const device half*  d_ptr = reinterpret_cast<const device half*>(block + 208);
+        float d = static_cast<float>(d_ptr[0]);
+
+        // ql byte index: half_idx*64 + l + (quarter & 1 ? 32 : 0)
+        // quarter 0: ql[l],     low nibble
+        // quarter 1: ql[l+32],  low nibble
+        // quarter 2: ql[l],     high nibble
+        // quarter 3: ql[l+32],  high nibble
+        uint ql_off = half_idx * 64u + l + ((quarter & 1u) ? 32u : 0u);
+        uchar ql_byte = ql[ql_off];
+        uint ql_nibble = (quarter < 2u) ? (uint)(ql_byte & 0xFu)
+                                        : (uint)((ql_byte >> 4) & 0xFu);
+
+        uint qh_off = half_idx * 32u + l;
+        uchar qh_byte = qh[qh_off];
+        uint qh_bits = (uint)((qh_byte >> (quarter * 2u)) & 0x3u);
+
+        int q = static_cast<int>(ql_nibble | (qh_bits << 4)) - 32;
+
+        // Scales: per-half offset 8, per-quarter offset 2, per-l/16 offset 1.
+        uint scale_idx = half_idx * 8u + quarter * 2u + (l / 16u);
+        float scale = static_cast<float>(sc[scale_idx]);
+
+        partial += d * scale * static_cast<float>(q) * input[c];
+    }
+    partial = simd_sum(partial);
+    if (lane_idx == 0u) {
+        output[row] = partial;
+    }
+}
+
 kernel void q6_k_matmul_transposed(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -1560,6 +1621,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> q4KMatmulPipeline = nil;
     id<MTLComputePipelineState> q5KMatmulPipeline = nil;
     id<MTLComputePipelineState> q6KMatmulPipeline = nil;
+    id<MTLComputePipelineState> q6KMatmulPipelineV2 = nil;
     id<MTLComputePipelineState> q6KMatmulTransposedPipeline = nil;
     id<MTLComputePipelineState> q8KMatmulPipeline = nil;
     id<MTLComputePipelineState> q8_0MatmulPipeline = nil;
@@ -1805,6 +1867,7 @@ struct MetalExecutor::Impl {
                 q4KMatmulPipeline = buildPipeline(@"q4_k_matmul");
                 q5KMatmulPipeline = buildPipeline(@"q5_k_matmul");
                 q6KMatmulPipeline = buildPipeline(@"q6_k_matmul");
+                q6KMatmulPipelineV2 = buildPipeline(@"q6_k_matmul_v2");
                 q6KMatmulTransposedPipeline = buildPipeline(@"q6_k_matmul_transposed");
                 q8KMatmulPipeline = buildPipeline(@"q8_k_matmul");
                 q8_0MatmulPipeline = buildPipeline(@"q8_0_matmul");
@@ -3171,6 +3234,52 @@ bool matmulQ4_K(const std::string& weight_name,
                     std::vector<float>& output) const {
 #if defined(__APPLE__)
         if (!available() || !q6KMatmulPipeline) return false;
+        // Lever 1 (sweep-75): Q6_K simdgroup-reduction kernel. 1 simdgroup
+        // per output row, 32 lanes split K via stride-32. Same E1 template
+        // adapted for Q6_K layout. Falls back to v1 (single-thread-per-row)
+        // for cols < 64 where the per-call overhead would swamp the win.
+        if (q6KMatmulPipelineV2 != nil && cols >= 64) {
+            if (input.size() != cols) return false;
+            if (weights.size() < row_stride * rows) return false;
+            if (@available(macOS 11.0, *)) {
+                @autoreleasepool {
+                    id<MTLBuffer> weightBuffer = getOrCacheWeight(weight_name, weights);
+                    id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
+                                                                    length:input.size() * sizeof(float)
+                                                                   options:MTLResourceStorageModeShared];
+                    id<MTLBuffer> outputBuffer = [device newBufferWithLength:rows * sizeof(float)
+                                                                      options:MTLResourceStorageModeShared];
+                    if (!weightBuffer || !inputBuffer || !outputBuffer) return false;
+
+                    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                    if (!encoder) return false;
+                    [encoder setComputePipelineState:q6KMatmulPipelineV2];
+                    [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+                    [encoder setBuffer:inputBuffer offset:0 atIndex:1];
+                    [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+                    QKParamsNative params = {static_cast<uint32_t>(rows),
+                                             static_cast<uint32_t>(cols),
+                                             static_cast<uint32_t>(row_stride)};
+                    [encoder setBytes:&params length:sizeof(QKParamsNative) atIndex:3];
+                    [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    [encoder endEncoding];
+                    [commandBuffer commit];
+                    [commandBuffer waitUntilCompleted];
+
+                    bool ok = commandBuffer.status == MTLCommandBufferStatusCompleted;
+                    output.resize(rows);
+                    std::memcpy(output.data(), [outputBuffer contents], rows * sizeof(float));
+                    if (bias && !bias->empty()) {
+                        for (size_t i = 0; i < rows && i < bias->size(); ++i) {
+                            output[i] += (*bias)[i];
+                        }
+                    }
+                    return ok;
+                }
+            }
+        }
         return matmulQuantK(weight_name, weights, input, rows, cols, row_stride,
                             q6KMatmulPipeline, bias, output);
 #else
