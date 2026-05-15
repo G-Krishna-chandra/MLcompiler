@@ -1703,6 +1703,78 @@ struct MetalExecutor::Impl {
     };
     mutable std::array<std::vector<id<MTLBuffer>>, kPoolClasses> pool_free_lists_;
 
+    // Lever 2 (sweep-75): MPS object cache. MPSMatrixMultiplication and
+    // MPSMatrixSoftMax objects are independent of buffers — only their
+    // shape/parameters are bound at init. Cache them by parameter signature
+    // and reuse across calls (across heads, layers, and forward passes).
+    // Saves the per-call alloc/init cost (~50-100 µs each on M3 Pro) for
+    // the attention path which allocates ~10 MPS kernels per layer call.
+    struct MPSMatMulKey {
+        bool   transL;
+        bool   transR;
+        uint32_t resultRows;
+        uint32_t resultCols;
+        uint32_t interior;
+        float  alpha;
+        float  beta;
+        bool operator==(const MPSMatMulKey& o) const {
+            return transL == o.transL && transR == o.transR &&
+                   resultRows == o.resultRows && resultCols == o.resultCols &&
+                   interior == o.interior && alpha == o.alpha && beta == o.beta;
+        }
+    };
+    struct MPSMatMulKeyHash {
+        size_t operator()(const MPSMatMulKey& k) const noexcept {
+            uint64_t h = 1469598103934665603ull;
+            auto mix = [&](uint64_t v){ h ^= v; h *= 1099511628211ull; };
+            mix((uint64_t)(k.transL ? 1 : 0) | ((uint64_t)(k.transR ? 1 : 0) << 1));
+            mix((uint64_t)k.resultRows | ((uint64_t)k.resultCols << 32));
+            mix((uint64_t)k.interior);
+            uint32_t fa, fb;
+            std::memcpy(&fa, &k.alpha, 4);
+            std::memcpy(&fb, &k.beta, 4);
+            mix((uint64_t)fa | ((uint64_t)fb << 32));
+            return (size_t)h;
+        }
+    };
+    mutable std::unordered_map<MPSMatMulKey, MPSMatrixMultiplication*, MPSMatMulKeyHash> mps_matmul_cache_;
+    mutable MPSMatrixSoftMax* mps_softmax_cached_ = nil;
+    mutable size_t mps_matmul_cache_hits_ = 0;
+    mutable size_t mps_matmul_cache_misses_ = 0;
+
+    MPSMatrixMultiplication* getOrCreateMPSMatMul(bool transL,
+                                                     bool transR,
+                                                     uint32_t resultRows,
+                                                     uint32_t resultCols,
+                                                     uint32_t interior,
+                                                     float alpha,
+                                                     float beta) const {
+        MPSMatMulKey key{transL, transR, resultRows, resultCols, interior, alpha, beta};
+        auto it = mps_matmul_cache_.find(key);
+        if (it != mps_matmul_cache_.end()) {
+            mps_matmul_cache_hits_++;
+            return it->second;
+        }
+        mps_matmul_cache_misses_++;
+        MPSMatrixMultiplication* mm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                              transposeLeft:transL
+                                             transposeRight:transR
+                                                 resultRows:resultRows
+                                              resultColumns:resultCols
+                                            interiorColumns:interior
+                                                      alpha:alpha
+                                                       beta:beta];
+        if (mm) mps_matmul_cache_.emplace(key, mm);
+        return mm;
+    }
+
+    MPSMatrixSoftMax* getOrCreateMPSSoftMax() const {
+        if (mps_softmax_cached_) return mps_softmax_cached_;
+        mps_softmax_cached_ = [[MPSMatrixSoftMax alloc] initWithDevice:device];
+        return mps_softmax_cached_;
+    }
+
     static size_t poolClassFor(size_t bytes) {
         for (size_t i = 0; i < kPoolClasses; ++i) {
             if (bytes <= kPoolClassBytes[i]) return i;
@@ -2687,15 +2759,11 @@ struct MetalExecutor::Impl {
             MPSMatrix* rightMatrix = [[MPSMatrix alloc] initWithBuffer:rightBuffer descriptor:rightDesc];
             MPSMatrix* resultMatrix = [[MPSMatrix alloc] initWithBuffer:resultBuffer descriptor:resultDesc];
 
-            MPSMatrixMultiplication* mm =
-                [[MPSMatrixMultiplication alloc] initWithDevice:device
-                                                transposeLeft:false
-                                               transposeRight:false
-                                                  resultRows:rows
-                                               resultColumns:1
-                                            interiorColumns:cols
-                                                       alpha:1.0f
-                                                        beta:0.0f];
+            MPSMatrixMultiplication* mm = getOrCreateMPSMatMul(
+                /*transL=*/false, /*transR=*/false,
+                /*resultRows=*/(uint32_t)rows, /*resultCols=*/1u,
+                /*interior=*/(uint32_t)cols,
+                /*alpha=*/1.0f, /*beta=*/0.0f);
 
             if (!mm) {
                 return false;
@@ -4200,15 +4268,11 @@ bool matmulQ4_K(const std::string& weight_name,
                     }
                     MPSMatrix* logitsMatrix = [[MPSMatrix alloc] initWithBuffer:logitsBuffer descriptor:logitsDesc];
 
-                    MPSMatrixMultiplication* qk =
-                        [[MPSMatrixMultiplication alloc] initWithDevice:device
-                                                        transposeLeft:false
-                                                       transposeRight:true
-                                                          resultRows:1
-                                                       resultColumns:tokens
-                                                    interiorColumns:head_dim
-                                                               alpha:inv_sqrt
-                                                                beta:0.0f];
+                    MPSMatrixMultiplication* qk = getOrCreateMPSMatMul(
+                        /*transL=*/false, /*transR=*/true,
+                        /*resultRows=*/1u, /*resultCols=*/(uint32_t)tokens,
+                        /*interior=*/(uint32_t)head_dim,
+                        /*alpha=*/inv_sqrt, /*beta=*/0.0f);
 
                     if (!qk) return false;
 
@@ -4249,7 +4313,7 @@ bool matmulQ4_K(const std::string& weight_name,
                         }
                     }
 
-                    MPSMatrixSoftMax* softmaxKernel = [[MPSMatrixSoftMax alloc] initWithDevice:device];
+                    MPSMatrixSoftMax* softmaxKernel = getOrCreateMPSSoftMax();
                     if (!softmaxKernel) return false;
                     id<MTLCommandBuffer> softmaxBuffer = [queue commandBuffer];
                     [softmaxKernel encodeToCommandBuffer:softmaxBuffer
@@ -4310,15 +4374,11 @@ bool matmulQ4_K(const std::string& weight_name,
                     }
                     MPSMatrix* outMatrix = [[MPSMatrix alloc] initWithBuffer:resultBuffer descriptor:outDesc];
 
-                    MPSMatrixMultiplication* av =
-                        [[MPSMatrixMultiplication alloc] initWithDevice:device
-                                                        transposeLeft:false
-                                                       transposeRight:false
-                                                          resultRows:1
-                                                       resultColumns:head_dim
-                                                    interiorColumns:tokens
-                                                               alpha:1.0f
-                                                                beta:0.0f];
+                    MPSMatrixMultiplication* av = getOrCreateMPSMatMul(
+                        /*transL=*/false, /*transR=*/false,
+                        /*resultRows=*/1u, /*resultCols=*/(uint32_t)head_dim,
+                        /*interior=*/(uint32_t)tokens,
+                        /*alpha=*/1.0f, /*beta=*/0.0f);
                     if (!av) return false;
                     id<MTLCommandBuffer> commandBuffer2 = [queue commandBuffer];
                     [av encodeToCommandBuffer:commandBuffer2
@@ -4540,15 +4600,11 @@ bool matmulQ4_K(const std::string& weight_name,
 
                 // 5a. Batched Q.K with beta=1.0 (adds scaled scores onto the
                 //     pre-populated mask/alibi values).
-                MPSMatrixMultiplication* qk =
-                    [[MPSMatrixMultiplication alloc] initWithDevice:device
-                                                      transposeLeft:false
-                                                     transposeRight:true
-                                                         resultRows:1
-                                                      resultColumns:tokens
-                                                    interiorColumns:head_dim
-                                                              alpha:inv_sqrt
-                                                               beta:1.0f];
+                MPSMatrixMultiplication* qk = getOrCreateMPSMatMul(
+                    /*transL=*/false, /*transR=*/true,
+                    /*resultRows=*/1u, /*resultCols=*/(uint32_t)tokens,
+                    /*interior=*/(uint32_t)head_dim,
+                    /*alpha=*/inv_sqrt, /*beta=*/1.0f);
                 if (!qk) return false;
                 [qk encodeToCommandBuffer:commandBuffer
                                leftMatrix:qMat
@@ -4556,23 +4612,18 @@ bool matmulQ4_K(const std::string& weight_name,
                              resultMatrix:lMatBatched];
 
                 // 5b. Softmax over [num_heads, tokens] — one call, per-row.
-                MPSMatrixSoftMax* softmaxKernel =
-                    [[MPSMatrixSoftMax alloc] initWithDevice:device];
+                MPSMatrixSoftMax* softmaxKernel = getOrCreateMPSSoftMax();
                 if (!softmaxKernel) return false;
                 [softmaxKernel encodeToCommandBuffer:commandBuffer
                                          inputMatrix:lMatSoftmax
                                         resultMatrix:lMatSoftmax];
 
                 // 5c. Batched att.V.
-                MPSMatrixMultiplication* av =
-                    [[MPSMatrixMultiplication alloc] initWithDevice:device
-                                                      transposeLeft:false
-                                                     transposeRight:false
-                                                         resultRows:1
-                                                      resultColumns:head_dim
-                                                    interiorColumns:tokens
-                                                              alpha:1.0f
-                                                               beta:0.0f];
+                MPSMatrixMultiplication* av = getOrCreateMPSMatMul(
+                    /*transL=*/false, /*transR=*/false,
+                    /*resultRows=*/1u, /*resultCols=*/(uint32_t)head_dim,
+                    /*interior=*/(uint32_t)tokens,
+                    /*alpha=*/1.0f, /*beta=*/0.0f);
                 if (!av) return false;
                 [av encodeToCommandBuffer:commandBuffer
                                leftMatrix:lMatBatched
@@ -4597,9 +4648,9 @@ bool matmulQ4_K(const std::string& weight_name,
                     pass_retained_.push_back((id)lMatSoftmax);
                     pass_retained_.push_back((id)vMat);
                     pass_retained_.push_back((id)rMat);
-                    pass_retained_.push_back((id)qk);
-                    pass_retained_.push_back((id)softmaxKernel);
-                    pass_retained_.push_back((id)av);
+                    // qk, softmaxKernel, av are owned by the MPS object cache
+                    // (retained for the lifetime of the executor) — no need
+                    // to add them to pass_retained_.
 
                     // Establish the convention "every op's downstream-
                     // visible output buffer is fp32". When fp16_attn is
