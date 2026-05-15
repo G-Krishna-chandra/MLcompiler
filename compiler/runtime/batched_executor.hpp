@@ -2,15 +2,19 @@
 
 // BatchedExecutor — top-level runtime for continuous batching.
 //
-// Phase B1 sets up the API surface and an N=1 implementation that
-// delegates to the existing single-stream ExecutionExecutor + ExecutionContext.
-// At N=1 the output is bit-identical to DecodeRunner; future Phase B2/B3
-// commits replace internals with batched dispatches and paged KV.
+// Phase B1 set up the API surface and an N=1 implementation that delegated
+// to the existing single-stream ExecutionExecutor + ExecutionContext.
 //
-// The class manages its own ExecutionGraph + ExecutionContext + ExecutionExecutor
-// for the duration of its life — request state is held in this BatchedExecutor,
-// not in the surrounding scheduler. The scheduler (Phase C) drives admission
-// and decoding; BatchedExecutor handles the per-pass mechanics.
+// Phase B2c upgrades to N>=1 by holding per-request ExecutionContext +
+// ExecutionExecutor state. At N=1 the behavior is unchanged (and remains
+// bit-identical to DecodeRunner). At N>1 each request runs sequentially
+// with its own isolated KV state, so per-request output matches what the
+// single-stream path would produce — Option (a) "sequential per-request
+// attention" from the design doc.
+//
+// Phase B3 will wire paged-KV storage into the per-request contexts.
+// Phase E may add cross-request batching for matmul / attention to capture
+// compute-density wins beyond CB-sharing amortization.
 
 #include "runtime/session.hpp"
 #include "runtime/execution_graph.hpp"
@@ -18,6 +22,7 @@
 #include "runtime/execution_executor.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -41,37 +46,44 @@ struct BatchedDecodeOutput {
 
 class BatchedExecutor {
 public:
-    // Construct over a previously loaded Session. The graph is built once;
-    // context is owned by this executor and reset on demand.
     explicit BatchedExecutor(const Session& session);
 
-    // Run one decoder pass for the given slots. Currently supports batch
-    // size 1 only; N>1 returns an empty output (will be wired in B2).
+    // Run one decoder pass per slot. Each slot's KV state is isolated in a
+    // per-request ExecutionContext. Slots run sequentially within this
+    // call (Option a from the design doc).
     BatchedDecodeOutput run_decode(const std::vector<RequestSlot>& slots);
 
-    // Run prefill for a single request: process `tokens` through the model
-    // sequentially (token-by-token; multi-token batched prefill is a v2
-    // optimization), populating the request's KV state. Returns logits at
-    // the last token. The request_id is used for future per-request KV
-    // partitioning; in B1 (single-stream backing) it's recorded but not
-    // routed.
+    // Run prefill for a single request: process `tokens` through the
+    // request's context one token at a time, returning logits at the
+    // last position.
     std::vector<float> run_prefill(uint32_t request_id,
                                    const std::vector<uint64_t>& tokens);
 
-    // Reset the internal context (clears KV cache, position trackers).
-    // Used by the test harness and between independent runs.
+    // Drop all per-request state (KV cache + position trackers +
+    // executor/context objects). Useful for tests; in production the
+    // scheduler removes individual requests via release_request.
     void reset();
 
-    // Accessors for testing / debugging.
+    // Drop a single request's state and free its context.
+    void release_request(uint32_t request_id);
+
     const ExecutionGraph& graph() const { return graph_; }
     size_t known_position(uint32_t request_id) const;
+    size_t live_request_count() const { return requests_.size(); }
 
 private:
+    struct PerRequest {
+        std::unique_ptr<ExecutionContext> context;
+        std::unique_ptr<ExecutionExecutor> executor;
+        size_t next_position = 0;
+    };
+
+    PerRequest& ensure_request(uint32_t request_id);
+    void prime_token_tensors(ExecutionContext& ctx, uint64_t token) const;
+
     const Session& session_;
     ExecutionGraph graph_;
-    ExecutionContext context_;
-    ExecutionExecutor executor_;
-    std::unordered_map<uint32_t, size_t> request_positions_;
+    std::unordered_map<uint32_t, PerRequest> requests_;
 };
 
 } // namespace runtime

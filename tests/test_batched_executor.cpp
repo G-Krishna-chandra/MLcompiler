@@ -40,7 +40,7 @@ TEST(BatchedExecutorB1, EmptySlotsReturnsEmpty) {
     EXPECT_TRUE(out.per_request.empty());
 }
 
-TEST(BatchedExecutorB1, NGreaterThanOneReturnsFailureSentinels) {
+TEST(BatchedExecutorB2c, N2BothRequestsSucceed) {
     if (!tinyLlamaAvailable()) {
         GTEST_SKIP() << "TinyLlama model not present at " << tinyLlamaPath();
     }
@@ -52,8 +52,99 @@ TEST(BatchedExecutorB1, NGreaterThanOneReturnsFailureSentinels) {
     };
     auto out = exec.run_decode(slots);
     ASSERT_EQ(out.per_request.size(), 2u);
-    EXPECT_FALSE(out.per_request[0].success);
-    EXPECT_FALSE(out.per_request[1].success);
+    EXPECT_TRUE(out.per_request[0].success);
+    EXPECT_TRUE(out.per_request[1].success);
+    EXPECT_FALSE(out.per_request[0].logits.empty());
+    EXPECT_FALSE(out.per_request[1].logits.empty());
+}
+
+namespace {
+double cosineSimilarity(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size() || a.empty()) return 0.0;
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dot += static_cast<double>(a[i]) * b[i];
+        na  += static_cast<double>(a[i]) * a[i];
+        nb  += static_cast<double>(b[i]) * b[i];
+    }
+    if (na == 0.0 || nb == 0.0) return 0.0;
+    return dot / (std::sqrt(na) * std::sqrt(nb));
+}
+} // namespace
+
+// B2c: per-request cosine match against single-stream baseline at N=2.
+// Two prompts run through DecodeRunner (one each) define the reference;
+// the same two prompts run through BatchedExecutor at N=2 must produce
+// per-request logits that match cosine >= 0.999 across multiple steps.
+//
+// Bit-identity is the design intent (sequential per-request execution
+// preserves the single-stream code path), but per the validation spec
+// we accept >= 0.999 cosine to allow any tiny drift from per-pass state
+// ordering (e.g., unordered_map iteration affecting weight cache hit
+// patterns). In practice this should be 1.000000.
+TEST(BatchedExecutorB2c, N2CosineMatchesSingleStream) {
+    if (!tinyLlamaAvailable()) {
+        GTEST_SKIP() << "TinyLlama model not present at " << tinyLlamaPath();
+    }
+
+    std::vector<uint64_t> prompt_a = {1, 1462, 1554, 304, 263};
+    std::vector<uint64_t> prompt_b = {1, 17320, 366, 460, 263};
+    constexpr size_t kSteps = 5;
+    ASSERT_EQ(prompt_a.size(), kSteps);
+    ASSERT_EQ(prompt_b.size(), kSteps);
+
+    auto runReference = [&](const std::vector<uint64_t>& tokens) {
+        mlc::runtime::DecodeOptions opts;
+        opts.tokens = tokens;
+        opts.max_steps = kSteps;
+        opts.start_position = 0;
+        opts.top_k = 0;
+        mlc::runtime::DecodeRunner runner(tinyLlamaPath());
+        auto res = runner.run(opts);
+        EXPECT_TRUE(res.success);
+        return res;
+    };
+
+    auto ref_a = runReference(prompt_a);
+    auto ref_b = runReference(prompt_b);
+    ASSERT_EQ(ref_a.steps.size(), kSteps);
+    ASSERT_EQ(ref_b.steps.size(), kSteps);
+
+    // Batched run: N=2 stepping in lockstep.
+    mlc::runtime::Session session(tinyLlamaPath());
+    mlc::runtime::BatchedExecutor exec(session);
+    exec.reset();
+    constexpr uint32_t REQ_A = 11;
+    constexpr uint32_t REQ_B = 22;
+
+    for (size_t i = 0; i < kSteps; ++i) {
+        std::vector<mlc::runtime::RequestSlot> slots = {
+            {REQ_A, prompt_a[i], i},
+            {REQ_B, prompt_b[i], i},
+        };
+        auto out = exec.run_decode(slots);
+        ASSERT_EQ(out.per_request.size(), 2u);
+
+        const auto& got_a = (out.per_request[0].request_id == REQ_A
+                             ? out.per_request[0].logits
+                             : out.per_request[1].logits);
+        const auto& got_b = (out.per_request[0].request_id == REQ_B
+                             ? out.per_request[0].logits
+                             : out.per_request[1].logits);
+        ASSERT_FALSE(got_a.empty()) << "step=" << i;
+        ASSERT_FALSE(got_b.empty()) << "step=" << i;
+
+        double cos_a = cosineSimilarity(got_a, ref_a.steps[i].logits);
+        double cos_b = cosineSimilarity(got_b, ref_b.steps[i].logits);
+        EXPECT_GE(cos_a, 0.999) << "request A step=" << i << " cos=" << cos_a;
+        EXPECT_GE(cos_b, 0.999) << "request B step=" << i << " cos=" << cos_b;
+
+        // Greedy match — top-1 token must agree.
+        EXPECT_EQ(argmax(got_a), argmax(ref_a.steps[i].logits))
+            << "request A step=" << i;
+        EXPECT_EQ(argmax(got_b), argmax(ref_b.steps[i].logits))
+            << "request B step=" << i;
+    }
 }
 
 // Bit-identity check: for the same sequence of input tokens at the same
