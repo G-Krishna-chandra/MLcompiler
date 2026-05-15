@@ -436,6 +436,35 @@ public:
                       size_t row_stride,
                       std::vector<float>& dst) const;
 
+    // Phase A2 (continuous batching) — gather K or V from a paged buffer
+    // into a contiguous [n_kv_heads, num_tokens, head_dim] output.
+    //
+    // Per-page layout: token-major, [page_size_tokens, n_kv_heads, head_dim]
+    // of `dtype_bytes`-wide elements. Page `i`'s offset in the storage
+    // buffer is `i * page_size_tokens * n_kv_heads * head_dim * dtype_bytes`.
+    // page_table is in token-position order: page_table[t / page_size_tokens]
+    // holds the page id for token t.
+    //
+    // dtype_bytes must be 2 (fp16) or 4 (fp32).
+    // Returns false on bad arguments or kernel failure.
+    bool gatherKVPages(void* page_storage_buffer,
+                       const std::vector<uint32_t>& page_table,
+                       size_t page_size_tokens,
+                       size_t n_kv_heads,
+                       size_t head_dim,
+                       size_t num_tokens,
+                       void* dst_buffer,
+                       size_t dtype_bytes) const;
+
+    // Phase A2 — minimal test helpers for paged-KV unit tests. allocateScratchBuffer
+    // returns a fresh shared-storage MTLBuffer of `bytes` bytes (or nullptr).
+    // upload/download wrap memcpy to/from contents() for the buffer. Safe to use
+    // outside the forward-pass pool; freed by releaseScratchBuffer.
+    void* allocateScratchBuffer(size_t bytes) const;
+    void  releaseScratchBuffer(void* buffer) const;
+    void  uploadToBuffer(void* buffer, const void* src, size_t bytes, size_t dst_offset = 0) const;
+    void  downloadFromBuffer(const void* buffer, void* dst, size_t bytes, size_t src_offset = 0) const;
+
 private:
     MetalExecutor();
     ~MetalExecutor();

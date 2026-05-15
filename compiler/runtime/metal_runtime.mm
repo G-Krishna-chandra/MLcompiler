@@ -223,6 +223,62 @@ struct KVWriteParams {
     uint base_pos;
 };
 
+// Phase A2 (continuous batching): paged KV gather kernel.
+// Reads K or V from a paged storage buffer using a request's page table
+// and writes a contiguous [n_kv_heads, num_tokens, head_dim] output.
+// Per-page layout is token-major: [page_size_tokens, n_kv_heads, head_dim].
+struct GatherKVParams {
+    uint page_size_tokens;
+    uint n_kv_heads;
+    uint head_dim;
+    uint num_tokens;
+    uint elements_per_page;  // = page_size_tokens * n_kv_heads * head_dim
+};
+
+kernel void gather_kv_pages_f16(
+    device const half* page_storage [[buffer(0)]],
+    constant uint* page_table [[buffer(1)]],
+    device       half* dst [[buffer(2)]],
+    constant GatherKVParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.n_kv_heads * p.num_tokens * p.head_dim;
+    if (gid >= total) return;
+    uint dim   = gid % p.head_dim;
+    uint tmp   = gid / p.head_dim;
+    uint tok   = tmp % p.num_tokens;
+    uint head  = tmp / p.num_tokens;
+    uint page_idx = tok / p.page_size_tokens;
+    uint slot     = tok % p.page_size_tokens;
+    uint page_id  = page_table[page_idx];
+    uint src_off  = page_id * p.elements_per_page +
+                    slot * p.n_kv_heads * p.head_dim +
+                    head * p.head_dim +
+                    dim;
+    dst[gid] = page_storage[src_off];
+}
+
+kernel void gather_kv_pages_f32(
+    device const float* page_storage [[buffer(0)]],
+    constant uint* page_table [[buffer(1)]],
+    device       float* dst [[buffer(2)]],
+    constant GatherKVParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.n_kv_heads * p.num_tokens * p.head_dim;
+    if (gid >= total) return;
+    uint dim   = gid % p.head_dim;
+    uint tmp   = gid / p.head_dim;
+    uint tok   = tmp % p.num_tokens;
+    uint head  = tmp / p.num_tokens;
+    uint page_idx = tok / p.page_size_tokens;
+    uint slot     = tok % p.page_size_tokens;
+    uint page_id  = page_table[page_idx];
+    uint src_off  = page_id * p.elements_per_page +
+                    slot * p.n_kv_heads * p.head_dim +
+                    head * p.head_dim +
+                    dim;
+    dst[gid] = page_storage[src_off];
+}
+
 kernel void scatter_kv(
     device const float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],
@@ -1792,6 +1848,8 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> dequantQKPipeline = nil;
     id<MTLComputePipelineState> biasAddPipeline = nil;
     id<MTLComputePipelineState> kvWritePipeline = nil;
+    id<MTLComputePipelineState> gatherKVPagesF16Pipeline = nil;
+    id<MTLComputePipelineState> gatherKVPagesF32Pipeline = nil;
     id<MTLComputePipelineState> flashAttentionPipeline = nil;
     id<MTLComputePipelineState> castF16toF32Pipeline = nil;
     id<MTLComputePipelineState> sliceF32Pipeline = nil;
@@ -2193,6 +2251,8 @@ struct MetalExecutor::Impl {
                 dequantQKPipeline = buildPipeline(@"dequant_qk_row");
                 biasAddPipeline = buildPipeline(@"add_bias_strided");
                 kvWritePipeline = buildPipeline(@"scatter_kv");
+                gatherKVPagesF16Pipeline = buildPipeline(@"gather_kv_pages_f16");
+                gatherKVPagesF32Pipeline = buildPipeline(@"gather_kv_pages_f32");
                 flashAttentionPipeline = buildPipeline(@"flash_attention_v1");
                 castF16toF32Pipeline = buildPipeline(@"cast_f16_to_f32");
                 sliceF32Pipeline = buildPipeline(@"slice_f32");
@@ -6231,6 +6291,137 @@ bool MetalExecutor::hasKVWriteKernel() const {
 
 bool MetalExecutor::hasDequantQKKernel() const {
     return impl_ && impl_->available() && impl_->dequantQKPipeline != nil;
+}
+
+// ===========================================================================
+// Phase A2 (continuous batching) — paged KV gather + scratch buffer helpers.
+// ===========================================================================
+
+bool MetalExecutor::gatherKVPages(void* page_storage_buffer,
+                                  const std::vector<uint32_t>& page_table,
+                                  size_t page_size_tokens,
+                                  size_t n_kv_heads,
+                                  size_t head_dim,
+                                  size_t num_tokens,
+                                  void* dst_buffer,
+                                  size_t dtype_bytes) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available()) return false;
+    if (!page_storage_buffer || !dst_buffer) return false;
+    if (page_size_tokens == 0 || n_kv_heads == 0 || head_dim == 0 || num_tokens == 0) return false;
+    if (dtype_bytes != 2 && dtype_bytes != 4) return false;
+    // page_table must cover [0, num_tokens) — every token's page id resolvable.
+    size_t needed_pages = (num_tokens + page_size_tokens - 1) / page_size_tokens;
+    if (page_table.size() < needed_pages) return false;
+
+    id<MTLComputePipelineState> pipe = (dtype_bytes == 2)
+        ? impl_->gatherKVPagesF16Pipeline
+        : impl_->gatherKVPagesF32Pipeline;
+    if (!pipe) return false;
+
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            id<MTLBuffer> storageBuf = (__bridge id<MTLBuffer>)page_storage_buffer;
+            id<MTLBuffer> dstBuf     = (__bridge id<MTLBuffer>)dst_buffer;
+            id<MTLBuffer> pageTableBuf =
+                [impl_->device newBufferWithBytes:page_table.data()
+                                            length:page_table.size() * sizeof(uint32_t)
+                                           options:MTLResourceStorageModeShared];
+            if (!pageTableBuf) return false;
+
+            id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:storageBuf   offset:0 atIndex:0];
+            [enc setBuffer:pageTableBuf offset:0 atIndex:1];
+            [enc setBuffer:dstBuf       offset:0 atIndex:2];
+
+            struct GatherKVParamsHost {
+                uint32_t page_size_tokens;
+                uint32_t n_kv_heads;
+                uint32_t head_dim;
+                uint32_t num_tokens;
+                uint32_t elements_per_page;
+            } params;
+            params.page_size_tokens  = static_cast<uint32_t>(page_size_tokens);
+            params.n_kv_heads        = static_cast<uint32_t>(n_kv_heads);
+            params.head_dim          = static_cast<uint32_t>(head_dim);
+            params.num_tokens        = static_cast<uint32_t>(num_tokens);
+            params.elements_per_page = static_cast<uint32_t>(page_size_tokens * n_kv_heads * head_dim);
+            [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+            size_t total_elems = n_kv_heads * num_tokens * head_dim;
+            NSUInteger threadWidth = pipe.threadExecutionWidth;
+            if (threadWidth == 0) threadWidth = 32;
+            NSUInteger threadgroups = (total_elems + threadWidth - 1) / threadWidth;
+            if (threadgroups == 0) threadgroups = 1;
+
+            [enc dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            return cb.status == MTLCommandBufferStatusCompleted;
+        }
+    }
+#endif
+    (void)page_storage_buffer; (void)page_table; (void)page_size_tokens;
+    (void)n_kv_heads; (void)head_dim; (void)num_tokens; (void)dst_buffer;
+    (void)dtype_bytes;
+    return false;
+}
+
+void* MetalExecutor::allocateScratchBuffer(size_t bytes) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || bytes == 0) return nullptr;
+    if (@available(macOS 11.0, *)) {
+        id<MTLBuffer> buf = [impl_->device newBufferWithLength:bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (!buf) return nullptr;
+        // Bridge-retain so the caller owns a strong reference via void*.
+        return (__bridge_retained void*)buf;
+    }
+#endif
+    (void)bytes;
+    return nullptr;
+}
+
+void MetalExecutor::releaseScratchBuffer(void* buffer) const {
+#if defined(__APPLE__)
+    if (!buffer) return;
+    // Pair with __bridge_retained: drops the strong reference.
+    id<MTLBuffer> __unused buf = (__bridge_transfer id<MTLBuffer>)buffer;
+#else
+    (void)buffer;
+#endif
+}
+
+void MetalExecutor::uploadToBuffer(void* buffer, const void* src,
+                                   size_t bytes, size_t dst_offset) const {
+#if defined(__APPLE__)
+    if (!buffer || !src || bytes == 0) return;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer;
+    uint8_t* contents = reinterpret_cast<uint8_t*>([buf contents]);
+    if (!contents) return;
+    std::memcpy(contents + dst_offset, src, bytes);
+#else
+    (void)buffer; (void)src; (void)bytes; (void)dst_offset;
+#endif
+}
+
+void MetalExecutor::downloadFromBuffer(const void* buffer, void* dst,
+                                       size_t bytes, size_t src_offset) const {
+#if defined(__APPLE__)
+    if (!buffer || !dst || bytes == 0) return;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)(void*)buffer;
+    const uint8_t* contents = reinterpret_cast<const uint8_t*>([buf contents]);
+    if (!contents) return;
+    std::memcpy(dst, contents + src_offset, bytes);
+#else
+    (void)buffer; (void)dst; (void)bytes; (void)src_offset;
+#endif
 }
 
 } // namespace runtime
