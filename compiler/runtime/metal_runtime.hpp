@@ -447,6 +447,22 @@ public:
                            size_t length,
                            std::vector<float>& output) const;
 
+    // Phase B2b (continuous batching) — looped Q4_0 mat-vec for N requests.
+    // input is shape [batch, cols] (row n at offset n*cols); output is
+    // [batch, rows]. Internally dispatches the existing q4_0 v2/v3 kernel
+    // once per request, all into the same compute encoder so amortized CB
+    // overhead is N×1 (one CB) rather than N×N (one CB per dispatch).
+    // Bit-identical to running the single-row matmul N times sequentially.
+    bool runMatMulQ4_0Batched(const std::string& weight_name,
+                              const std::vector<uint8_t>& weights,
+                              const std::vector<float>& input,  // [batch, cols]
+                              size_t batch,
+                              size_t rows,
+                              size_t cols,
+                              size_t row_stride,
+                              uint32_t quant_version,
+                              std::vector<float>& output) const;  // [batch, rows]
+
     // Phase A2 (continuous batching) — gather K or V from a paged buffer
     // into a contiguous [n_kv_heads, num_tokens, head_dim] output.
     //

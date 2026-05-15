@@ -6415,6 +6415,116 @@ bool MetalExecutor::hasDequantQKKernel() const {
 }
 
 // ===========================================================================
+// Phase B2b (continuous batching) — looped Q4_0 mat-vec.
+// ===========================================================================
+
+bool MetalExecutor::runMatMulQ4_0Batched(const std::string& weight_name,
+                                         const std::vector<uint8_t>& weights,
+                                         const std::vector<float>& input,
+                                         size_t batch,
+                                         size_t rows,
+                                         size_t cols,
+                                         size_t row_stride,
+                                         uint32_t quant_version,
+                                         std::vector<float>& output) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->q4MatmulPipeline) return false;
+    if (batch == 0 || rows == 0 || cols == 0) return false;
+    if (input.size() != batch * cols) return false;
+    if (weights.size() < row_stride * rows) return false;
+
+    output.assign(batch * rows, 0.0f);
+
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            id<MTLBuffer> weightBuffer = impl_->getOrCacheWeight(weight_name, weights);
+            if (!weightBuffer) return false;
+
+            // One CB + one encoder; N dispatches into it. Pipeline state +
+            // weight buffer set once; per-request input/output buffers
+            // rebound per dispatch.
+            id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+
+            // Prefer v3 (4 rows/sg) → v2 → v1, matching matmulQ4_0's policy.
+            const bool use_v3 = impl_->q4MatmulPipelineV3 != nil && cols >= 64 && (rows % 4u == 0u);
+            const bool use_v2 = !use_v3 && impl_->q4MatmulPipelineV2 != nil && cols >= 64;
+            id<MTLComputePipelineState> pipe = use_v3 ? impl_->q4MatmulPipelineV3
+                                            : use_v2 ? impl_->q4MatmulPipelineV2
+                                                     : impl_->q4MatmulPipeline;
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:weightBuffer offset:0 atIndex:0];
+
+            struct Q4_0ParamsHost {
+                uint32_t rows;
+                uint32_t cols;
+                uint32_t row_stride;
+                uint32_t quant_version;
+            } params;
+            params.rows          = static_cast<uint32_t>(rows);
+            params.cols          = static_cast<uint32_t>(cols);
+            params.row_stride    = static_cast<uint32_t>(row_stride);
+            params.quant_version = quant_version;
+            [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+            // Allocate per-request input/output buffers up-front so they
+            // survive until CB commit. (Each iteration sets a different
+            // buffer at index 1/2; encoded dispatches reference the
+            // current binding at dispatch time.)
+            std::vector<id<MTLBuffer>> inBufs, outBufs;
+            inBufs.reserve(batch);
+            outBufs.reserve(batch);
+            const size_t in_bytes  = cols * sizeof(float);
+            const size_t out_bytes = rows * sizeof(float);
+            for (size_t n = 0; n < batch; ++n) {
+                id<MTLBuffer> ib = [impl_->device newBufferWithBytes:input.data() + n * cols
+                                                              length:in_bytes
+                                                             options:MTLResourceStorageModeShared];
+                id<MTLBuffer> ob = [impl_->device newBufferWithLength:out_bytes
+                                                              options:MTLResourceStorageModeShared];
+                if (!ib || !ob) return false;
+                inBufs.push_back(ib);
+                outBufs.push_back(ob);
+            }
+
+            for (size_t n = 0; n < batch; ++n) {
+                [enc setBuffer:inBufs[n]  offset:0 atIndex:1];
+                [enc setBuffer:outBufs[n] offset:0 atIndex:2];
+                if (use_v3) {
+                    [enc dispatchThreadgroups:MTLSizeMake((rows + 3u) / 4u, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                } else if (use_v2) {
+                    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                } else {
+                    NSUInteger tpg = impl_->q4MatmulPipeline.threadExecutionWidth;
+                    if (tpg == 0) tpg = 32;
+                    NSUInteger groups = (rows + tpg - 1) / tpg;
+                    if (groups == 0) groups = 1;
+                    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+                }
+            }
+
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) return false;
+
+            for (size_t n = 0; n < batch; ++n) {
+                std::memcpy(output.data() + n * rows, [outBufs[n] contents], out_bytes);
+            }
+            return true;
+        }
+    }
+#endif
+    (void)weight_name; (void)weights; (void)input; (void)batch;
+    (void)rows; (void)cols; (void)row_stride; (void)quant_version; (void)output;
+    return false;
+}
+
+// ===========================================================================
 // Phase B2a (continuous batching) — batched RMSNorm.
 // ===========================================================================
 

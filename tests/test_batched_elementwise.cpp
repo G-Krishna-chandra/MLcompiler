@@ -112,6 +112,65 @@ TEST(BatchedElementwiseB2a, AddOverBatchTreatsAsFlat) {
     }
 }
 
+// Phase B2b: looped Q4_0 mat-vec for N requests.
+// Validates against single-request runMatMulQ4_0 by extracting an actual
+// Q4_0 weight tensor from a TinyLlama (or any) GGUF if available; falls
+// back to skipping when not present.
+
+#include "runtime/session.hpp"
+#include "frontends/gguf_loader.hpp"
+#include <filesystem>
+
+TEST(BatchedMatMulB2b, LoopedMatchesSingle) {
+    auto& exec = mlc::runtime::MetalExecutor::Instance();
+    if (!exec.isAvailable()) {
+        GTEST_SKIP() << "Metal unavailable";
+    }
+    const std::string model_path = "models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf";
+    if (!std::filesystem::exists(model_path)) {
+        GTEST_SKIP() << "TinyLlama Q4_0 not present at " << model_path;
+    }
+
+    mlc::runtime::Session session(model_path);
+    const auto& tensors = session.loader().tensors();
+    auto it = tensors.find("blk.0.attn_q.weight");
+    ASSERT_NE(it, tensors.end());
+    const auto& tinfo = it->second;
+    ASSERT_EQ(tinfo.shape.size(), 2u);
+    size_t cols = static_cast<size_t>(tinfo.shape[0]);
+    size_t rows = static_cast<size_t>(tinfo.shape[1]);
+    const auto& raw = session.tensorData(tinfo);
+    size_t row_stride = raw.size() / rows;
+    uint32_t qv = session.loader().quantizationVersion();
+
+    // Build N random input vectors of size cols.
+    constexpr size_t batch = 4;
+    std::vector<float> flat_input(batch * cols);
+    std::vector<std::vector<float>> per_row;
+    for (size_t n = 0; n < batch; ++n) {
+        auto row = randomVector(cols, /*seed=*/2000 + static_cast<uint32_t>(n));
+        std::copy(row.begin(), row.end(), flat_input.begin() + n * cols);
+        per_row.push_back(std::move(row));
+    }
+
+    std::vector<float> batched_out;
+    ASSERT_TRUE(exec.runMatMulQ4_0Batched("blk.0.attn_q.weight", raw,
+                                          flat_input, batch, rows, cols,
+                                          row_stride, qv, batched_out));
+    ASSERT_EQ(batched_out.size(), batch * rows);
+
+    for (size_t n = 0; n < batch; ++n) {
+        std::vector<float> single_out;
+        ASSERT_TRUE(exec.runMatMulQ4_0("blk.0.attn_q.weight", raw, per_row[n],
+                                       rows, cols, row_stride, qv, single_out));
+        ASSERT_EQ(single_out.size(), rows);
+        for (size_t r = 0; r < rows; ++r) {
+            EXPECT_EQ(batched_out[n * rows + r], single_out[r])
+                << "row request=" << n << " out_idx=" << r;
+        }
+    }
+}
+
 TEST(BatchedElementwiseB2a, FeedForwardOverBatchTreatsAsFlat) {
     auto& exec = mlc::runtime::MetalExecutor::Instance();
     if (!exec.isAvailable()) {
