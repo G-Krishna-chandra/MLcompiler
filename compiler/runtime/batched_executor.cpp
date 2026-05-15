@@ -70,6 +70,10 @@ BatchedExecutor::PerRequest& BatchedExecutor::ensure_request(uint32_t request_id
     pr.executor = std::make_unique<ExecutionExecutor>(graph_,
                                                       &BackendRegistry::Default(),
                                                       pr.context.get());
+    // Match chat-repl's startup: zero KV state and invalidate any cached
+    // MetalBuffer wrappers. Without this, fuse-mode reads stale GPU
+    // buffers cached by the executor singleton during a prior request.
+    pr.context->clearStateTensors();
     auto inserted = requests_.emplace(request_id, std::move(pr));
     return inserted.first->second;
 }
@@ -96,7 +100,6 @@ BatchedDecodeOutput BatchedExecutor::run_decode(const std::vector<RequestSlot>& 
 
         ctx.setToken(slot.input_token);
         ctx.setSequencePosition(slot.sequence_position);
-        ctx.setActiveSequenceId(0);
         prime_token_tensors(ctx, slot.input_token);
 
         auto exec_res = req.executor->run();
@@ -125,16 +128,49 @@ std::vector<float> BatchedExecutor::run_prefill(uint32_t request_id,
     std::vector<float> last_logits;
     if (tokens.empty()) return last_logits;
 
+    auto& req = ensure_request(request_id);
+    ExecutionContext& ctx = *req.context;
     size_t cursor = known_position(request_id);
-    for (uint64_t tok : tokens) {
-        std::vector<RequestSlot> slot{{request_id, tok, cursor}};
-        auto out = run_decode(slot);
-        if (out.per_request.empty() || !out.per_request.front().success) {
-            last_logits.clear();
-            return last_logits;
+
+    // Multi-token batched prefill (matches chat-repl). When seq_len > 1 the
+    // executor's fuse path is disabled internally and per-token fallthrough
+    // builds the KV cache correctly. Looping single-token decode-with-fuse
+    // from a zero KV cache silently produces all-zero logits — the encode
+    // path's K/V writes don't take effect until the cache has been seeded
+    // by the non-fuse multi-token path. (Confirmed by mlc decode having
+    // the same bug; chat-repl avoids it via multi-token prefill.)
+    ctx.setTokens(tokens);
+    ctx.setSequencePosition(cursor);
+    ctx.setActiveSequenceId(0);
+    static const std::vector<std::string> kTokenInputs = {"tokens", "token_ids"};
+    for (const auto& name : kTokenInputs) {
+        if (graph_.tensors().count(name)) {
+            std::vector<float> tf;
+            tf.reserve(tokens.size());
+            for (uint64_t t : tokens) tf.push_back(static_cast<float>(t));
+            ctx.setTensor(name, std::move(tf));
         }
-        last_logits = std::move(out.per_request.front().logits);
-        ++cursor;
+    }
+    auto exec_res = req.executor->run();
+    if (!exec_res.success) {
+        return last_logits;
+    }
+    if (const auto* logits = ctx.getTensor("logits")) {
+        last_logits = *logits;
+    }
+    req.next_position = cursor + tokens.size();
+    // Reset seq_len so subsequent run_decode (single-token) sees the right shape.
+    ctx.setSeqLen(1);
+
+    // B3 paged-KV: extend the page table by one slot per prefilled token.
+    // Failure here releases logits and signals failure.
+    if (page_pool_) {
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (!advance_page_state(req)) {
+                last_logits.clear();
+                return last_logits;
+            }
+        }
     }
     return last_logits;
 }

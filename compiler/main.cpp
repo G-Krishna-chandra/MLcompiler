@@ -14,6 +14,8 @@
 #include "runtime/model_runner.hpp"
 #include "runtime/metal_runtime.hpp"
 #include "runtime/decode_runner.hpp"
+#include "runtime/batched_executor.hpp"
+#include "runtime/scheduler.hpp"
 #include "runtime/tokenizer.hpp"
 #include "runtime/sampling.hpp"
 #include "runtime/parity_harness.hpp"
@@ -1743,6 +1745,171 @@ int handleChatCommand(const std::vector<std::string>& args) {
                 std::cout << "Decoded: [unavailable]\n";
             }
         }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+}
+
+// Phase D1 (continuous batching demo): mlc serve.
+//
+// Multi-prompt input, streaming output with per-request tags, aggregate
+// tok/s report. The simplest viable demo for the wedge — no HTTP, no
+// chat templating, no fancy sampling. Greedy decode only; the point
+// is throughput scaling, not chat quality.
+int handleServeCommand(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        std::cerr << "Usage: mlc serve <gguf_path> --prompt \"...\" [--prompt \"...\" ...]\n"
+                     "                 [--max-tokens N] [--batch-size N]\n";
+        return 1;
+    }
+
+    const std::string& gguf_path = args[0];
+    std::vector<std::string> prompts;
+    size_t max_tokens = 64;
+    size_t batch_size = 8;
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "--prompt" && i + 1 < args.size()) {
+            prompts.push_back(args[++i]);
+        } else if (arg.rfind("--prompt=", 0) == 0) {
+            prompts.push_back(arg.substr(9));
+        } else if (arg == "--max-tokens" && i + 1 < args.size()) {
+            parseSizeT(args[++i], max_tokens);
+        } else if (arg.rfind("--max-tokens=", 0) == 0) {
+            parseSizeT(arg.substr(13), max_tokens);
+        } else if (arg == "--batch-size" && i + 1 < args.size()) {
+            parseSizeT(args[++i], batch_size);
+        } else if (arg.rfind("--batch-size=", 0) == 0) {
+            parseSizeT(arg.substr(13), batch_size);
+        } else {
+            std::cerr << "Unknown serve option: " << arg << "\n";
+            return 1;
+        }
+    }
+
+    if (prompts.empty()) {
+        std::cerr << "mlc serve requires at least one --prompt.\n";
+        return 1;
+    }
+    if (max_tokens == 0) max_tokens = 1;
+    if (batch_size == 0) batch_size = 1;
+
+    try {
+        mlc::runtime::Session session(gguf_path);
+        mlc::runtime::Tokenizer tokenizer(session.loader());
+        if (!tokenizer.valid()) {
+            std::cerr << "Tokenizer not available in GGUF\n";
+            return 1;
+        }
+
+        mlc::runtime::BatchedExecutor exec(session);
+        mlc::runtime::Scheduler scheduler(&exec, batch_size);
+
+        // Per-request bookkeeping for streaming + per-request tok/s.
+        struct ReqInfo {
+            uint32_t id = 0;
+            std::string prompt;
+            size_t prompt_tokens = 0;
+            std::vector<uint64_t> generated_ids;
+            std::chrono::steady_clock::time_point started;
+            std::chrono::steady_clock::time_point finished;
+        };
+        std::unordered_map<uint32_t, ReqInfo> by_id;
+        std::vector<uint32_t> ordered_ids;
+
+        // Tokenize prompts and enqueue.
+        mlc::runtime::TokenizerConfig tc;
+        tc.add_bos = true;
+        tc.add_eos = false;
+
+        mlc::runtime::GenerationParams params;
+        params.max_new_tokens = max_tokens;
+        int64_t eos = (tokenizer.eosId() != std::numeric_limits<uint64_t>::max())
+                          ? static_cast<int64_t>(tokenizer.eosId())
+                          : -1;
+        params.eos_token_id = eos;
+
+        for (const auto& prompt_text : prompts) {
+            auto tokens = tokenizer.encode(prompt_text, tc);
+            if (tokens.empty()) {
+                std::cerr << "Tokenization produced no tokens for prompt: " << prompt_text << "\n";
+                return 1;
+            }
+            uint32_t id = scheduler.add_request(tokens, params);
+            ReqInfo info;
+            info.id = id;
+            info.prompt = prompt_text;
+            info.prompt_tokens = tokens.size();
+            info.started = std::chrono::steady_clock::now();
+            by_id.emplace(id, std::move(info));
+            ordered_ids.push_back(id);
+            std::cout << "[req " << id << "] queued: \"" << prompt_text << "\" ("
+                      << tokens.size() << " prompt tokens)\n";
+        }
+
+        // Streaming token callback. We emit a single decoded glyph per token
+        // (or its raw byte form when partial UTF-8). Per-request tag prefix.
+        scheduler.set_token_callback([&](uint32_t req_id, uint64_t tok) {
+            auto it = by_id.find(req_id);
+            if (it == by_id.end()) return;
+            it->second.generated_ids.push_back(tok);
+            // Decode incrementally: take last few tokens to handle BPE's
+            // multi-token glyphs robustly. Stream the difference.
+            const auto& gen = it->second.generated_ids;
+            std::string acc = tokenizer.decode(gen);
+            // Print the last decoded char(s) since previous emit. We
+            // re-decode from scratch each step which is O(N) but N is
+            // tiny here. A streaming-capable tokenizer would do better.
+            static thread_local std::unordered_map<uint32_t, size_t> printed;
+            size_t already = printed[req_id];
+            if (acc.size() > already) {
+                std::cout << "[req " << req_id << "] " << acc.substr(already) << "\n";
+                std::cout.flush();
+                printed[req_id] = acc.size();
+            }
+        });
+
+        scheduler.set_complete_callback([&](const mlc::runtime::Scheduler::Request& req) {
+            auto it = by_id.find(req.id);
+            if (it == by_id.end()) return;
+            it->second.finished = std::chrono::steady_clock::now();
+            it->second.generated_ids = req.generated_tokens;
+        });
+
+        auto wall_start = std::chrono::steady_clock::now();
+        size_t decode_steps = scheduler.run_until_idle();
+        auto wall_end = std::chrono::steady_clock::now();
+
+        double wall_s = std::chrono::duration<double>(wall_end - wall_start).count();
+        if (wall_s <= 0.0) wall_s = 1e-9;
+
+        // Final per-request report.
+        size_t total_generated = 0;
+        std::cout << "\n--- final report ---\n";
+        for (uint32_t id : ordered_ids) {
+            const ReqInfo& info = by_id[id];
+            double per_s = std::chrono::duration<double>(info.finished - info.started).count();
+            if (per_s <= 0.0) per_s = wall_s;
+            size_t n = info.generated_ids.size();
+            total_generated += n;
+            double tok_s = n / per_s;
+            std::string text = tokenizer.decode(info.generated_ids);
+            std::cout << "[req " << id << "] generated=" << n
+                      << " time=" << std::fixed << std::setprecision(2) << (per_s * 1000.0)
+                      << " ms tok/s=" << std::setprecision(1) << tok_s << "\n";
+            std::cout << "          prompt: \"" << info.prompt << "\"\n";
+            std::cout << "          output: \"" << text << "\"\n";
+        }
+        double aggregate_tok_s = total_generated / wall_s;
+        std::cout << "[summary] requests=" << prompts.size()
+                  << " batch_size=" << batch_size
+                  << " decode_steps=" << decode_steps
+                  << " total_tokens=" << total_generated
+                  << " wall=" << std::fixed << std::setprecision(2) << (wall_s * 1000.0) << " ms"
+                  << " aggregate=" << std::setprecision(1) << aggregate_tok_s << " tok/s\n";
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
@@ -3485,6 +3652,8 @@ int main(int argc, char* argv[]) {
         return handleChatCommand(args.arguments);
     } else if (args.command == "chat-repl") {
         return handleChatReplCommand(args.arguments);
+    } else if (args.command == "serve") {
+        return handleServeCommand(args.arguments);
     } else if (args.command == "chat-llama") {
         return handleChatLlamaCommand(args.arguments);
     } else if (args.command == "tokenize") {
