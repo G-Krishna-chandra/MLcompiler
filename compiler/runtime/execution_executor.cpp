@@ -749,7 +749,13 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
                 po.buffer = backend_result.gpu_output_buffer;
                 po.host_dst = host_dst;
                 po.element_count = backend_result.gpu_output_element_count;
-                po.needs_host = true;
+                // Lever 6 (final-push): use the precomputed needs_host map.
+                // If every consumer is a fusable op that reads via
+                // FromBuffer and there's no tap, the host readback can
+                // be skipped — saves the per-pass memcpy at flush for
+                // attention output and similar.
+                auto nh_it = tensor_needs_host.find(out_name);
+                po.needs_host = (nh_it == tensor_needs_host.end()) ? true : nh_it->second;
                 pass_outputs[out_name] = po;
             }
         }
