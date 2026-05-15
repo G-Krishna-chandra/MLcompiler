@@ -89,6 +89,7 @@ add_library(mlc_lib STATIC
 target_include_directories(mlc_lib PUBLIC
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/compiler
+    ${CMAKE_SOURCE_DIR}/third_party
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

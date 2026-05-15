@@ -34,6 +34,12 @@
 #include "llama.h"
 #endif
 
+#ifndef MLC_DISABLE_HTTPLIB
+#include "httplib.h"
+#endif
+
+#include <mutex>
+
 #include <random>
 #include <limits>
 #include <cstdio>
@@ -2095,6 +2101,254 @@ int handleServeCommand(const std::vector<std::string>& args) {
     }
 }
 
+// =====================================================================
+// Phase K1: mlc api — minimal HTTP server for the wedge demo.
+//
+// Exposes one POST endpoint that takes a JSON body of N prompts and
+// runs them as a single batched forward pass through the existing
+// BatchedExecutor + paged storage path. Returns per-prompt text +
+// timing.
+//
+// Companion to tools/demo/index.html which races this against Ollama
+// (which serializes concurrent requests on one model instance) to
+// visually demonstrate the continuous-batching wedge.
+// =====================================================================
+namespace {
+
+// ---- Tiny JSON parse/write ----
+//
+// Hand-rolled because nlohmann/json adds a few seconds of compile time
+// for every translation unit and the schema here is fixed:
+//
+//   request:  {"prompts": [{"id": "x", "text": "y"}, ...], "max_tokens": N}
+//   response: {"results": [{"id":..., "text":..., "tokens":..., "time_ms":...}, ...],
+//              "total_time_ms": N, "aggregate_tok_s": N}
+//
+// String escapes supported on parse: \" \\ \/ \n \t \r \b \f and
+// \uXXXX (BMP only). Writer escapes the inverse plus control chars.
+
+struct JsonError { std::string what; };
+
+void skipWs(const std::string& s, size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+}
+
+bool expect(const std::string& s, size_t& i, char c) {
+    skipWs(s, i);
+    if (i >= s.size() || s[i] != c) return false;
+    ++i;
+    return true;
+}
+
+bool peek(const std::string& s, size_t i, char c) {
+    skipWs(s, i);
+    return i < s.size() && s[i] == c;
+}
+
+void appendUtf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+}
+
+bool parseString(const std::string& s, size_t& i, std::string& out) {
+    skipWs(s, i);
+    if (i >= s.size() || s[i] != '"') return false;
+    ++i;
+    out.clear();
+    while (i < s.size() && s[i] != '"') {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char esc = s[i + 1];
+            i += 2;
+            switch (esc) {
+                case '"':  out.push_back('"');  break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/');  break;
+                case 'n':  out.push_back('\n'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 'b':  out.push_back('\b'); break;
+                case 'f':  out.push_back('\f'); break;
+                case 'u': {
+                    if (i + 4 > s.size()) return false;
+                    uint32_t cp = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        char c = s[i + k];
+                        cp <<= 4;
+                        if (c >= '0' && c <= '9') cp |= (c - '0');
+                        else if (c >= 'a' && c <= 'f') cp |= (c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') cp |= (c - 'A' + 10);
+                        else return false;
+                    }
+                    i += 4;
+                    appendUtf8(out, cp);
+                    break;
+                }
+                default: return false;
+            }
+        } else {
+            out.push_back(s[i++]);
+        }
+    }
+    if (i >= s.size()) return false;
+    ++i;  // skip closing quote
+    return true;
+}
+
+bool parseNumber(const std::string& s, size_t& i, double& out) {
+    skipWs(s, i);
+    size_t start = i;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+')) ++i;
+    while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) ||
+                            s[i] == '.' || s[i] == 'e' || s[i] == 'E' ||
+                            s[i] == '+' || s[i] == '-')) ++i;
+    if (start == i) return false;
+    try {
+        out = std::stod(s.substr(start, i - start));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+struct ApiPrompt { std::string id; std::string text; };
+struct ApiResult { std::string id; std::string text; size_t tokens = 0; double time_ms = 0.0; };
+
+// Parse {"prompts": [...], "max_tokens": N} — returns false on any
+// schema violation. Tolerates field order and extra unknown fields.
+bool parseApiRequest(const std::string& body,
+                     std::vector<ApiPrompt>& out_prompts,
+                     size_t& out_max_tokens) {
+    size_t i = 0;
+    if (!expect(body, i, '{')) return false;
+    out_max_tokens = 100;
+    bool got_prompts = false;
+    while (true) {
+        skipWs(body, i);
+        if (peek(body, i, '}')) { ++i; while (body[i-1] != '}') ++i; break; }
+        std::string key;
+        if (!parseString(body, i, key)) return false;
+        if (!expect(body, i, ':')) return false;
+        if (key == "prompts") {
+            if (!expect(body, i, '[')) return false;
+            got_prompts = true;
+            while (true) {
+                skipWs(body, i);
+                if (peek(body, i, ']')) { ++i; break; }
+                if (!expect(body, i, '{')) return false;
+                ApiPrompt p;
+                while (true) {
+                    skipWs(body, i);
+                    if (peek(body, i, '}')) { ++i; break; }
+                    std::string k;
+                    if (!parseString(body, i, k)) return false;
+                    if (!expect(body, i, ':')) return false;
+                    std::string v;
+                    if (!parseString(body, i, v)) return false;
+                    if (k == "id") p.id = v;
+                    else if (k == "text") p.text = v;
+                    skipWs(body, i);
+                    if (peek(body, i, ',')) { ++i; continue; }
+                }
+                out_prompts.push_back(std::move(p));
+                skipWs(body, i);
+                if (peek(body, i, ',')) { ++i; continue; }
+            }
+        } else if (key == "max_tokens") {
+            double n = 0.0;
+            if (!parseNumber(body, i, n)) return false;
+            if (n > 0) out_max_tokens = static_cast<size_t>(n);
+        } else {
+            // Unknown field — skip a value (string, number, bool, object, array).
+            skipWs(body, i);
+            if (i >= body.size()) return false;
+            char c = body[i];
+            if (c == '"') { std::string ignored; if (!parseString(body, i, ignored)) return false; }
+            else if (c == '{' || c == '[') {
+                int depth = 0;
+                bool in_string = false;
+                while (i < body.size()) {
+                    char ch = body[i++];
+                    if (in_string) {
+                        if (ch == '\\' && i < body.size()) ++i;
+                        else if (ch == '"') in_string = false;
+                    } else {
+                        if (ch == '"') in_string = true;
+                        else if (ch == '{' || ch == '[') ++depth;
+                        else if (ch == '}' || ch == ']') { --depth; if (depth == 0) break; }
+                    }
+                }
+            } else {
+                // number / bool / null — read until , or } at depth 0
+                while (i < body.size() && body[i] != ',' && body[i] != '}') ++i;
+            }
+        }
+        skipWs(body, i);
+        if (peek(body, i, ',')) { ++i; continue; }
+        if (peek(body, i, '}')) { ++i; break; }
+        return false;
+    }
+    return got_prompts;
+}
+
+void writeJsonString(std::ostringstream& out, const std::string& s) {
+    out << '"';
+    for (char c : s) {
+        switch (c) {
+            case '"':  out << "\\\""; break;
+            case '\\': out << "\\\\"; break;
+            case '\n': out << "\\n";  break;
+            case '\r': out << "\\r";  break;
+            case '\t': out << "\\t";  break;
+            case '\b': out << "\\b";  break;
+            case '\f': out << "\\f";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+                    out << buf;
+                } else {
+                    out << c;
+                }
+        }
+    }
+    out << '"';
+}
+
+std::string writeApiResponse(const std::vector<ApiResult>& results,
+                             double total_ms,
+                             double aggregate_tok_s) {
+    std::ostringstream out;
+    out << "{\"results\":[";
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (i) out << ",";
+        out << "{\"id\":";
+        writeJsonString(out, results[i].id);
+        out << ",\"text\":";
+        writeJsonString(out, results[i].text);
+        out << ",\"tokens\":" << results[i].tokens;
+        out << ",\"time_ms\":" << std::fixed << std::setprecision(1) << results[i].time_ms;
+        out << "}";
+        out.unsetf(std::ios::fixed);
+    }
+    out << "],\"total_time_ms\":" << std::fixed << std::setprecision(1) << total_ms;
+    out << ",\"aggregate_tok_s\":" << std::setprecision(2) << aggregate_tok_s;
+    out << ",\"backend\":\"mlc\"";
+    out << "}";
+    return out.str();
+}
+
+}  // namespace
+
+int handleApiCommand(const std::vector<std::string>& args);
+
 int handleChatReplCommand(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cerr << "Usage: mlc chat-repl <gguf_path> [--max-new N] [--temperature T] [--topk K] [--topp P]\n"
@@ -2505,6 +2759,303 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
+}
+
+int handleApiCommand(const std::vector<std::string>& args) {
+#ifdef MLC_DISABLE_HTTPLIB
+    (void)args;
+    std::cerr << "mlc api: built without httplib support\n";
+    return 1;
+#else
+    return [&]() -> int {
+    if (args.empty()) {
+        std::cerr << "Usage: mlc api <gguf_path> [--port N] [--host HOST] [--max-tokens N]\n"
+                     "                            [--page-size N] [--max-batch N]\n"
+                     "                            [--static-dir DIR]\n"
+                     "\n"
+                     "POST /v1/completions  body: {\"prompts\":[{\"id\":...,\"text\":...},...],\n"
+                     "                             \"max_tokens\":N}\n"
+                     "GET  /health          {\"status\":\"ok\",\"backend\":\"mlc\",\"model\":...}\n"
+                     "GET  /                serves --static-dir/index.html if set\n";
+        return 1;
+    }
+    std::string gguf_path = args[0];
+    std::string host = "0.0.0.0";
+    int port = 8080;
+    size_t default_max_tokens = 100;
+    size_t page_size = 64;
+    size_t max_batch = 16;
+    std::string static_dir;
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--port" && i + 1 < args.size()) port = std::stoi(args[++i]);
+        else if (a.rfind("--port=", 0) == 0) port = std::stoi(a.substr(7));
+        else if (a == "--host" && i + 1 < args.size()) host = args[++i];
+        else if (a.rfind("--host=", 0) == 0) host = a.substr(7);
+        else if (a == "--max-tokens" && i + 1 < args.size()) parseSizeT(args[++i], default_max_tokens);
+        else if (a.rfind("--max-tokens=", 0) == 0) parseSizeT(a.substr(13), default_max_tokens);
+        else if (a == "--page-size" && i + 1 < args.size()) parseSizeT(args[++i], page_size);
+        else if (a == "--max-batch" && i + 1 < args.size()) parseSizeT(args[++i], max_batch);
+        else if (a == "--static-dir" && i + 1 < args.size()) static_dir = args[++i];
+        else if (a.rfind("--static-dir=", 0) == 0) static_dir = a.substr(13);
+        else { std::cerr << "Unknown api option: " << a << "\n"; return 1; }
+    }
+    if (max_batch == 0) max_batch = 1;
+
+    try {
+        // Load model + tokenizer ONCE. Per-request setup creates a fresh
+        // BatchedExecutor + paged storage but reuses the loaded session
+        // (mmap'd weights, vocab cache).
+        std::cerr << "[api] loading model: " << gguf_path << "\n";
+        mlc::runtime::Session session(gguf_path);
+        mlc::runtime::Tokenizer tokenizer(session.loader());
+        if (!tokenizer.valid()) {
+            std::cerr << "[api] tokenizer not available in GGUF\n";
+            return 1;
+        }
+        std::cerr << "[api] model loaded, vocab=" << tokenizer.vocabSize() << "\n";
+
+        // Discover model attention shape for paged storage sizing.
+        size_t n_kv_heads = 0, head_dim = 0, n_layers = 0;
+        {
+            auto graph = mlc::runtime::ExecutionPlanBuilder::BuildFromLoader(session.loader());
+            for (const auto& n : graph.nodes()) {
+                if (n.op == mlc::runtime::ExecOpType::Attention) {
+                    if (n_kv_heads == 0) {
+                        n_kv_heads = static_cast<size_t>(n.attributes.at("kv_heads"));
+                        head_dim   = static_cast<size_t>(n.attributes.at("head_dim"));
+                    }
+                    ++n_layers;
+                }
+            }
+        }
+        if (n_kv_heads == 0 || head_dim == 0 || n_layers == 0) {
+            std::cerr << "[api] failed to discover model attention shape\n";
+            return 1;
+        }
+
+        std::mutex inference_mutex;  // serialize inference (one batch at a time)
+
+        // Per-request inference: tokenize, batch via BatchedExecutor +
+        // paged storage + Scheduler, collect per-prompt results.
+        auto runBatch = [&](const std::vector<ApiPrompt>& prompts,
+                            size_t max_tokens,
+                            std::vector<ApiResult>& results,
+                            double& total_ms,
+                            double& aggregate_tok_s) {
+            std::lock_guard<std::mutex> lk(inference_mutex);
+
+            using clk = std::chrono::steady_clock;
+            auto wall_start = clk::now();
+
+            mlc::runtime::BatchedExecutor exec(session);
+            uint32_t pages_per_req = static_cast<uint32_t>(
+                (max_tokens + 256 + page_size - 1) / page_size);
+            uint32_t capacity = static_cast<uint32_t>(prompts.size() + 4) * pages_per_req;
+            mlc::runtime::PagePool page_pool(capacity);
+            mlc::runtime::PagedKVStorage paged_storage(
+                capacity, static_cast<uint32_t>(n_layers),
+                static_cast<uint32_t>(page_size), static_cast<uint32_t>(n_kv_heads),
+                static_cast<uint32_t>(head_dim), /*dtype_bytes=*/2);
+            if (!paged_storage.initialize()) {
+                results.clear();
+                total_ms = 0;
+                aggregate_tok_s = 0;
+                return false;
+            }
+            exec.attach_page_pool(&page_pool, static_cast<uint32_t>(page_size));
+            exec.attach_paged_storage(&paged_storage);
+
+            mlc::runtime::Scheduler scheduler(&exec, prompts.size());
+
+            mlc::runtime::TokenizerConfig tc;
+            tc.add_bos = true;
+            tc.add_eos = false;
+            mlc::runtime::GenerationParams params;
+            params.max_new_tokens = max_tokens;
+            int64_t eos = (tokenizer.eosId() != std::numeric_limits<uint64_t>::max())
+                              ? static_cast<int64_t>(tokenizer.eosId())
+                              : -1;
+            params.eos_token_id = eos;
+
+            struct ReqState {
+                std::string id;
+                size_t prompt_tokens = 0;
+                std::chrono::steady_clock::time_point started;
+                std::chrono::steady_clock::time_point finished;
+                std::vector<uint64_t> generated;
+            };
+            std::unordered_map<uint32_t, ReqState> by_id;
+            std::vector<uint32_t> ordered_req_ids;
+
+            for (const auto& p : prompts) {
+                auto toks = tokenizer.encode(p.text, tc);
+                if (toks.empty()) {
+                    // Inject a single BOS so the kernel has work; result will be empty.
+                    if (tokenizer.bosId() != std::numeric_limits<uint64_t>::max()) {
+                        toks.push_back(tokenizer.bosId());
+                    } else {
+                        toks.push_back(1);
+                    }
+                }
+                uint32_t rid = scheduler.add_request(toks, params);
+                ReqState s;
+                s.id = p.id;
+                s.prompt_tokens = toks.size();
+                s.started = clk::now();
+                by_id.emplace(rid, std::move(s));
+                ordered_req_ids.push_back(rid);
+            }
+
+            scheduler.set_token_callback([&](uint32_t req_id, uint64_t tok) {
+                auto it = by_id.find(req_id);
+                if (it != by_id.end()) it->second.generated.push_back(tok);
+            });
+            scheduler.set_complete_callback([&](const mlc::runtime::Scheduler::Request& req) {
+                auto it = by_id.find(req.id);
+                if (it != by_id.end()) {
+                    it->second.finished = clk::now();
+                    it->second.generated = req.generated_tokens;
+                }
+            });
+
+            scheduler.run_until_idle();
+            auto wall_end = clk::now();
+            double wall_s = std::chrono::duration<double>(wall_end - wall_start).count();
+            total_ms = wall_s * 1000.0;
+
+            results.clear();
+            size_t total_generated = 0;
+            for (uint32_t rid : ordered_req_ids) {
+                const auto& s = by_id[rid];
+                ApiResult r;
+                r.id = s.id;
+                r.tokens = s.generated.size();
+                total_generated += r.tokens;
+                double per_s = std::chrono::duration<double>(s.finished - s.started).count();
+                if (per_s <= 0.0) per_s = wall_s;
+                r.time_ms = per_s * 1000.0;
+                r.text = tokenizer.decode(s.generated);
+                results.push_back(std::move(r));
+            }
+            aggregate_tok_s = wall_s > 0 ? total_generated / wall_s : 0;
+            return true;
+        };
+
+        // Warm up: a one-prompt batch with 1 token to JIT-compile Metal
+        // kernels and prime the weight cache. First /v1/completions
+        // request would otherwise eat ~3-5 sec of one-time setup.
+        {
+            std::cerr << "[api] warming up..." << std::endl;
+            std::vector<ApiPrompt> warm = {{"warmup", "Hi"}};
+            std::vector<ApiResult> wr;
+            double t = 0, a = 0;
+            runBatch(warm, 4, wr, t, a);
+            std::cerr << "[api] warmup done in " << std::fixed << std::setprecision(0) << t
+                      << " ms (next requests will be fast)\n";
+        }
+
+        // ---- HTTP server ----
+        httplib::Server svr;
+        auto setCors = [](httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type");
+        };
+        svr.Options(R"(.*)", [&](const httplib::Request&, httplib::Response& res) {
+            setCors(res);
+            res.status = 204;
+        });
+
+        svr.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
+            setCors(res);
+            std::ostringstream o;
+            o << "{\"status\":\"ok\",\"backend\":\"mlc\",\"model\":";
+            writeJsonString(o, gguf_path);
+            o << ",\"max_batch\":" << max_batch
+              << ",\"default_max_tokens\":" << default_max_tokens
+              << ",\"vocab_size\":" << tokenizer.vocabSize()
+              << "}";
+            res.set_content(o.str(), "application/json");
+        });
+
+        svr.Post("/v1/completions", [&](const httplib::Request& req, httplib::Response& res) {
+            setCors(res);
+            std::vector<ApiPrompt> prompts;
+            size_t max_tokens = default_max_tokens;
+            if (!parseApiRequest(req.body, prompts, max_tokens)) {
+                res.status = 400;
+                res.set_content("{\"error\":\"invalid JSON or schema\"}", "application/json");
+                return;
+            }
+            if (prompts.empty()) {
+                res.status = 400;
+                res.set_content("{\"error\":\"prompts array empty\"}", "application/json");
+                return;
+            }
+            if (prompts.size() > max_batch) {
+                res.status = 400;
+                std::ostringstream o;
+                o << "{\"error\":\"batch size " << prompts.size()
+                  << " exceeds --max-batch " << max_batch << "\"}";
+                res.set_content(o.str(), "application/json");
+                return;
+            }
+            // Cap max_tokens defensively.
+            if (max_tokens > 1024) max_tokens = 1024;
+
+            std::vector<ApiResult> results;
+            double total_ms = 0, aggregate_tok_s = 0;
+            std::cerr << "[api] /v1/completions n=" << prompts.size()
+                      << " max_tokens=" << max_tokens << "\n";
+            bool ok = runBatch(prompts, max_tokens, results, total_ms, aggregate_tok_s);
+            if (!ok) {
+                res.status = 500;
+                res.set_content("{\"error\":\"inference failed\"}", "application/json");
+                return;
+            }
+            std::cerr << "[api]   → " << std::fixed << std::setprecision(0) << total_ms
+                      << " ms, agg=" << std::setprecision(1) << aggregate_tok_s << " tok/s\n";
+            res.set_content(writeApiResponse(results, total_ms, aggregate_tok_s),
+                            "application/json");
+        });
+
+        // Optional static file serving. Convenient for `mlc api ... --static-dir tools/demo`
+        // so the demo HTML is served from the same origin (no CORS dance needed).
+        if (!static_dir.empty()) {
+            svr.set_mount_point("/", static_dir);
+        }
+
+        svr.Get("/", [&](const httplib::Request& req, httplib::Response& res) {
+            // If static_dir was set and serves index.html, httplib's mount
+            // handles it. This fallback only fires if no static dir.
+            if (!static_dir.empty()) return;
+            setCors(res);
+            res.set_content(
+                "mlc api running. POST /v1/completions to batch infer. GET /health for status.\n",
+                "text/plain");
+            (void)req;
+        });
+
+        std::cout << "[api] listening on http://" << host << ":" << port << "\n";
+        if (!static_dir.empty()) {
+            std::cout << "[api]   serving static files from " << static_dir << "\n";
+        }
+        std::cout << "[api]   curl -s http://" << host << ":" << port << "/health\n";
+        std::cout << "[api]   curl -s -X POST http://" << host << ":" << port << "/v1/completions \\\n";
+        std::cout << "[api]        -H 'Content-Type: application/json' \\\n";
+        std::cout << "[api]        -d '{\"prompts\":[{\"id\":\"a\",\"text\":\"Hello\"}],\"max_tokens\":8}'\n";
+        if (!svr.listen(host, port)) {
+            std::cerr << "[api] failed to bind " << host << ":" << port << "\n";
+            return 1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[api] error: " << e.what() << "\n";
+        return 1;
+    }
+    }();
+#endif
 }
 
 int handleChatLlamaCommand(const std::vector<std::string>& args) {
@@ -3884,6 +4435,8 @@ int main(int argc, char* argv[]) {
         return handleChatReplCommand(args.arguments);
     } else if (args.command == "serve") {
         return handleServeCommand(args.arguments);
+    } else if (args.command == "api") {
+        return handleApiCommand(args.arguments);
     } else if (args.command == "chat-llama") {
         return handleChatLlamaCommand(args.arguments);
     } else if (args.command == "tokenize") {
