@@ -39,6 +39,7 @@ bool isFusableOp(ExecOpType op) {
         case ExecOpType::Linear:
         case ExecOpType::Norm:
         case ExecOpType::Add:
+        case ExecOpType::Slice:
             return true;
         default:
             return false;
@@ -314,6 +315,14 @@ ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
             case ExecOpType::Add: {
                 if (n->annotations.count("bias")) return false;
                 return n->inputs.size() >= 2;
+            }
+            case ExecOpType::Slice: {
+                // Lever 5: Slice over a single fp32 input with constant offset/length.
+                auto off = n->attributes.find("slice_offset");
+                auto len = n->attributes.find("slice_length");
+                if (off == n->attributes.end() || len == n->attributes.end()) return false;
+                if (n->inputs.size() < 1) return false;
+                return true;
             }
             default: return false;
         }

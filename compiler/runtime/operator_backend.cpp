@@ -1808,6 +1808,43 @@ BackendExecutionResult MetalExecutionBackend::encode(const ExecutionNode& node,
                 result.success = false; result.message = "encode: norm param missing"; return result;
             }
         }
+        case ExecOpType::Slice: {
+            // Lever 5 (final-push): Slice on the open forward-pass CB.
+            // Source can be GPU-resident (chained from QKV/gate-up matmul
+            // output) or host. Emits encodeSlice* which uses the GPU
+            // slice_f32 kernel.
+            if (node.inputs.size() < 1) {
+                result.success = false; result.message = "encode: slice needs 1 input"; return result;
+            }
+            auto attr_off = node.attributes.find("slice_offset");
+            auto attr_len = node.attributes.find("slice_length");
+            if (attr_off == node.attributes.end() || attr_len == node.attributes.end()) {
+                result.success = false; result.message = "encode: slice missing offset/length"; return result;
+            }
+            size_t offset = static_cast<size_t>(attr_off->second);
+            size_t length = static_cast<size_t>(attr_len->second);
+            std::string out_name = node.outputs.empty() ? std::string() : node.outputs[0];
+            bool ok = false;
+            if (fusion.primary_input_buffer) {
+                ok = MetalExecutor::Instance().encodeSliceFromBuffer(
+                    fusion.primary_input_buffer, fusion.primary_input_count,
+                    offset, length,
+                    fusion.output_buffer, out_name,
+                    fusion.host_dst, fusion.needs_host_output);
+            } else {
+                const std::vector<float>* input = fetchInput(*context, node, 0, result);
+                if (!result.success) return result;
+                ok = MetalExecutor::Instance().encodeSliceFromHost(
+                    *input, offset, length,
+                    fusion.output_buffer, out_name,
+                    fusion.host_dst, fusion.needs_host_output);
+            }
+            if (!ok) {
+                result.success = false; result.message = "encode: encodeSlice failed"; return result;
+            }
+            result.message = "metal-slice-encoded";
+            return result;
+        }
         case ExecOpType::Add: {
             if (node.inputs.size() < 2) {
                 result.success = false; result.message = "encode: add needs 2 inputs"; return result;
