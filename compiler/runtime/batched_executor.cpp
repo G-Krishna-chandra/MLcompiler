@@ -20,11 +20,41 @@ BatchedExecutor::BatchedExecutor(const Session& session)
       graph_(ExecutionPlanBuilder::BuildFromLoader(session.loader())) {}
 
 void BatchedExecutor::reset() {
+    if (page_pool_) {
+        for (auto& kv : requests_) {
+            if (kv.second.page_state) kv.second.page_state->release_all(*page_pool_);
+        }
+    }
     requests_.clear();
 }
 
 void BatchedExecutor::release_request(uint32_t request_id) {
-    requests_.erase(request_id);
+    auto it = requests_.find(request_id);
+    if (it == requests_.end()) return;
+    if (page_pool_ && it->second.page_state) {
+        it->second.page_state->release_all(*page_pool_);
+    }
+    requests_.erase(it);
+}
+
+void BatchedExecutor::attach_page_pool(PagePool* pool, uint32_t page_size_tokens) {
+    page_pool_ = pool;
+    page_size_tokens_ = page_size_tokens > 0 ? page_size_tokens : 64;
+}
+
+const RequestKVState* BatchedExecutor::page_state(uint32_t request_id) const {
+    auto it = requests_.find(request_id);
+    if (it == requests_.end()) return nullptr;
+    return it->second.page_state.get();
+}
+
+bool BatchedExecutor::advance_page_state(PerRequest& req) {
+    if (!page_pool_) return true;
+    if (!req.page_state) {
+        req.page_state = std::make_unique<RequestKVState>();
+        req.page_state->page_size_tokens = page_size_tokens_;
+    }
+    return req.page_state->extend_one_token(*page_pool_).has_value();
 }
 
 size_t BatchedExecutor::known_position(uint32_t request_id) const {
@@ -76,6 +106,14 @@ BatchedDecodeOutput BatchedExecutor::run_decode(const std::vector<RequestSlot>& 
                 per.logits = *logits;
             }
             req.next_position = slot.sequence_position + 1;
+            // B3: extend the request's paged-KV table by one slot. Failure
+            // here (pool exhaustion) is reported as a soft failure on the
+            // slot — the per-request KV in the contiguous context remains
+            // intact, but the scheduler should treat this as a stop signal.
+            if (!advance_page_state(req)) {
+                per.success = false;
+                per.logits.clear();
+            }
         }
         out.per_request.push_back(std::move(per));
     }

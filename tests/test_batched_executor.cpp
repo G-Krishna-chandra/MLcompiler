@@ -2,10 +2,13 @@
 
 #include "runtime/batched_executor.hpp"
 #include "runtime/decode_runner.hpp"
+#include "runtime/paged_kv.hpp"
 #include "runtime/session.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -145,6 +148,114 @@ TEST(BatchedExecutorB2c, N2CosineMatchesSingleStream) {
         EXPECT_EQ(argmax(got_b), argmax(ref_b.steps[i].logits))
             << "request B step=" << i;
     }
+}
+
+// B3: paged-KV lifecycle integration.
+// With a PagePool attached, BatchedExecutor maintains a per-request
+// RequestKVState, advancing it by one slot per successful decode.
+// This test verifies (a) cosine match against single-stream is preserved
+// when paged tracking is on, (b) page tables grow as expected, and
+// (c) page IDs are disjoint across concurrent requests.
+TEST(BatchedExecutorB3, PagedKVLifecycle) {
+    if (!tinyLlamaAvailable()) {
+        GTEST_SKIP() << "TinyLlama model not present at " << tinyLlamaPath();
+    }
+
+    constexpr uint32_t REQ_A = 7;
+    constexpr uint32_t REQ_B = 9;
+    constexpr uint32_t PAGE_SIZE_TOKENS = 4;  // small for fast page-rollover
+    constexpr size_t kSteps = 10;             // crosses 2 page boundaries each
+    constexpr uint32_t POOL_CAPACITY = 32;    // headroom for both requests
+
+    std::vector<uint64_t> tokens_a = {1, 1462, 1554, 304, 263, 100, 200, 300, 400, 500};
+    std::vector<uint64_t> tokens_b = {1, 17320, 366, 460, 263, 600, 700, 800, 900, 1000};
+    ASSERT_EQ(tokens_a.size(), kSteps);
+    ASSERT_EQ(tokens_b.size(), kSteps);
+
+    // Reference: single-stream baselines.
+    auto runReference = [&](const std::vector<uint64_t>& tokens) {
+        mlc::runtime::DecodeOptions opts;
+        opts.tokens = tokens;
+        opts.max_steps = kSteps;
+        opts.start_position = 0;
+        opts.top_k = 0;
+        mlc::runtime::DecodeRunner runner(tinyLlamaPath());
+        return runner.run(opts);
+    };
+    auto ref_a = runReference(tokens_a);
+    auto ref_b = runReference(tokens_b);
+    ASSERT_TRUE(ref_a.success);
+    ASSERT_TRUE(ref_b.success);
+
+    // Batched run with paged KV attached.
+    mlc::runtime::Session session(tinyLlamaPath());
+    mlc::runtime::PagePool pool(POOL_CAPACITY);
+    mlc::runtime::BatchedExecutor exec(session);
+    exec.attach_page_pool(&pool, PAGE_SIZE_TOKENS);
+
+    for (size_t i = 0; i < kSteps; ++i) {
+        std::vector<mlc::runtime::RequestSlot> slots = {
+            {REQ_A, tokens_a[i], i},
+            {REQ_B, tokens_b[i], i},
+        };
+        auto out = exec.run_decode(slots);
+        ASSERT_EQ(out.per_request.size(), 2u);
+        for (const auto& per : out.per_request) {
+            ASSERT_TRUE(per.success) << "step=" << i << " req=" << per.request_id;
+        }
+
+        // Lookup logits per request id.
+        const std::vector<float>* got_a = nullptr;
+        const std::vector<float>* got_b = nullptr;
+        for (const auto& per : out.per_request) {
+            if (per.request_id == REQ_A) got_a = &per.logits;
+            else if (per.request_id == REQ_B) got_b = &per.logits;
+        }
+        ASSERT_NE(got_a, nullptr);
+        ASSERT_NE(got_b, nullptr);
+
+        EXPECT_GE(cosineSimilarity(*got_a, ref_a.steps[i].logits), 0.999)
+            << "request A step=" << i;
+        EXPECT_GE(cosineSimilarity(*got_b, ref_b.steps[i].logits), 0.999)
+            << "request B step=" << i;
+        EXPECT_EQ(argmax(*got_a), argmax(ref_a.steps[i].logits))
+            << "request A step=" << i;
+        EXPECT_EQ(argmax(*got_b), argmax(ref_b.steps[i].logits))
+            << "request B step=" << i;
+
+        // Page-table progression: after step i, each request holds (i+1) tokens.
+        // ceil((i+1) / PAGE_SIZE_TOKENS) pages allocated.
+        size_t expected_tokens = i + 1;
+        size_t expected_pages =
+            (expected_tokens + PAGE_SIZE_TOKENS - 1) / PAGE_SIZE_TOKENS;
+        const auto* state_a = exec.page_state(REQ_A);
+        const auto* state_b = exec.page_state(REQ_B);
+        ASSERT_NE(state_a, nullptr);
+        ASSERT_NE(state_b, nullptr);
+        EXPECT_EQ(state_a->total_tokens(), expected_tokens) << "step=" << i;
+        EXPECT_EQ(state_b->total_tokens(), expected_tokens) << "step=" << i;
+        EXPECT_EQ(state_a->page_table.size(), expected_pages) << "step=" << i;
+        EXPECT_EQ(state_b->page_table.size(), expected_pages) << "step=" << i;
+
+        // Disjoint page IDs across the two concurrent requests.
+        std::set<uint32_t> a_set(state_a->page_table.begin(), state_a->page_table.end());
+        for (uint32_t id : state_b->page_table) {
+            EXPECT_EQ(a_set.count(id), 0u)
+                << "page " << id << " in both requests at step=" << i;
+        }
+    }
+
+    // Pool accounting: 2 requests × ceil(kSteps / PAGE_SIZE_TOKENS) pages.
+    size_t expected_pages_per_req =
+        (kSteps + PAGE_SIZE_TOKENS - 1) / PAGE_SIZE_TOKENS;
+    EXPECT_EQ(pool.pages_in_use(), 2u * expected_pages_per_req);
+
+    // Releasing a request returns its pages to the pool.
+    exec.release_request(REQ_A);
+    EXPECT_EQ(pool.pages_in_use(), expected_pages_per_req);
+    exec.release_request(REQ_B);
+    EXPECT_EQ(pool.pages_in_use(), 0u);
+    EXPECT_EQ(exec.live_request_count(), 0u);
 }
 
 // Bit-identity check: for the same sequence of input tokens at the same

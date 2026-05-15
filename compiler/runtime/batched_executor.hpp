@@ -20,6 +20,7 @@
 #include "runtime/execution_graph.hpp"
 #include "runtime/execution_context.hpp"
 #include "runtime/execution_executor.hpp"
+#include "runtime/paged_kv.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -47,6 +48,19 @@ struct BatchedDecodeOutput {
 class BatchedExecutor {
 public:
     explicit BatchedExecutor(const Session& session);
+
+    // Phase B3 — attach a PagePool. When attached, BatchedExecutor maintains
+    // a RequestKVState per request and extends each request's page table by
+    // one slot per decode step (one page allocated per page_size_tokens
+    // tokens). The actual K/V data continues to flow through each request's
+    // contiguous ExecutionContext for now; the page table tracks ownership
+    // and provides the lifecycle hook the scheduler (Phase C) will consume.
+    // Attaching with no pool (default) skips paged tracking entirely.
+    void attach_page_pool(PagePool* pool, uint32_t page_size_tokens = 64);
+
+    // Read-only accessor for the per-request page table (paged mode only).
+    // Returns nullptr when paged tracking is off or the request isn't tracked.
+    const RequestKVState* page_state(uint32_t request_id) const;
 
     // Run one decoder pass per slot. Each slot's KV state is isolated in a
     // per-request ExecutionContext. Slots run sequentially within this
@@ -76,14 +90,23 @@ private:
         std::unique_ptr<ExecutionContext> context;
         std::unique_ptr<ExecutionExecutor> executor;
         size_t next_position = 0;
+        // B3: optional paged-KV page table for this request. Populated only
+        // when a PagePool is attached and grown on each successful decode
+        // step. Released back to the pool on release_request / reset.
+        std::unique_ptr<RequestKVState> page_state;
     };
 
     PerRequest& ensure_request(uint32_t request_id);
     void prime_token_tensors(ExecutionContext& ctx, uint64_t token) const;
+    bool advance_page_state(PerRequest& req);
 
     const Session& session_;
     ExecutionGraph graph_;
     std::unordered_map<uint32_t, PerRequest> requests_;
+
+    // B3 paged-KV state. Optional; nullptr means paged tracking is off.
+    PagePool* page_pool_ = nullptr;
+    uint32_t page_size_tokens_ = 64;
 };
 
 } // namespace runtime
