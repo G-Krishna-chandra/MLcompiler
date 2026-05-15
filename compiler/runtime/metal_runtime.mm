@@ -1663,8 +1663,26 @@ struct MetalExecutor::Impl {
     // tracks pool buffers in use by the current window so flush can return
     // them all at once.
     mutable id<MTLCommandBuffer> open_forward_pass_cb_ = nil;
+    // Lever 4 (sweep-75): pooled compute encoder for the current forward
+    // pass CB. All encode*FromHost/Buffer kernels in a row share one
+    // MTLComputeCommandEncoder; we close it (endEncoding) only when an
+    // MPS dispatch needs the CB or at flush time. Saves one encoder
+    // construction per kernel dispatch (~30 µs on M3 Pro).
+    mutable id<MTLComputeCommandEncoder> pass_encoder_ = nil;
     mutable std::vector<id> pass_retained_;
     mutable std::vector<id<MTLBuffer>> pass_checked_out_;
+
+    id<MTLComputeCommandEncoder> getPassEncoder() const {
+        if (open_forward_pass_cb_ == nil) return nil;
+        if (pass_encoder_ != nil) return pass_encoder_;
+        pass_encoder_ = [open_forward_pass_cb_ computeCommandEncoder];
+        return pass_encoder_;
+    }
+    void closePassEncoder() const {
+        if (pass_encoder_ == nil) return;
+        [pass_encoder_ endEncoding];
+        pass_encoder_ = nil;
+    }
     // Set when a non-fusable Metal op (Attention) defers a result onto an
     // open forward-pass CB. The executor reads via lastDeferredOutput*()
     // after backend.execute() returns and inserts into pass_outputs so
@@ -2152,7 +2170,12 @@ struct MetalExecutor::Impl {
         if (!cb || !src || !dst || !castF16toF32Pipeline) return false;
         if (element_count == 0 || element_count > std::numeric_limits<uint32_t>::max()) return false;
         if (@available(macOS 11.0, *)) {
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            // Lever 4: when called against the open forward-pass CB, share
+            // the pooled encoder; otherwise open a fresh one and end it.
+            const bool pooled = (cb == open_forward_pass_cb_);
+            id<MTLComputeCommandEncoder> enc = pooled
+                ? getPassEncoder()
+                : [cb computeCommandEncoder];
             if (!enc) return false;
             [enc setComputePipelineState:castF16toF32Pipeline];
             [enc setBuffer:src offset:0 atIndex:0];
@@ -2165,7 +2188,7 @@ struct MetalExecutor::Impl {
             if (threadgroups == 0) threadgroups = 1;
             [enc dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
-            [enc endEncoding];
+            if (!pooled) [enc endEncoding];
             return true;
         }
 #endif
@@ -3481,7 +3504,10 @@ bool matmulQ4_K(const std::string& weight_name,
                 id<MTLCommandBuffer> commandBuffer = deferred_mode
                     ? open_forward_pass_cb_
                     : [queue commandBuffer];
-                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                // Lever 4: pool the encoder when riding the open pass CB.
+                id<MTLComputeCommandEncoder> encoder = deferred_mode
+                    ? getPassEncoder()
+                    : [commandBuffer computeCommandEncoder];
                 if (!encoder) return false;
                 [encoder setComputePipelineState:ffnPipeline];
                 [encoder setBuffer:gateBuffer offset:0 atIndex:0];
@@ -3498,7 +3524,7 @@ bool matmulQ4_K(const std::string& weight_name,
                 MTLSize tgSize = MTLSizeMake(threadgroups, 1, 1);
                 MTLSize thSize = MTLSizeMake(threadsPerGroup, 1, 1);
                 [encoder dispatchThreadgroups:tgSize threadsPerThreadgroup:thSize];
-                [encoder endEncoding];
+                if (!deferred_mode) [encoder endEncoding];
 
                 if (deferred_mode) {
                     pass_retained_.push_back((id)gateBuffer);
@@ -4598,6 +4624,11 @@ bool matmulQ4_K(const std::string& weight_name,
                     ? open_forward_pass_cb_
                     : [queue commandBuffer];
 
+                // Lever 4: MPS encodes open their own internal encoders on
+                // the CB; close any pooled compute encoder first so MPS
+                // doesn't error with "encoder still active on CB".
+                if (deferred_mode) closePassEncoder();
+
                 // 5a. Batched Q.K with beta=1.0 (adds scaled scores onto the
                 //     pre-populated mask/alibi values).
                 MPSMatrixMultiplication* qk = getOrCreateMPSMatMul(
@@ -5103,6 +5134,7 @@ bool MetalExecutor::flushForwardPassCB(
         }
         return true;
     }
+    impl_->closePassEncoder();
     [impl_->open_forward_pass_cb_ commit];
     [impl_->open_forward_pass_cb_ waitUntilCompleted];
     bool ok = impl_->open_forward_pass_cb_.status == MTLCommandBufferStatusCompleted;
@@ -5173,6 +5205,9 @@ inline bool encodeSliceImpl(void* impl_void, void* device_void, void* pipeline_v
         id<MTLComputePipelineState> pipe = (__bridge id<MTLComputePipelineState>)pipeline_void;
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)in_buf;
         id<MTLBuffer> dst = (__bridge id<MTLBuffer>)out_buf;
+        // NOTE: slice helper is not pool-aware (impl is private). The slice
+        // call sites close the pooled encoder before calling this helper
+        // when running against the open pass CB.
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         if (!enc) return false;
         [enc setComputePipelineState:pipe];
@@ -5208,6 +5243,9 @@ bool MetalExecutor::encodeSliceFromBuffer(void* input_buffer, size_t input_count
     if (!input_buffer || !output_buffer) return false;
     if (offset_elems + length > input_count) return false;
     if (length > std::numeric_limits<uint32_t>::max()) return false;
+    // Lever 4: slice helper opens its own encoder (it can't see the private
+    // Impl). Close any open pooled encoder first to avoid CB-encoder collision.
+    impl_->closePassEncoder();
     bool ok = encodeSliceImpl(impl_.get(), nullptr,
                               (__bridge void*)impl_->sliceF32Pipeline,
                               (__bridge void*)impl_->open_forward_pass_cb_,
@@ -5249,6 +5287,8 @@ bool MetalExecutor::encodeSliceFromHost(const std::vector<float>& host_input,
                                                          options:MTLResourceStorageModeShared];
         if (!upload) return false;
         impl_->pass_retained_.push_back(upload);
+        // Lever 4: slice opens its own encoder; close pooled first.
+        impl_->closePassEncoder();
         bool ok = encodeSliceImpl(impl_.get(), nullptr,
                                   (__bridge void*)impl_->sliceF32Pipeline,
                                   (__bridge void*)impl_->open_forward_pass_cb_,
@@ -5291,6 +5331,7 @@ void MetalExecutor::discardForwardPassCB() const {
     // Safe to drop without commit: Metal's explicit-commit API keeps the
     // buffer in MTLCommandBufferStatusNotEnqueued state until commit() is
     // called. If we adopt async scheduling, revisit.
+    impl_->closePassEncoder();
     for (id<MTLBuffer> buf : impl_->pass_checked_out_) impl_->poolReturn(buf);
     impl_->pass_checked_out_.clear();
     impl_->pass_readbacks_.clear();
@@ -5352,7 +5393,7 @@ bool MetalExecutor::encodeMatMulQ4_0FromHost(const std::string& weight_name,
                                                               options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!weightBuffer || !inputBuffer) return false;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = impl_->getPassEncoder();
         if (!encoder) return false;
         const bool use_v2 = impl_->q4MatmulPipelineV2 != nil && cols >= 64;
         [encoder setComputePipelineState:(use_v2 ? impl_->q4MatmulPipelineV2 : impl_->q4MatmulPipeline)];
@@ -5376,7 +5417,8 @@ bool MetalExecutor::encodeMatMulQ4_0FromHost(const std::string& weight_name,
             [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
         }
-        [encoder endEncoding];
+        // Lever 4: encoder is pooled across forward-pass dispatches —
+        // closed by closePassEncoder() at flush time or before any MPS encode.
         impl_->pass_retained_.push_back(inputBuffer);
         impl_->recordReadback(outBuf, host_dst, rows * sizeof(float), needs_host);
         return true;
@@ -5409,7 +5451,7 @@ bool MetalExecutor::encodeMatMulQ4_0FromBuffer(const std::string& weight_name,
         id<MTLBuffer> inputBuf = (__bridge id<MTLBuffer>)input_buffer;
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!weightBuffer) return false;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = impl_->getPassEncoder();
         if (!encoder) return false;
         const bool use_v2 = impl_->q4MatmulPipelineV2 != nil && cols >= 64;
         [encoder setComputePipelineState:(use_v2 ? impl_->q4MatmulPipelineV2 : impl_->q4MatmulPipeline)];
@@ -5432,7 +5474,7 @@ bool MetalExecutor::encodeMatMulQ4_0FromBuffer(const std::string& weight_name,
             [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
         }
-        [encoder endEncoding];
+        // Lever 4: pooled encoder — closed at flush, not here.
         impl_->recordReadback(outBuf, host_dst, rows * sizeof(float), needs_host);
         return true;
     }
@@ -5465,7 +5507,7 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
                                                           options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!inBuffer || !wBuffer) return false;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = impl_->getPassEncoder();
         if (!encoder) return false;
         const bool use_v2 = impl_->normPipelineV2 != nil && host_input.size() >= 32;
         [encoder setComputePipelineState:(use_v2 ? impl_->normPipelineV2 : impl_->normPipeline)];
@@ -5484,7 +5526,7 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
             [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         }
-        [encoder endEncoding];
+        // Lever 4: pooled encoder — closed at flush, not here.
         impl_->pass_retained_.push_back(inBuffer);
         impl_->pass_retained_.push_back(wBuffer);
         impl_->recordReadback(outBuf, host_dst, bytes, needs_host);
@@ -5517,7 +5559,7 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
                                                           options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!wBuffer) return false;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = impl_->getPassEncoder();
         if (!encoder) return false;
         const bool use_v2 = impl_->normPipelineV2 != nil && input_count >= 32;
         [encoder setComputePipelineState:(use_v2 ? impl_->normPipelineV2 : impl_->normPipeline)];
@@ -5536,7 +5578,7 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
             [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         }
-        [encoder endEncoding];
+        // Lever 4: pooled encoder — closed at flush, not here.
         impl_->pass_retained_.push_back(wBuffer);
         impl_->recordReadback(outBuf, host_dst, bytes, needs_host);
         return true;
@@ -5597,7 +5639,7 @@ bool MetalExecutor::encodeAddMixed(const std::vector<float>* host_a, void* buffe
             bBuf = (__bridge id<MTLBuffer>)buffer_b;
         }
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
-        id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = impl_->getPassEncoder();
         if (!encoder) return false;
         [encoder setComputePipelineState:impl_->addPipeline];
         [encoder setBuffer:aBuf offset:0 atIndex:0];
@@ -5611,7 +5653,7 @@ bool MetalExecutor::encodeAddMixed(const std::vector<float>* host_a, void* buffe
         if (threadgroups == 0) threadgroups = 1;
         [encoder dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
-        [encoder endEncoding];
+        // Lever 4: pooled encoder — closed at flush, not here.
         impl_->recordReadback(outBuf, host_dst, bytes, needs_host);
         return true;
     }
