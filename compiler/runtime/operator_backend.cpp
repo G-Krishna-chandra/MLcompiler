@@ -1789,13 +1789,15 @@ BackendExecutionResult MetalExecutionBackend::encode(const ExecutionNode& node,
                     ok = MetalExecutor::Instance().encodeRmsNormFromBuffer(
                         fusion.primary_input_buffer, fusion.primary_input_count,
                         weight, 1e-5f,
-                        fusion.output_buffer, fusion.host_dst, fusion.needs_host_output);
+                        fusion.output_buffer, fusion.host_dst, fusion.needs_host_output,
+                        weight_name);
                 } else {
                     const std::vector<float>* input = fetchInput(*context, node, 0, result);
                     if (!result.success) return result;
                     ok = MetalExecutor::Instance().encodeRmsNormFromHost(
                         *input, weight, 1e-5f,
-                        fusion.output_buffer, fusion.host_dst, fusion.needs_host_output);
+                        fusion.output_buffer, fusion.host_dst, fusion.needs_host_output,
+                        weight_name);
                 }
                 if (!ok) {
                     result.success = false; result.message = "encode: encodeRmsNorm failed"; return result;

@@ -1916,6 +1916,23 @@ struct MetalExecutor::Impl {
     mutable size_t mps_matmul_cache_hits_ = 0;
     mutable size_t mps_matmul_cache_misses_ = 0;
 
+    // Lever 10 (sweep-75): per-name cache of small fp32 buffers (e.g.,
+    // RmsNorm gain weights). Eliminates ~30 newBufferWithBytes calls per
+    // forward pass on TinyLlama (45 norm tensors with weight_name in the
+    // graph; ~half are hot on each token's path).
+    mutable std::unordered_map<std::string, id<MTLBuffer>> small_param_cache_;
+    id<MTLBuffer> getOrCacheSmallParam(const std::string& name,
+                                        const std::vector<float>& data) const {
+        if (name.empty()) return nil;  // anonymous — caller must own buffer
+        auto it = small_param_cache_.find(name);
+        if (it != small_param_cache_.end()) return it->second;
+        id<MTLBuffer> buf = [device newBufferWithBytes:data.data()
+                                                length:data.size() * sizeof(float)
+                                               options:MTLResourceStorageModeShared];
+        if (buf) small_param_cache_.emplace(name, buf);
+        return buf;
+    }
+
     MPSMatrixMultiplication* getOrCreateMPSMatMul(bool transL,
                                                      bool transR,
                                                      uint32_t resultRows,
@@ -5674,7 +5691,8 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
                                           float epsilon,
                                           void* output_buffer,
                                           std::vector<float>* host_dst,
-                                          bool needs_host) const {
+                                          bool needs_host,
+                                          const std::string& weight_name) const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available() || !impl_->normPipeline) return false;
     if (impl_->open_forward_pass_cb_ == nil) return false;
@@ -5686,9 +5704,12 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
         id<MTLBuffer> inBuffer = [impl_->device newBufferWithBytes:host_input.data()
                                                             length:bytes
                                                            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> wBuffer = [impl_->device newBufferWithBytes:weight.data()
-                                                           length:bytes
-                                                          options:MTLResourceStorageModeShared];
+        // Lever 10: weight is a static parameter — cache by name across passes.
+        id<MTLBuffer> wBuffer = !weight_name.empty()
+            ? impl_->getOrCacheSmallParam(weight_name, weight)
+            : [impl_->device newBufferWithBytes:weight.data()
+                                          length:bytes
+                                         options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!inBuffer || !wBuffer) return false;
         id<MTLComputeCommandEncoder> encoder = impl_->getPassEncoder();
@@ -5712,13 +5733,14 @@ bool MetalExecutor::encodeRmsNormFromHost(const std::vector<float>& host_input,
         }
         // Lever 4: pooled encoder — closed at flush, not here.
         impl_->pass_retained_.push_back(inBuffer);
-        impl_->pass_retained_.push_back(wBuffer);
+        // Lever 10: only retain wBuffer when not from cache (cache owns it).
+        if (weight_name.empty()) impl_->pass_retained_.push_back(wBuffer);
         impl_->recordReadback(outBuf, host_dst, bytes, needs_host);
         return true;
     }
 #endif
     (void)host_input; (void)weight; (void)epsilon; (void)output_buffer;
-    (void)host_dst; (void)needs_host;
+    (void)host_dst; (void)needs_host; (void)weight_name;
     return false;
 }
 
@@ -5728,7 +5750,8 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
                                             float epsilon,
                                             void* output_buffer,
                                             std::vector<float>* host_dst,
-                                            bool needs_host) const {
+                                            bool needs_host,
+                                            const std::string& weight_name) const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available() || !impl_->normPipeline) return false;
     if (impl_->open_forward_pass_cb_ == nil) return false;
@@ -5738,9 +5761,12 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
     if (@available(macOS 11.0, *)) {
         size_t bytes = input_count * sizeof(float);
         id<MTLBuffer> inBuf = (__bridge id<MTLBuffer>)input_buffer;
-        id<MTLBuffer> wBuffer = [impl_->device newBufferWithBytes:weight.data()
-                                                           length:bytes
-                                                          options:MTLResourceStorageModeShared];
+        // Lever 10: cache norm weight by name.
+        id<MTLBuffer> wBuffer = !weight_name.empty()
+            ? impl_->getOrCacheSmallParam(weight_name, weight)
+            : [impl_->device newBufferWithBytes:weight.data()
+                                          length:bytes
+                                         options:MTLResourceStorageModeShared];
         id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)output_buffer;
         if (!wBuffer) return false;
         id<MTLComputeCommandEncoder> encoder = impl_->getPassEncoder();
@@ -5763,11 +5789,13 @@ bool MetalExecutor::encodeRmsNormFromBuffer(void* input_buffer,
                     threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         }
         // Lever 4: pooled encoder — closed at flush, not here.
-        impl_->pass_retained_.push_back(wBuffer);
+        // Lever 10: only retain wBuffer when not from cache.
+        if (weight_name.empty()) impl_->pass_retained_.push_back(wBuffer);
         impl_->recordReadback(outBuf, host_dst, bytes, needs_host);
         return true;
     }
 #endif
+    (void)weight_name;
     (void)input_buffer; (void)input_count; (void)weight; (void)epsilon;
     (void)output_buffer; (void)host_dst; (void)needs_host;
     return false;

@@ -258,14 +258,16 @@ public:
                                float epsilon,
                                void* output_buffer,
                                std::vector<float>* host_dst,
-                               bool needs_host) const;
+                               bool needs_host,
+                               const std::string& weight_name = std::string()) const;
     bool encodeRmsNormFromBuffer(void* input_buffer,
                                  size_t input_count,
                                  const std::vector<float>& weight,
                                  float epsilon,
                                  void* output_buffer,
                                  std::vector<float>* host_dst,
-                                 bool needs_host) const;
+                                 bool needs_host,
+                                 const std::string& weight_name = std::string()) const;
     bool encodeAddFromHost(const std::vector<float>& host_a,
                            const std::vector<float>& host_b,
                            void* output_buffer,
