@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MLcompiler vs Ollama — Continuous Batching Demo</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel2: #1f2630;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #7d8590;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --gold: #ffd33d;
+    --mlc: #58a6ff;
+    --ollama: #ff7b72;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  .container { max-width: 1280px; margin: 0 auto; padding: 24px; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 24px;
+  }
+  h1 { font-size: 22px; margin: 0; font-weight: 600; }
+  h1 .sub { color: var(--muted); font-weight: 400; font-size: 14px; margin-left: 8px; }
+  .controls {
+    display: flex; gap: 8px; align-items: center;
+    margin-bottom: 12px;
+  }
+  input[type="text"] {
+    flex: 1;
+    padding: 10px 14px;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 14px;
+  }
+  input[type="text"]:focus {
+    outline: none;
+    border-color: var(--blue);
+  }
+  button.primary {
+    padding: 10px 20px;
+    background: var(--blue);
+    color: #0e1116;
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button.primary:hover:not(:disabled) { background: #79b8ff; }
+  button.primary:disabled {
+    background: #30363d;
+    color: #7d8590;
+    cursor: not-allowed;
+  }
+  .presets {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    margin-bottom: 24px;
+  }
+  .chip {
+    padding: 6px 12px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--muted);
+    transition: all 0.1s;
+  }
+  .chip:hover { color: var(--text); border-color: var(--blue); }
+
+  .race {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .column {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    display: flex; flex-direction: column;
+  }
+  .column.mlc { border-top: 3px solid var(--mlc); }
+  .column.ollama { border-top: 3px solid var(--ollama); }
+
+  .col-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 4px;
+  }
+  .col-title {
+    font-size: 16px; font-weight: 600;
+  }
+  .col-subtitle {
+    font-size: 11px; color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .status {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted);
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted);
+    transition: background 0.2s;
+  }
+  .dot.green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.yellow { background: var(--yellow); }
+  .dot.red { background: var(--red); }
+
+  .timer {
+    font-family: "SF Mono", Menlo, Monaco, monospace;
+    font-size: 24px;
+    font-weight: 600;
+    margin: 8px 0 16px 0;
+    color: var(--muted);
+  }
+  .timer.running { color: var(--gold); }
+  .timer.done { color: var(--green); }
+
+  .cards {
+    display: flex; flex-direction: column; gap: 8px;
+    flex: 1;
+  }
+  .card {
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    transition: border-color 0.2s;
+  }
+  .card.pending {
+    opacity: 0.5;
+  }
+  .card.running {
+    border-color: var(--gold);
+  }
+  .card.done {
+    border-color: var(--green);
+  }
+  .card-title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--muted);
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 6px;
+  }
+  .card-meta {
+    font-family: "SF Mono", Menlo, Monaco, monospace;
+    font-size: 10px;
+  }
+  .card-text {
+    font-size: 13px; line-height: 1.5;
+    color: var(--text);
+    white-space: pre-wrap;
+    min-height: 1.5em;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .card.pending .card-text::after {
+    content: "waiting...";
+    color: var(--muted); font-style: italic;
+  }
+  .card.running .card-text::after {
+    content: "running ⏳";
+    color: var(--gold); font-style: italic;
+  }
+  .card.error .card-text {
+    color: var(--red);
+  }
+
+  .summary {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .summary .big {
+    font-size: 18px;
+    color: var(--text);
+    font-family: "SF Mono", Menlo, Monaco, monospace;
+    margin-bottom: 4px;
+  }
+  .summary.winner .big { color: var(--green); }
+  .summary.loser .big { color: var(--muted); }
+
+  .verdict {
+    margin-top: 24px;
+    padding: 24px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    text-align: center;
+  }
+  .verdict.empty { color: var(--muted); }
+  .verdict .speedup {
+    font-family: "SF Mono", Menlo, Monaco, monospace;
+    font-size: 36px;
+    font-weight: 700;
+    color: var(--gold);
+    margin-bottom: 8px;
+  }
+  .verdict .label {
+    color: var(--muted); font-size: 14px;
+  }
+
+  .footer {
+    margin-top: 24px;
+    color: var(--muted); font-size: 11px;
+    text-align: center;
+  }
+  .footer code {
+    background: var(--panel);
+    padding: 2px 6px; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Monaco, monospace;
+    font-size: 11px;
+  }
+
+  .health-warn {
+    padding: 8px 12px;
+    background: rgba(248, 81, 73, 0.15);
+    border: 1px solid var(--red);
+    border-radius: 6px;
+    color: #ffa198;
+    font-size: 12px;
+    margin-bottom: 12px;
+    display: none;
+  }
+  .health-warn.show { display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>MLcompiler <span class="sub">vs Ollama — continuous batching, side by side</span></h1>
+  </header>
+
+  <div class="health-warn" id="warn"></div>
+
+  <div class="controls">
+    <input type="text" id="question"
+           value="How should I structure a Python web scraper for news sites?"
+           placeholder="Ask a question...">
+    <button class="primary" id="run" disabled>Run Race</button>
+  </div>
+
+  <div class="presets" id="presets">
+    <!-- chips injected by JS -->
+  </div>
+
+  <div class="race">
+    <!-- MLcompiler column -->
+    <div class="column mlc">
+      <div class="col-header">
+        <div class="col-title">MLcompiler</div>
+        <div class="status">
+          <span class="dot" id="mlc-dot"></span>
+          <span id="mlc-status">Checking...</span>
+        </div>
+      </div>
+      <div class="col-subtitle">all 4 prompts in ONE batched forward pass</div>
+      <div class="timer" id="mlc-timer">0.000s</div>
+      <div class="cards" id="mlc-cards"></div>
+      <div class="summary" id="mlc-summary">
+        <div class="big" id="mlc-big">—</div>
+        <div id="mlc-meta"></div>
+      </div>
+    </div>
+
+    <!-- Ollama column -->
+    <div class="column ollama">
+      <div class="col-header">
+        <div class="col-title">Ollama</div>
+        <div class="status">
+          <span class="dot" id="ollama-dot"></span>
+          <span id="ollama-status">Checking...</span>
+        </div>
+      </div>
+      <div class="col-subtitle">4 concurrent requests, processed sequentially</div>
+      <div class="timer" id="ollama-timer">0.000s</div>
+      <div class="cards" id="ollama-cards"></div>
+      <div class="summary" id="ollama-summary">
+        <div class="big" id="ollama-big">—</div>
+        <div id="ollama-meta"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="verdict empty" id="verdict">
+    <div class="speedup" id="verdict-speedup">—</div>
+    <div class="label" id="verdict-label">click "Run Race" to compare</div>
+  </div>
+
+  <div class="footer">
+    Both backends running TinyLlama 1.1B Q4_0 on the same hardware.<br>
+    MLcompiler endpoint: <code id="mlc-url">http://localhost:8080</code> ·
+    Ollama endpoint: <code id="ollama-url">http://localhost:11434</code>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---- Configuration ----
+const MLC_URL = "http://localhost:8080";
+const OLLAMA_URL = "http://localhost:11434";
+const OLLAMA_MODEL = "tinyllama";
+const MAX_TOKENS = 80;
+
+// TinyLlama uses chatml-style chat template. We send the same raw
+// prompt to both backends (Ollama via /api/generate, not /api/chat,
+// so neither side gets server-side template wrapping). This keeps
+// the comparison apples-to-apples: same model, same prompt, only the
+// scheduling differs.
+const SUB_TASKS = [
+  { id: "rephrase",   label: "Rephrase",
+    template: q => `<|user|>\nRephrase this question more precisely in one sentence: ${q}\n<|assistant|>\n` },
+  { id: "plan",       label: "Plan",
+    template: q => `<|user|>\nGive a brief step-by-step plan to answer: ${q}\n<|assistant|>\n` },
+  { id: "gaps",       label: "Gaps",
+    template: q => `<|user|>\nList what information is missing or ambiguous in: ${q}\n<|assistant|>\n` },
+  { id: "difficulty", label: "Difficulty",
+    template: q => `<|user|>\nRate the complexity (easy/medium/hard) and explain in one sentence: ${q}\n<|assistant|>\n` },
+];
+
+const PRESETS = [
+  "How should I structure a Python web scraper for news sites?",
+  "Explain the tradeoffs of microservices vs monolith",
+  "Plan a weekend trip to Yosemite",
+  "Debug a memory leak in a Node.js app",
+];
+
+// ---- DOM helpers ----
+const $ = id => document.getElementById(id);
+
+function buildCards(prefix) {
+  const container = $(prefix + "-cards");
+  container.innerHTML = "";
+  SUB_TASKS.forEach(t => {
+    const card = document.createElement("div");
+    card.className = "card pending";
+    card.id = `${prefix}-card-${t.id}`;
+    card.innerHTML = `
+      <div class="card-title">
+        <span>${t.label}</span>
+        <span class="card-meta" id="${prefix}-meta-${t.id}"></span>
+      </div>
+      <div class="card-text" id="${prefix}-text-${t.id}"></div>`;
+    container.appendChild(card);
+  });
+}
+
+function setCardState(prefix, id, state) {
+  const c = $(`${prefix}-card-${id}`);
+  if (!c) return;
+  c.classList.remove("pending", "running", "done", "error");
+  c.classList.add(state);
+}
+
+function setCardText(prefix, id, text, meta) {
+  const t = $(`${prefix}-text-${id}`);
+  const m = $(`${prefix}-meta-${id}`);
+  if (t) t.textContent = text || "";
+  if (m && meta != null) m.textContent = meta;
+}
+
+// ---- Health checks ----
+async function checkMlc() {
+  try {
+    const r = await fetch(`${MLC_URL}/health`, { cache: "no-store" });
+    if (!r.ok) throw new Error("not ok");
+    const j = await r.json();
+    return { ok: true, level: "green", text: `Connected (${j.backend || "mlc"})` };
+  } catch (e) {
+    return { ok: false, level: "red", text: "Not running — start `mlc api ...`" };
+  }
+}
+
+async function checkOllama() {
+  try {
+    const r = await fetch(`${OLLAMA_URL}/api/tags`, { cache: "no-store" });
+    if (!r.ok) throw new Error("not ok");
+    const j = await r.json();
+    const models = (j.models || []).map(m => m.name || "");
+    const hasModel = models.some(n => n.startsWith(OLLAMA_MODEL));
+    if (!hasModel) {
+      return { ok: false, level: "yellow",
+               text: `Running but ${OLLAMA_MODEL} not pulled — run \`ollama pull ${OLLAMA_MODEL}\`` };
+    }
+    return { ok: true, level: "green", text: `Connected (${models.length} models)` };
+  } catch (e) {
+    return { ok: false, level: "red", text: "Not running — start `ollama serve`" };
+  }
+}
+
+let mlcOk = false;
+let ollamaOk = false;
+
+async function refreshHealth() {
+  const [m, o] = await Promise.all([checkMlc(), checkOllama()]);
+  mlcOk = m.ok;
+  ollamaOk = o.ok;
+  $("mlc-dot").className = "dot " + m.level;
+  $("mlc-status").textContent = m.text;
+  $("ollama-dot").className = "dot " + o.level;
+  $("ollama-status").textContent = o.text;
+
+  const warn = $("warn");
+  const issues = [];
+  if (!mlcOk) issues.push(`MLcompiler: ${m.text}`);
+  if (!ollamaOk) issues.push(`Ollama: ${o.text}`);
+  if (issues.length) {
+    warn.textContent = issues.join(" · ");
+    warn.classList.add("show");
+  } else {
+    warn.classList.remove("show");
+  }
+
+  const btn = $("run");
+  btn.disabled = !(mlcOk && ollamaOk);
+  btn.title = btn.disabled ? "Both backends must be connected" : "Run the race";
+}
+
+// ---- Live timer ----
+function startLiveTimer(prefix, startTime) {
+  const t = $(prefix + "-timer");
+  t.classList.add("running");
+  t.classList.remove("done");
+  let frame;
+  const tick = () => {
+    const dt = (performance.now() - startTime) / 1000;
+    t.textContent = dt.toFixed(3) + "s";
+    frame = requestAnimationFrame(tick);
+  };
+  frame = requestAnimationFrame(tick);
+  return () => cancelAnimationFrame(frame);
+}
+
+function stopLiveTimer(prefix, finalMs) {
+  const t = $(prefix + "-timer");
+  t.classList.remove("running");
+  t.classList.add("done");
+  t.textContent = (finalMs / 1000).toFixed(3) + "s";
+}
+
+// ---- Run race ----
+async function runMlcRace(question) {
+  const prefix = "mlc";
+  buildCards(prefix);
+  SUB_TASKS.forEach(t => setCardState(prefix, t.id, "running"));
+  const start = performance.now();
+  const stop = startLiveTimer(prefix, start);
+  $(prefix + "-big").textContent = "Running...";
+  $(prefix + "-meta").textContent = "";
+
+  try {
+    const body = {
+      prompts: SUB_TASKS.map(t => ({ id: t.id, text: t.template(question) })),
+      max_tokens: MAX_TOKENS,
+    };
+    const r = await fetch(`${MLC_URL}/v1/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    const elapsed = performance.now() - start;
+    stop();
+    stopLiveTimer(prefix, elapsed);
+
+    // Fill all 4 cards (they completed at the same time by construction).
+    let totalToks = 0;
+    for (const res of j.results) {
+      setCardState(prefix, res.id, "done");
+      setCardText(prefix, res.id, res.text || "(empty)",
+                  `${res.tokens} tok · ${res.time_ms.toFixed(0)} ms`);
+      totalToks += res.tokens;
+    }
+    $(prefix + "-big").textContent = `${(elapsed / 1000).toFixed(2)}s · ${j.aggregate_tok_s.toFixed(1)} tok/s`;
+    $(prefix + "-meta").textContent = `${totalToks} tokens across 4 batched prompts in ONE forward pass`;
+    return { backend: "mlc", ok: true, elapsed, total_tokens: totalToks, agg: j.aggregate_tok_s };
+  } catch (e) {
+    stop();
+    stopLiveTimer(prefix, performance.now() - start);
+    SUB_TASKS.forEach(t => {
+      setCardState(prefix, t.id, "error");
+      setCardText(prefix, t.id, "request failed: " + e.message, "");
+    });
+    $(prefix + "-big").textContent = "Failed";
+    $(prefix + "-meta").textContent = e.message;
+    return { backend: "mlc", ok: false, elapsed: performance.now() - start };
+  }
+}
+
+async function runOllamaRace(question) {
+  const prefix = "ollama";
+  buildCards(prefix);
+  SUB_TASKS.forEach(t => setCardState(prefix, t.id, "running"));
+  const start = performance.now();
+  const stop = startLiveTimer(prefix, start);
+  $(prefix + "-big").textContent = "Running...";
+  $(prefix + "-meta").textContent = "";
+
+  // Fire 4 concurrent requests. Ollama serializes them on its single
+  // model instance — that's the demo. As each one returns, fill its card.
+  const subStarts = SUB_TASKS.map(() => performance.now());
+  let totalToks = 0;
+  let allOk = true;
+
+  const calls = SUB_TASKS.map(async (t, idx) => {
+    const t0 = performance.now();
+    subStarts[idx] = t0;
+    try {
+      const body = {
+        model: OLLAMA_MODEL,
+        prompt: t.template(question),
+        stream: false,
+        options: { num_predict: MAX_TOKENS, temperature: 0.7 },
+      };
+      const r = await fetch(`${OLLAMA_URL}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      const elapsed = performance.now() - t0;
+      const text = (j.response || "").trim();
+      const toks = j.eval_count || text.split(/\s+/).length;
+      totalToks += toks;
+      setCardState(prefix, t.id, "done");
+      setCardText(prefix, t.id, text || "(empty)",
+                  `${toks} tok · ${elapsed.toFixed(0)} ms`);
+    } catch (e) {
+      allOk = false;
+      setCardState(prefix, t.id, "error");
+      setCardText(prefix, t.id, "request failed: " + e.message, "");
+    }
+  });
+
+  await Promise.all(calls);
+  const total = performance.now() - start;
+  stop();
+  stopLiveTimer(prefix, total);
+  const aggTokS = total > 0 ? (totalToks * 1000 / total) : 0;
+  $(prefix + "-big").textContent = `${(total / 1000).toFixed(2)}s · ${aggTokS.toFixed(1)} tok/s`;
+  $(prefix + "-meta").textContent = `${totalToks} tokens across 4 sequential requests`;
+  return { backend: "ollama", ok: allOk, elapsed: total, total_tokens: totalToks, agg: aggTokS };
+}
+
+async function runRace() {
+  const q = $("question").value.trim();
+  if (!q) return;
+  $("run").disabled = true;
+  $("verdict").classList.add("empty");
+  $("verdict-speedup").textContent = "—";
+  $("verdict-label").textContent = "racing...";
+
+  const [mlcRes, ollamaRes] = await Promise.all([
+    runMlcRace(q),
+    runOllamaRace(q),
+  ]);
+
+  // Show verdict.
+  $("verdict").classList.remove("empty");
+  if (mlcRes.ok && ollamaRes.ok) {
+    const speedup = ollamaRes.elapsed / mlcRes.elapsed;
+    const winner = speedup >= 1 ? "MLcompiler" : "Ollama";
+    const factor = speedup >= 1 ? speedup : 1 / speedup;
+    $("verdict-speedup").textContent = `${factor.toFixed(2)}x`;
+    $("verdict-label").textContent = `${winner} was faster on this race`;
+
+    // Color summaries based on winner.
+    document.getElementById("mlc-summary").classList.toggle("winner", speedup >= 1);
+    document.getElementById("mlc-summary").classList.toggle("loser",  speedup < 1);
+    document.getElementById("ollama-summary").classList.toggle("winner", speedup < 1);
+    document.getElementById("ollama-summary").classList.toggle("loser",  speedup >= 1);
+  } else {
+    $("verdict-speedup").textContent = "—";
+    $("verdict-label").textContent = "one or both backends failed";
+  }
+
+  refreshHealth();  // re-enables button if both still up
+}
+
+// ---- Init ----
+function init() {
+  buildCards("mlc");
+  buildCards("ollama");
+
+  // Preset chips.
+  const pc = $("presets");
+  for (const p of PRESETS) {
+    const c = document.createElement("div");
+    c.className = "chip";
+    c.textContent = p;
+    c.onclick = () => $("question").value = p;
+    pc.appendChild(c);
+  }
+
+  $("run").onclick = runRace;
+  $("question").addEventListener("keypress", e => {
+    if (e.key === "Enter" && !$("run").disabled) runRace();
+  });
+
+  refreshHealth();
+  setInterval(refreshHealth, 5000);
+}
+init();
+</script>
+</body>
+</html>
