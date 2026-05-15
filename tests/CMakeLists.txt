@@ -28,6 +28,7 @@ set(TEST_SOURCES
     test_paged_kv.cpp
     test_batched_executor.cpp
     test_batched_elementwise.cpp
+    test_scheduler.cpp
 )
 
 # Create test executable

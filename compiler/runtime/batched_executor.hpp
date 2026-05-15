@@ -45,7 +45,18 @@ struct BatchedDecodeOutput {
     std::vector<PerRequest> per_request;
 };
 
-class BatchedExecutor {
+// IBatchedExecutor — abstract interface the Scheduler depends on. Lets unit
+// tests inject a mock without standing up the full Metal-backed runtime.
+class IBatchedExecutor {
+public:
+    virtual ~IBatchedExecutor() = default;
+    virtual BatchedDecodeOutput run_decode(const std::vector<RequestSlot>& slots) = 0;
+    virtual std::vector<float>  run_prefill(uint32_t request_id,
+                                            const std::vector<uint64_t>& tokens) = 0;
+    virtual void release_request(uint32_t request_id) = 0;
+};
+
+class BatchedExecutor : public IBatchedExecutor {
 public:
     explicit BatchedExecutor(const Session& session);
 
@@ -65,13 +76,13 @@ public:
     // Run one decoder pass per slot. Each slot's KV state is isolated in a
     // per-request ExecutionContext. Slots run sequentially within this
     // call (Option a from the design doc).
-    BatchedDecodeOutput run_decode(const std::vector<RequestSlot>& slots);
+    BatchedDecodeOutput run_decode(const std::vector<RequestSlot>& slots) override;
 
     // Run prefill for a single request: process `tokens` through the
     // request's context one token at a time, returning logits at the
     // last position.
     std::vector<float> run_prefill(uint32_t request_id,
-                                   const std::vector<uint64_t>& tokens);
+                                   const std::vector<uint64_t>& tokens) override;
 
     // Drop all per-request state (KV cache + position trackers +
     // executor/context objects). Useful for tests; in production the
@@ -79,7 +90,7 @@ public:
     void reset();
 
     // Drop a single request's state and free its context.
-    void release_request(uint32_t request_id);
+    void release_request(uint32_t request_id) override;
 
     const ExecutionGraph& graph() const { return graph_; }
     size_t known_position(uint32_t request_id) const;
