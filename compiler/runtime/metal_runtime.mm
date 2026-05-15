@@ -1887,6 +1887,153 @@ kernel void flash_attention_v1(
         }
     }
 }
+
+// ============================================================================
+// paged_flash_attention: batched, paged-KV, fp16-storage flash attention.
+//
+// Dispatch: (num_heads, batch_size) threadgroups × head_dim threads.
+// Each (head, request) threadgroup runs the same online-softmax recurrence
+// as flash_attention_v1, but K/V are read from paged storage via the
+// request's page table.
+//
+// Per-page layout (matches gather_kv_pages_f16 / scatter_kv_paged_f16):
+//   page bytes = [page_size_tokens, n_kv_heads, head_dim] of half
+//
+// page_tables_flat is a flat array of all requests' page IDs concatenated.
+// Request r's page IDs live at page_tables_flat[offsets[r]..offsets[r+1]).
+// ============================================================================
+struct PagedFlashParams {
+    uint num_heads;
+    uint kv_heads;
+    uint head_dim;
+    uint page_size_tokens;
+    uint elements_per_page;   // page_size_tokens * kv_heads * head_dim
+    uint apply_causal;        // 0 or 1
+    float inv_sqrt_d;
+};
+
+constant uint PAGED_FLASH_TILE = 32u;
+
+kernel void paged_flash_attention(
+    device const float* Q                 [[buffer(0)]],   // [batch, num_heads, head_dim]
+    device const half*  K_pages           [[buffer(1)]],   // bulk page mem
+    device const half*  V_pages           [[buffer(2)]],   // bulk page mem
+    device       float* O                 [[buffer(3)]],   // [batch, num_heads, head_dim]
+    constant uint*  page_tables_flat      [[buffer(4)]],
+    constant uint*  page_table_offsets    [[buffer(5)]],   // [batch + 1]
+    constant uint*  seq_lens              [[buffer(6)]],   // [batch]
+    constant uint*  q_positions           [[buffer(7)]],   // [batch]
+    constant PagedFlashParams& params     [[buffer(8)]],
+    threadgroup float* tg_buf             [[threadgroup(0)]],
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  t    [[thread_position_in_threadgroup]]) {
+    const uint T = PAGED_FLASH_TILE;
+    const uint D = params.head_dim;
+
+    // 1D dispatch: tgid = req_idx * num_heads + head_idx.
+    const uint head_idx = tgid % params.num_heads;
+    const uint req_idx  = tgid / params.num_heads;
+    const uint S        = seq_lens[req_idx];
+    const uint q_pos    = q_positions[req_idx];
+    const uint kv_h     = (head_idx * params.kv_heads) / params.num_heads;
+    const uint pt_base  = page_table_offsets[req_idx];
+
+    threadgroup float* shared_q    = tg_buf;                              // [D]
+    threadgroup float* tile_K      = tg_buf + D;                          // [T*D]
+    threadgroup float* tile_V      = tg_buf + D + T * D;                  // [T*D]
+    threadgroup float* tile_scores = tg_buf + D + 2u * T * D;             // [T]
+    threadgroup float* partial_buf = tg_buf + D + 2u * T * D + T;         // [D]
+
+    // Load Q for (req, head) into threadgroup memory.
+    shared_q[t] = Q[(req_idx * params.num_heads + head_idx) * D + t];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o = 0.0f;
+
+    if (S == 0u) {
+        if (t < D) O[(req_idx * params.num_heads + head_idx) * D + t] = 0.0f;
+        return;
+    }
+
+    const uint num_tiles = (S + T - 1u) / T;
+    for (uint tile = 0u; tile < num_tiles; ++tile) {
+        uint tile_start = tile * T;
+        uint tile_n = (S - tile_start < T) ? (S - tile_start) : T;
+
+        // Cooperative paged load. Each thread loads its feature column t
+        // for every position in the tile.
+        for (uint i = 0u; i < tile_n; ++i) {
+            uint kv_pos   = tile_start + i;
+            uint page_idx = kv_pos / params.page_size_tokens;
+            uint slot     = kv_pos - page_idx * params.page_size_tokens;
+            uint page_id  = page_tables_flat[pt_base + page_idx];
+            uint base     = page_id * params.elements_per_page
+                          + slot * (params.kv_heads * D)
+                          + kv_h * D;
+            tile_K[i * D + t] = (float)K_pages[base + t];
+            tile_V[i * D + t] = (float)V_pages[base + t];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Tile QK + causal mask.
+        for (uint s_local = t; s_local < tile_n; s_local += D) {
+            float score = 0.0f;
+            threadgroup const float* k_row = tile_K + s_local * D;
+            for (uint d = 0u; d < D; ++d) score += shared_q[d] * k_row[d];
+            float scaled = score * params.inv_sqrt_d;
+            uint kv_pos = tile_start + s_local;
+            if (params.apply_causal != 0u && kv_pos > q_pos) scaled = -INFINITY;
+            tile_scores[s_local] = scaled;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Tile max via fixed-stride tree reduce.
+        float my_max = -INFINITY;
+        for (uint s = t; s < tile_n; s += D) my_max = fmax(my_max, tile_scores[s]);
+        partial_buf[t] = my_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = D / 2u; stride >= 1u; stride /= 2u) {
+            if (t < stride) partial_buf[t] = fmax(partial_buf[t], partial_buf[t + stride]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (stride == 1u) break;
+        }
+        float tile_max = partial_buf[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float m_new = fmax(m, tile_max);
+        float alpha = (m == -INFINITY) ? 0.0f : exp(m - m_new);
+
+        float my_sum = 0.0f;
+        for (uint s = t; s < tile_n; s += D) {
+            float ts = tile_scores[s];
+            float e  = (ts == -INFINITY) ? 0.0f : exp(ts - m_new);
+            tile_scores[s] = e;
+            my_sum += e;
+        }
+        partial_buf[t] = my_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = D / 2u; stride >= 1u; stride /= 2u) {
+            if (t < stride) partial_buf[t] += partial_buf[t + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (stride == 1u) break;
+        }
+        float tile_sum = partial_buf[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float my_v_acc = 0.0f;
+        for (uint s = 0u; s < tile_n; ++s) my_v_acc += tile_scores[s] * tile_V[s * D + t];
+
+        o = o * alpha + my_v_acc;
+        l = l * alpha + tile_sum;
+        m = m_new;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    O[(req_idx * params.num_heads + head_idx) * D + t] = o * inv_l;
+}
 )";
 } // namespace
 #endif
@@ -1969,6 +2116,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> scatterKVPagedF16Pipeline = nil;
     id<MTLComputePipelineState> scatterKVPagedF32Pipeline = nil;
     id<MTLComputePipelineState> flashAttentionPipeline = nil;
+    id<MTLComputePipelineState> pagedFlashAttentionPipeline = nil;
     id<MTLComputePipelineState> castF16toF32Pipeline = nil;
     id<MTLComputePipelineState> sliceF32Pipeline = nil;
     bool debug_log = false;
@@ -2375,6 +2523,7 @@ struct MetalExecutor::Impl {
                 scatterKVPagedF16Pipeline = buildPipeline(@"scatter_kv_paged_f16");
                 scatterKVPagedF32Pipeline = buildPipeline(@"scatter_kv_paged_f32");
                 flashAttentionPipeline = buildPipeline(@"flash_attention_v1");
+                pagedFlashAttentionPipeline = buildPipeline(@"paged_flash_attention");
                 castF16toF32Pipeline = buildPipeline(@"cast_f16_to_f32");
                 sliceF32Pipeline = buildPipeline(@"slice_f32");
             }
@@ -6664,6 +6813,111 @@ bool MetalExecutor::gatherKVPages(void* page_storage_buffer,
     (void)page_storage_buffer; (void)page_table; (void)page_size_tokens;
     (void)n_kv_heads; (void)head_dim; (void)num_tokens; (void)dst_buffer;
     (void)dtype_bytes;
+    return false;
+}
+
+// ===========================================================================
+// Phase F1 (continuous batching v2) — batched paged flash attention.
+// ===========================================================================
+
+bool MetalExecutor::runPagedFlashAttention(void* q_buffer,
+                                           void* k_pages_buffer,
+                                           void* v_pages_buffer,
+                                           void* o_buffer,
+                                           const std::vector<uint32_t>& page_tables_flat,
+                                           const std::vector<uint32_t>& page_table_offsets,
+                                           const std::vector<uint32_t>& seq_lens,
+                                           const std::vector<uint32_t>& q_positions,
+                                           size_t batch,
+                                           size_t num_heads,
+                                           size_t kv_heads,
+                                           size_t head_dim,
+                                           size_t page_size_tokens,
+                                           bool   apply_causal) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available()) return false;
+    if (!impl_->pagedFlashAttentionPipeline) return false;
+    if (!q_buffer || !k_pages_buffer || !v_pages_buffer || !o_buffer) return false;
+    if (batch == 0 || num_heads == 0 || head_dim == 0 || page_size_tokens == 0) return false;
+    if (kv_heads == 0 || (num_heads % kv_heads) != 0) return false;
+    if (page_table_offsets.size() != batch + 1) return false;
+    if (seq_lens.size() != batch || q_positions.size() != batch) return false;
+    if (page_tables_flat.size() < page_table_offsets.back()) return false;
+    if (head_dim > 256) return false;  // threadgroup memory bound
+
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            id<MTLBuffer> qBuf = (__bridge id<MTLBuffer>)q_buffer;
+            id<MTLBuffer> kBuf = (__bridge id<MTLBuffer>)k_pages_buffer;
+            id<MTLBuffer> vBuf = (__bridge id<MTLBuffer>)v_pages_buffer;
+            id<MTLBuffer> oBuf = (__bridge id<MTLBuffer>)o_buffer;
+
+            id<MTLBuffer> ptFlatBuf = [impl_->device newBufferWithBytes:page_tables_flat.data()
+                                                                  length:page_tables_flat.size() * sizeof(uint32_t)
+                                                                 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> ptOffBuf  = [impl_->device newBufferWithBytes:page_table_offsets.data()
+                                                                  length:page_table_offsets.size() * sizeof(uint32_t)
+                                                                 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> seqBuf    = [impl_->device newBufferWithBytes:seq_lens.data()
+                                                                  length:seq_lens.size() * sizeof(uint32_t)
+                                                                 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> qPosBuf   = [impl_->device newBufferWithBytes:q_positions.data()
+                                                                  length:q_positions.size() * sizeof(uint32_t)
+                                                                 options:MTLResourceStorageModeShared];
+            if (!ptFlatBuf || !ptOffBuf || !seqBuf || !qPosBuf) return false;
+
+            id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+
+            [enc setComputePipelineState:impl_->pagedFlashAttentionPipeline];
+            [enc setBuffer:qBuf       offset:0 atIndex:0];
+            [enc setBuffer:kBuf       offset:0 atIndex:1];
+            [enc setBuffer:vBuf       offset:0 atIndex:2];
+            [enc setBuffer:oBuf       offset:0 atIndex:3];
+            [enc setBuffer:ptFlatBuf  offset:0 atIndex:4];
+            [enc setBuffer:ptOffBuf   offset:0 atIndex:5];
+            [enc setBuffer:seqBuf     offset:0 atIndex:6];
+            [enc setBuffer:qPosBuf    offset:0 atIndex:7];
+
+            struct ParamsHost {
+                uint32_t num_heads;
+                uint32_t kv_heads;
+                uint32_t head_dim;
+                uint32_t page_size_tokens;
+                uint32_t elements_per_page;
+                uint32_t apply_causal;
+                float    inv_sqrt_d;
+            } params;
+            params.num_heads        = static_cast<uint32_t>(num_heads);
+            params.kv_heads         = static_cast<uint32_t>(kv_heads);
+            params.head_dim         = static_cast<uint32_t>(head_dim);
+            params.page_size_tokens = static_cast<uint32_t>(page_size_tokens);
+            params.elements_per_page = static_cast<uint32_t>(page_size_tokens * kv_heads * head_dim);
+            params.apply_causal     = apply_causal ? 1u : 0u;
+            params.inv_sqrt_d       = 1.0f / sqrtf(static_cast<float>(head_dim));
+            [enc setBytes:&params length:sizeof(params) atIndex:8];
+
+            // Threadgroup memory: D + 2*T*D + T + D floats
+            constexpr uint32_t T = 32;
+            size_t tg_floats = head_dim + 2 * T * head_dim + T + head_dim;
+            [enc setThreadgroupMemoryLength:tg_floats * sizeof(float) atIndex:0];
+
+            // 1D grid: tgid = req_idx * num_heads + head_idx.
+            MTLSize grid = MTLSizeMake(batch * num_heads, 1, 1);
+            MTLSize tpg  = MTLSizeMake(head_dim, 1, 1);
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tpg];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            return cb.status == MTLCommandBufferStatusCompleted;
+        }
+    }
+#endif
+    (void)q_buffer; (void)k_pages_buffer; (void)v_pages_buffer; (void)o_buffer;
+    (void)page_tables_flat; (void)page_table_offsets; (void)seq_lens; (void)q_positions;
+    (void)batch; (void)num_heads; (void)kv_heads; (void)head_dim;
+    (void)page_size_tokens; (void)apply_causal;
     return false;
 }
 

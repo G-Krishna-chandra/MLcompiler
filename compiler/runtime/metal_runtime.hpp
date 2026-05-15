@@ -483,6 +483,38 @@ public:
                        void* dst_buffer,
                        size_t dtype_bytes) const;
 
+    // Phase F1 (continuous batching v2) — batched paged flash attention.
+    // Runs attention for all `batch` requests in a single dispatch.
+    //
+    // Inputs (all device pointers, void* bridged to id<MTLBuffer>):
+    //   q_buffer:        fp32 [batch, num_heads, head_dim]
+    //   k_pages_buffer:  fp16 paged storage (per-page layout
+    //                    [page_size_tokens, kv_heads, head_dim])
+    //   v_pages_buffer:  fp16 paged storage (same layout as K)
+    //   o_buffer:        fp32 [batch, num_heads, head_dim] (output)
+    //   page_tables_flat: uint32_t[] all requests' page IDs concatenated
+    //   page_table_offsets: uint32_t[batch+1], request r's pages live at
+    //                       [offsets[r], offsets[r+1])
+    //   seq_lens:        uint32_t[batch], number of K/V tokens per request
+    //   q_positions:     uint32_t[batch], position of the active Q token per
+    //                    request (used for causal masking)
+    //
+    // Returns false on bad arguments or kernel failure.
+    bool runPagedFlashAttention(void*  q_buffer,
+                                void*  k_pages_buffer,
+                                void*  v_pages_buffer,
+                                void*  o_buffer,
+                                const std::vector<uint32_t>& page_tables_flat,
+                                const std::vector<uint32_t>& page_table_offsets,
+                                const std::vector<uint32_t>& seq_lens,
+                                const std::vector<uint32_t>& q_positions,
+                                size_t batch,
+                                size_t num_heads,
+                                size_t kv_heads,
+                                size_t head_dim,
+                                size_t page_size_tokens,
+                                bool   apply_causal) const;
+
     // Phase A3 (continuous batching) — paged scatter. Writes K or V from a
     // contiguous source buffer with layout [n_kv_heads, tokens, head_dim]
     // into the paged storage. The destination slot for token t is page
