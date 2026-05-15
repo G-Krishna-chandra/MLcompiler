@@ -96,5 +96,53 @@ struct RequestKVState {
     void release_all(PagePool& pool);
 };
 
+// PagedKVStorage — per-layer Metal-backed bulk page storage.
+//
+// One MTLBuffer per layer holding `capacity_pages * page_bytes` bytes, where
+// page_bytes = page_size_tokens * n_kv_heads * head_dim * dtype_bytes.
+// Per-page layout (matches gather_kv_pages_f16 / scatter_kv_paged_f16):
+//   [page_size_tokens, n_kv_heads, head_dim] of half (or float when
+//   dtype_bytes == 4)
+//
+// This class owns the storage. Page-id allocation is delegated to a
+// PagePool (request-level page tables hold the page IDs).
+class PagedKVStorage {
+public:
+    PagedKVStorage(uint32_t capacity_pages,
+                   uint32_t n_layers,
+                   uint32_t page_size_tokens,
+                   uint32_t n_kv_heads,
+                   uint32_t head_dim,
+                   uint32_t dtype_bytes);
+    ~PagedKVStorage();
+    PagedKVStorage(const PagedKVStorage&) = delete;
+    PagedKVStorage& operator=(const PagedKVStorage&) = delete;
+
+    bool initialize();  // Allocates MTLBuffers; returns false if Metal unavailable.
+
+    void* k_buffer(size_t layer) const;  // void* bridged from id<MTLBuffer>
+    void* v_buffer(size_t layer) const;
+
+    uint32_t capacity_pages() const { return capacity_pages_; }
+    uint32_t page_size_tokens() const { return page_size_tokens_; }
+    uint32_t n_layers() const { return n_layers_; }
+    uint32_t n_kv_heads() const { return n_kv_heads_; }
+    uint32_t head_dim() const { return head_dim_; }
+    uint32_t dtype_bytes() const { return dtype_bytes_; }
+    size_t page_bytes() const {
+        return static_cast<size_t>(page_size_tokens_) * n_kv_heads_ * head_dim_ * dtype_bytes_;
+    }
+
+private:
+    uint32_t capacity_pages_;
+    uint32_t n_layers_;
+    uint32_t page_size_tokens_;
+    uint32_t n_kv_heads_;
+    uint32_t head_dim_;
+    uint32_t dtype_bytes_;
+    std::vector<void*> k_buffers_;  // size = n_layers
+    std::vector<void*> v_buffers_;
+};
+
 } // namespace runtime
 } // namespace mlc

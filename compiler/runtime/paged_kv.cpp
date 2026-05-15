@@ -1,4 +1,5 @@
 #include "runtime/paged_kv.hpp"
+#include "runtime/metal_runtime.hpp"
 
 #include <cassert>
 #include <stdexcept>
@@ -77,6 +78,52 @@ void RequestKVState::release_all(PagePool& pool) {
     for (uint32_t id : page_table) pool.release(id);
     page_table.clear();
     tokens_in_last_page = 0;
+}
+
+PagedKVStorage::PagedKVStorage(uint32_t capacity_pages,
+                               uint32_t n_layers,
+                               uint32_t page_size_tokens,
+                               uint32_t n_kv_heads,
+                               uint32_t head_dim,
+                               uint32_t dtype_bytes)
+    : capacity_pages_(capacity_pages),
+      n_layers_(n_layers),
+      page_size_tokens_(page_size_tokens),
+      n_kv_heads_(n_kv_heads),
+      head_dim_(head_dim),
+      dtype_bytes_(dtype_bytes) {
+    k_buffers_.resize(n_layers, nullptr);
+    v_buffers_.resize(n_layers, nullptr);
+}
+
+PagedKVStorage::~PagedKVStorage() {
+    auto& exec = MetalExecutor::Instance();
+    for (auto* buf : k_buffers_) if (buf) exec.releaseScratchBuffer(buf);
+    for (auto* buf : v_buffers_) if (buf) exec.releaseScratchBuffer(buf);
+}
+
+bool PagedKVStorage::initialize() {
+    auto& exec = MetalExecutor::Instance();
+    if (!exec.isAvailable()) return false;
+    size_t bytes_per_layer = static_cast<size_t>(capacity_pages_) * page_bytes();
+    for (uint32_t L = 0; L < n_layers_; ++L) {
+        k_buffers_[L] = exec.allocateScratchBuffer(bytes_per_layer);
+        v_buffers_[L] = exec.allocateScratchBuffer(bytes_per_layer);
+        if (!k_buffers_[L] || !v_buffers_[L]) return false;
+        // Zero-init to ensure unread slots stay at 0 (matches single-stream KV
+        // cache behavior where rows beyond the active position are zero).
+        std::vector<uint8_t> zeros(bytes_per_layer, 0);
+        exec.uploadToBuffer(k_buffers_[L], zeros.data(), bytes_per_layer);
+        exec.uploadToBuffer(v_buffers_[L], zeros.data(), bytes_per_layer);
+    }
+    return true;
+}
+
+void* PagedKVStorage::k_buffer(size_t layer) const {
+    return layer < k_buffers_.size() ? k_buffers_[layer] : nullptr;
+}
+void* PagedKVStorage::v_buffer(size_t layer) const {
+    return layer < v_buffers_.size() ? v_buffers_[layer] : nullptr;
 }
 
 } // namespace runtime

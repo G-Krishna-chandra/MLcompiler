@@ -73,6 +73,19 @@ public:
     // Returns nullptr when paged tracking is off or the request isn't tracked.
     const RequestKVState* page_state(uint32_t request_id) const;
 
+    // Phase G1 — attach a PagedKVStorage. When attached AND a PagePool is
+    // also attached, run_decode routes through the chunked-walk path that
+    // dispatches paged_flash_attention for batched-attention compute. When
+    // not attached, run_decode keeps using the per-request sequential MPS
+    // attention from B2c.
+    void attach_paged_storage(PagedKVStorage* storage) { paged_storage_ = storage; }
+
+    // Phase G1 — chunked-walk decode that uses paged_flash_attention for
+    // attention. Public so tests can target it explicitly. run_decode
+    // dispatches here automatically when both PagePool and PagedKVStorage
+    // are attached.
+    BatchedDecodeOutput run_decode_paged(const std::vector<RequestSlot>& slots);
+
     // Run one decoder pass per slot. Each slot's KV state is isolated in a
     // per-request ExecutionContext. Slots run sequentially within this
     // call (Option a from the design doc).
@@ -111,6 +124,10 @@ private:
     void prime_token_tensors(ExecutionContext& ctx, uint64_t token) const;
     bool advance_page_state(PerRequest& req);
 
+    // G1 helpers.
+    void cache_topology() const;
+    BatchedDecodeOutput run_decode_paged_impl(const std::vector<RequestSlot>& slots);
+
     const Session& session_;
     ExecutionGraph graph_;
     std::unordered_map<uint32_t, PerRequest> requests_;
@@ -118,6 +135,12 @@ private:
     // B3 paged-KV state. Optional; nullptr means paged tracking is off.
     PagePool* page_pool_ = nullptr;
     uint32_t page_size_tokens_ = 64;
+
+    // G1: paged-storage backing + cached topology.
+    PagedKVStorage* paged_storage_ = nullptr;
+    mutable std::vector<std::string> topo_order_;
+    mutable std::vector<size_t> attention_node_indices_;
+    mutable std::vector<int> attention_layer_index_;  // parallel to attention_node_indices_
 };
 
 } // namespace runtime
