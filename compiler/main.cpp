@@ -2092,6 +2092,13 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
             }
         }
 
+        // Track the token sequence currently reflected in the KV cache.
+        // On a new templated turn, compute the longest common prefix
+        // between the re-rendered prompt and history_committed; if the
+        // committed history is a prefix of the new render, only prefill
+        // the suffix (and keep the KV cache). Otherwise reset.
+        std::vector<uint64_t> history_committed;
+
         size_t pos = start_pos;
         std::cout << "Interactive chat. Type 'exit' to quit.\n";
         std::vector<ChatMessage> messages;
@@ -2116,10 +2123,31 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
                     mlc::runtime::TokenizerConfig cfg;
                     cfg.add_bos = !templateHasBosHint(chat_template);
                     cfg.add_eos = false;
-                    history = tokenizer.encode(rendered, cfg);
-                    processed = 0;
-                    pos = start_pos;
-                    context.clearStateTensors();
+                    std::vector<uint64_t> new_hist = tokenizer.encode(rendered, cfg);
+                    size_t lcp = 0;
+                    while (lcp < new_hist.size() && lcp < history_committed.size() &&
+                           new_hist[lcp] == history_committed[lcp]) ++lcp;
+                    // Soft KV reuse: any matching prefix can be reused. Old
+                    // cache entries at positions >= lcp will be overwritten
+                    // when prefill resumes from pos = start_pos + lcp.
+                    bool reuse = (lcp > 0) && (lcp < new_hist.size())
+                                 && (start_pos + new_hist.size() <= context_len);
+                    if (std::getenv("MLC_KV_REUSE_DEBUG") != nullptr) {
+                        std::cerr << "[kv-reuse] turn=" << turn_index
+                                  << " committed=" << history_committed.size()
+                                  << " new=" << new_hist.size()
+                                  << " lcp=" << lcp
+                                  << " reuse=" << (reuse ? "yes" : "no") << "\n";
+                    }
+                    history = std::move(new_hist);
+                    if (reuse) {
+                        processed = lcp;
+                        pos = start_pos + lcp;
+                    } else {
+                        processed = 0;
+                        pos = start_pos;
+                        context.clearStateTensors();
+                    }
                     used_template = true;
                     logChatPrompt(chat_trace, turn_index, true, rendered);
                     logTokenListToFile(chat_trace.tokens_file, "chat_prompt_tokens", turn_index, history);
@@ -2133,10 +2161,28 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
                     mlc::runtime::TokenizerConfig cfg;
                     cfg.add_bos = !templateHasBosHint(chat_template);
                     cfg.add_eos = false;
-                    history = tokenizer.encode(rendered, cfg);
-                    processed = 0;
-                    pos = start_pos;
-                    context.clearStateTensors();
+                    std::vector<uint64_t> new_hist = tokenizer.encode(rendered, cfg);
+                    size_t lcp = 0;
+                    while (lcp < new_hist.size() && lcp < history_committed.size() &&
+                           new_hist[lcp] == history_committed[lcp]) ++lcp;
+                    bool reuse = (lcp > 0) && (lcp < new_hist.size())
+                                 && (start_pos + new_hist.size() <= context_len);
+                    if (std::getenv("MLC_KV_REUSE_DEBUG") != nullptr) {
+                        std::cerr << "[kv-reuse] turn=" << turn_index
+                                  << " committed=" << history_committed.size()
+                                  << " new=" << new_hist.size()
+                                  << " lcp=" << lcp
+                                  << " reuse=" << (reuse ? "yes" : "no") << "\n";
+                    }
+                    history = std::move(new_hist);
+                    if (reuse) {
+                        processed = lcp;
+                        pos = start_pos + lcp;
+                    } else {
+                        processed = 0;
+                        pos = start_pos;
+                        context.clearStateTensors();
+                    }
                     used_template = true;
                     logChatPrompt(chat_trace, turn_index, true, rendered);
                     logTokenListToFile(chat_trace.tokens_file, "chat_prompt_tokens", turn_index, history);
@@ -2177,6 +2223,7 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
             mlc::runtime::ExecutionExecutor::clearNodeProfile();
             auto t_prefill_begin = clk::now();
             size_t prompt_tokens_processed = 0;
+            const size_t prefix_reused = processed;
             if (history.size() > processed) {
                 if (pos + (history.size() - processed) > context_len) {
                     context.clearStateTensors();
@@ -2271,7 +2318,11 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
             double gen_ms     = dur_ms(t_gen_begin,     t_gen_end);
             double per_tok_ms = generated.empty() ? 0.0 : gen_ms / static_cast<double>(generated.size());
             std::cout << "[timing] prefill=" << std::fixed << std::setprecision(1)
-                      << prefill_ms << " ms (" << prompt_tokens_processed << " prompt tokens, "
+                      << prefill_ms << " ms (" << prompt_tokens_processed << " prompt tokens";
+            if (prefix_reused > 0) {
+                std::cout << ", " << prefix_reused << " kv-reused";
+            }
+            std::cout << ", "
                       << (prompt_tokens_processed
                               ? prefill_ms / static_cast<double>(prompt_tokens_processed)
                               : 0.0)
@@ -2316,6 +2367,7 @@ int handleChatReplCommand(const std::vector<std::string>& args) {
                 messages.push_back({"assistant", decoded});
             }
             processed = history.size();
+            history_committed = history;
             turn_index += 1;
         }
         return 0;
