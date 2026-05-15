@@ -56,7 +56,10 @@ public:
     virtual void release_request(uint32_t request_id) = 0;
 };
 
+class BatchedWalker;  // forward declaration; friend below
+
 class BatchedExecutor : public IBatchedExecutor {
+    friend class BatchedWalker;
 public:
     explicit BatchedExecutor(const Session& session);
 

@@ -32,6 +32,7 @@ set(TEST_SOURCES
     test_scheduler_e2e.cpp
     test_paged_flash.cpp
     test_batched_paged_g1.cpp
+    test_batched_walker_h1.cpp
 )
 
 # Create test executable
