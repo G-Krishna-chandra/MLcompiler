@@ -1921,6 +1921,40 @@ struct MetalExecutor::Impl {
     // forward pass on TinyLlama (45 norm tensors with weight_name in the
     // graph; ~half are hot on each token's path).
     mutable std::unordered_map<std::string, id<MTLBuffer>> small_param_cache_;
+
+    // Lever 3 (final-push): per-call persistent attention scratch buffers.
+    // Each unique attention output_tensor_name (one per layer) gets its
+    // own 5-buffer slot (q, k_batch, v_batch, logits, result). Buffers
+    // grow monotonically with sequence position; reused across forward
+    // passes to eliminate per-pass alloc churn (5 × 22 = 110 allocations
+    // / pass). Per-call keying is required: with the deferred-CB model,
+    // all CPU writes happen before commit so a single shared buffer
+    // would race (layer N+1's writes overwrite layer N's data before
+    // layer N's GPU dispatch reads it).
+    struct AttnScratchSlot {
+        id<MTLBuffer> q = nil;       size_t q_bytes = 0;
+        id<MTLBuffer> k = nil;       size_t k_bytes = 0;
+        id<MTLBuffer> v = nil;       size_t v_bytes = 0;
+        id<MTLBuffer> logits = nil;  size_t logits_bytes = 0;
+        id<MTLBuffer> result = nil;  size_t result_bytes = 0;
+    };
+    mutable std::unordered_map<std::string, AttnScratchSlot> attn_scratch_per_call_;
+    mutable AttnScratchSlot attn_scratch_anonymous_;  // fallback when name empty
+    AttnScratchSlot& attnScratchSlotFor(const std::string& name) const {
+        if (name.empty()) return attn_scratch_anonymous_;
+        auto it = attn_scratch_per_call_.find(name);
+        if (it != attn_scratch_per_call_.end()) return it->second;
+        return attn_scratch_per_call_[name];  // default-constructs
+    }
+    id<MTLBuffer> ensureAttnScratch(__strong id<MTLBuffer>& slot, size_t& slot_bytes,
+                                    size_t bytes) const {
+        if (!slot || slot_bytes < bytes) {
+            slot = [device newBufferWithLength:bytes
+                                       options:MTLResourceStorageModeShared];
+            slot_bytes = bytes;
+        }
+        return slot;
+    }
     id<MTLBuffer> getOrCacheSmallParam(const std::string& name,
                                         const std::vector<float>& data) const {
         if (name.empty()) return nil;  // anonymous — caller must own buffer
@@ -4645,16 +4679,21 @@ bool matmulQ4_K(const std::string& weight_name,
                 const size_t kLogitsRowBytes = tokens * kElemBytes;
                 const MPSDataType mpsDtype   = fp16_attn ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
 
-                id<MTLBuffer> qBuffer = [device newBufferWithLength:num_heads * kHeadDimBytes
-                                                            options:MTLResourceStorageModeShared];
-                id<MTLBuffer> kBatchBuffer = [device newBufferWithLength:num_heads * kKVMatrixBytes
-                                                                options:MTLResourceStorageModeShared];
-                id<MTLBuffer> vBatchBuffer = [device newBufferWithLength:num_heads * kKVMatrixBytes
-                                                                options:MTLResourceStorageModeShared];
-                id<MTLBuffer> logitsBuffer = [device newBufferWithLength:num_heads * kLogitsRowBytes
-                                                                options:MTLResourceStorageModeShared];
-                id<MTLBuffer> resultBuffer = [device newBufferWithLength:num_heads * kHeadDimBytes
-                                                                options:MTLResourceStorageModeShared];
+                // Lever 3: per-call (per-layer) scratch buffers cached
+                // across forward passes. Same layer always uses same
+                // buffer so CPU writes can't race with another layer's
+                // pending GPU dispatch in the same CB.
+                AttnScratchSlot& slot = attnScratchSlotFor(output_tensor_name);
+                id<MTLBuffer> qBuffer      = ensureAttnScratch(slot.q,      slot.q_bytes,
+                                                              num_heads * kHeadDimBytes);
+                id<MTLBuffer> kBatchBuffer = ensureAttnScratch(slot.k,      slot.k_bytes,
+                                                              num_heads * kKVMatrixBytes);
+                id<MTLBuffer> vBatchBuffer = ensureAttnScratch(slot.v,      slot.v_bytes,
+                                                              num_heads * kKVMatrixBytes);
+                id<MTLBuffer> logitsBuffer = ensureAttnScratch(slot.logits, slot.logits_bytes,
+                                                              num_heads * kLogitsRowBytes);
+                id<MTLBuffer> resultBuffer = ensureAttnScratch(slot.result, slot.result_bytes,
+                                                              num_heads * kHeadDimBytes);
                 if (!qBuffer || !kBatchBuffer || !vBatchBuffer ||
                     !logitsBuffer || !resultBuffer) {
                     return false;
@@ -4854,11 +4893,9 @@ bool matmulQ4_K(const std::string& weight_name,
                 //     MTLBuffer objects in pass_retained_ so they
                 //     survive until the CB commits.
                 if (deferred_mode) {
-                    pass_retained_.push_back((id)qBuffer);
-                    pass_retained_.push_back((id)kBatchBuffer);
-                    pass_retained_.push_back((id)vBatchBuffer);
-                    pass_retained_.push_back((id)logitsBuffer);
-                    pass_retained_.push_back((id)resultBuffer);
+                    // Lever 3: q/k/v/logits/result are cache-owned (per-layer
+                    // slot). MPS matrix wrappers reference them, so the
+                    // wrappers still need to survive until CB commit.
                     pass_retained_.push_back((id)qMat);
                     pass_retained_.push_back((id)kMat);
                     pass_retained_.push_back((id)lMatBatched);
