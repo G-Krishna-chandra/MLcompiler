@@ -93,6 +93,14 @@ void BatchedExecutor::prime_token_tensors(ExecutionContext& ctx, uint64_t token)
 }
 
 BatchedDecodeOutput BatchedExecutor::run_decode(const std::vector<RequestSlot>& slots) {
+    // G1: when paged storage AND page pool are both attached, route through
+    // the chunked-walk path that uses paged_flash_attention for batched
+    // attention. The Scheduler invokes run_decode via the IBatchedExecutor
+    // interface; this dispatch keeps the scheduler agnostic to the path.
+    if (paged_storage_ && page_pool_ && !slots.empty()) {
+        return run_decode_paged_impl(slots);
+    }
+
     BatchedDecodeOutput out;
     out.per_request.reserve(slots.size());
     if (slots.empty()) return out;
@@ -431,6 +439,25 @@ std::vector<float> BatchedExecutor::run_prefill(uint32_t request_id,
                                                 const std::vector<uint64_t>& tokens) {
     std::vector<float> last_logits;
     if (tokens.empty()) return last_logits;
+
+    // G1: when paged storage is attached, prefill must populate it
+    // incrementally via single-token decode paths so the per-layer paged
+    // KV pages reflect the prompt context. Multi-token executor.run() uses
+    // the contiguous KV cache and would skip paged storage entirely.
+    if (paged_storage_ && page_pool_) {
+        size_t cursor = known_position(request_id);
+        for (uint64_t tok : tokens) {
+            std::vector<RequestSlot> slot{{request_id, tok, cursor}};
+            auto out = run_decode_paged_impl(slot);
+            if (out.per_request.empty() || !out.per_request.front().success) {
+                last_logits.clear();
+                return last_logits;
+            }
+            last_logits = std::move(out.per_request.front().logits);
+            ++cursor;
+        }
+        return last_logits;
+    }
 
     auto& req = ensure_request(request_id);
     ExecutionContext& ctx = *req.context;

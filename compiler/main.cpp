@@ -1761,7 +1761,7 @@ int handleChatCommand(const std::vector<std::string>& args) {
 int handleServeCommand(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cerr << "Usage: mlc serve <gguf_path> --prompt \"...\" [--prompt \"...\" ...]\n"
-                     "                 [--max-tokens N] [--batch-size N]\n";
+                     "                 [--max-tokens N] [--batch-size N] [--paged]\n";
         return 1;
     }
 
@@ -1769,6 +1769,7 @@ int handleServeCommand(const std::vector<std::string>& args) {
     std::vector<std::string> prompts;
     size_t max_tokens = 64;
     size_t batch_size = 8;
+    bool use_paged = false;
 
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& arg = args[i];
@@ -1784,6 +1785,8 @@ int handleServeCommand(const std::vector<std::string>& args) {
             parseSizeT(args[++i], batch_size);
         } else if (arg.rfind("--batch-size=", 0) == 0) {
             parseSizeT(arg.substr(13), batch_size);
+        } else if (arg == "--paged") {
+            use_paged = true;
         } else {
             std::cerr << "Unknown serve option: " << arg << "\n";
             return 1;
@@ -1806,6 +1809,51 @@ int handleServeCommand(const std::vector<std::string>& args) {
         }
 
         mlc::runtime::BatchedExecutor exec(session);
+
+        // G1: when --paged is set, attach a PagePool and per-layer paged
+        // KV storage so BatchedExecutor routes through paged_flash_attention.
+        // Sized for batch_size requests × max_tokens worth of pages.
+        std::unique_ptr<mlc::runtime::PagePool> page_pool;
+        std::unique_ptr<mlc::runtime::PagedKVStorage> paged_storage;
+        constexpr uint32_t PAGE_SIZE_TOKENS = 64;
+        if (use_paged) {
+            // Discover model attention shape.
+            const auto& g = exec.graph();
+            size_t n_kv_heads = 0, head_dim = 0, n_layers = 0;
+            for (const auto& n : g.nodes()) {
+                if (n.op == mlc::runtime::ExecOpType::Attention) {
+                    if (n_kv_heads == 0) {
+                        n_kv_heads = static_cast<size_t>(n.attributes.at("kv_heads"));
+                        head_dim   = static_cast<size_t>(n.attributes.at("head_dim"));
+                    }
+                    ++n_layers;
+                }
+            }
+            if (n_kv_heads == 0 || head_dim == 0 || n_layers == 0) {
+                std::cerr << "--paged: failed to discover model attention shape\n";
+                return 1;
+            }
+            // Capacity: enough pages for batch_size requests × ceil(max_tokens / PAGE_SIZE).
+            // Plus a margin for prompt-prefill state.
+            uint32_t pages_per_req = static_cast<uint32_t>(
+                (max_tokens + 256 + PAGE_SIZE_TOKENS - 1) / PAGE_SIZE_TOKENS);
+            uint32_t capacity = static_cast<uint32_t>(batch_size + 4) * pages_per_req;
+            page_pool = std::make_unique<mlc::runtime::PagePool>(capacity);
+            paged_storage = std::make_unique<mlc::runtime::PagedKVStorage>(
+                capacity, static_cast<uint32_t>(n_layers),
+                PAGE_SIZE_TOKENS, static_cast<uint32_t>(n_kv_heads),
+                static_cast<uint32_t>(head_dim), /*dtype_bytes=*/2);
+            if (!paged_storage->initialize()) {
+                std::cerr << "--paged: failed to allocate paged KV storage\n";
+                return 1;
+            }
+            exec.attach_page_pool(page_pool.get(), PAGE_SIZE_TOKENS);
+            exec.attach_paged_storage(paged_storage.get());
+            std::cout << "[paged] enabled (capacity=" << capacity << " pages, page_size="
+                      << PAGE_SIZE_TOKENS << ", n_layers=" << n_layers
+                      << ", n_kv_heads=" << n_kv_heads << ", head_dim=" << head_dim << ")\n";
+        }
+
         mlc::runtime::Scheduler scheduler(&exec, batch_size);
 
         // Per-request bookkeeping for streaming + per-request tok/s.
