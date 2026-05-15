@@ -1761,7 +1761,16 @@ int handleChatCommand(const std::vector<std::string>& args) {
 int handleServeCommand(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cerr << "Usage: mlc serve <gguf_path> --prompt \"...\" [--prompt \"...\" ...]\n"
-                     "                 [--max-tokens N] [--batch-size N] [--paged]\n";
+                     "                 [--max-tokens N] [--batch-size N] [--paged]\n"
+                     "                 [--benchmark] [--benchmark-batches 1,2,4,8]\n"
+                     "                 [--benchmark-prompt \"text\"] [--quiet]\n"
+                     "\n"
+                     "  --benchmark           Run a scaling sweep: for each batch in\n"
+                     "                        --benchmark-batches, send N copies of\n"
+                     "                        --benchmark-prompt and report aggregate\n"
+                     "                        tok/s. Implies --paged. Default batches:\n"
+                     "                        1,2,4,8. Default prompt: \"Hello!\".\n"
+                     "  --quiet               Suppress per-token streaming.\n";
         return 1;
     }
 
@@ -1770,6 +1779,32 @@ int handleServeCommand(const std::vector<std::string>& args) {
     size_t max_tokens = 64;
     size_t batch_size = 8;
     bool use_paged = false;
+    bool benchmark_mode = false;
+    bool quiet = false;
+    std::vector<size_t> benchmark_batches;
+    std::string benchmark_prompt = "Hello!";
+
+    auto parseBatches = [&](const std::string& csv) {
+        benchmark_batches.clear();
+        std::string cur;
+        for (char c : csv) {
+            if (c == ',' || c == ' ') {
+                if (!cur.empty()) {
+                    size_t v = 0;
+                    parseSizeT(cur, v);
+                    if (v > 0) benchmark_batches.push_back(v);
+                    cur.clear();
+                }
+            } else {
+                cur.push_back(c);
+            }
+        }
+        if (!cur.empty()) {
+            size_t v = 0;
+            parseSizeT(cur, v);
+            if (v > 0) benchmark_batches.push_back(v);
+        }
+    };
 
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& arg = args[i];
@@ -1787,15 +1822,36 @@ int handleServeCommand(const std::vector<std::string>& args) {
             parseSizeT(arg.substr(13), batch_size);
         } else if (arg == "--paged") {
             use_paged = true;
+        } else if (arg == "--benchmark") {
+            benchmark_mode = true;
+        } else if (arg == "--benchmark-batches" && i + 1 < args.size()) {
+            parseBatches(args[++i]);
+        } else if (arg.rfind("--benchmark-batches=", 0) == 0) {
+            parseBatches(arg.substr(20));
+        } else if (arg == "--benchmark-prompt" && i + 1 < args.size()) {
+            benchmark_prompt = args[++i];
+        } else if (arg.rfind("--benchmark-prompt=", 0) == 0) {
+            benchmark_prompt = arg.substr(19);
+        } else if (arg == "--quiet") {
+            quiet = true;
         } else {
             std::cerr << "Unknown serve option: " << arg << "\n";
             return 1;
         }
     }
 
-    if (prompts.empty()) {
-        std::cerr << "mlc serve requires at least one --prompt.\n";
-        return 1;
+    if (benchmark_mode) {
+        // Standardized scaling sweep. Force --paged (otherwise scaling
+        // is the existing 1.0× legacy behavior) and quiet streaming
+        // (per-token output across many requests is noise).
+        use_paged = true;
+        quiet = true;
+        if (benchmark_batches.empty()) benchmark_batches = {1, 2, 4, 8};
+    } else {
+        if (prompts.empty()) {
+            std::cerr << "mlc serve requires at least one --prompt.\n";
+            return 1;
+        }
     }
     if (max_tokens == 0) max_tokens = 1;
     if (batch_size == 0) batch_size = 1;
@@ -1808,15 +1864,37 @@ int handleServeCommand(const std::vector<std::string>& args) {
             return 1;
         }
 
+        struct RunResult {
+            size_t requests = 0;
+            size_t batch_size = 0;
+            size_t total_generated = 0;
+            size_t decode_steps = 0;
+            double wall_ms = 0.0;
+            double aggregate_tok_s = 0.0;
+            double per_request_tok_s = 0.0;
+        };
+
+        // Inner runner: takes prompt list + batch + max_tokens and runs
+        // the existing serve loop. Returns aggregate timing. Caller
+        // decides whether to emit per-token streaming.
+        auto runOnce = [&](const std::vector<std::string>& run_prompts,
+                           size_t run_batch,
+                           size_t run_max,
+                           bool use_paged_flag,
+                           bool quiet_flag) -> RunResult {
+        RunResult result;
+        result.requests = run_prompts.size();
+        result.batch_size = run_batch;
+
         mlc::runtime::BatchedExecutor exec(session);
 
         // G1: when --paged is set, attach a PagePool and per-layer paged
         // KV storage so BatchedExecutor routes through paged_flash_attention.
-        // Sized for batch_size requests × max_tokens worth of pages.
+        // Sized for run_batch requests × run_max worth of pages.
         std::unique_ptr<mlc::runtime::PagePool> page_pool;
         std::unique_ptr<mlc::runtime::PagedKVStorage> paged_storage;
         constexpr uint32_t PAGE_SIZE_TOKENS = 64;
-        if (use_paged) {
+        if (use_paged_flag) {
             // Discover model attention shape.
             const auto& g = exec.graph();
             size_t n_kv_heads = 0, head_dim = 0, n_layers = 0;
@@ -1831,13 +1909,13 @@ int handleServeCommand(const std::vector<std::string>& args) {
             }
             if (n_kv_heads == 0 || head_dim == 0 || n_layers == 0) {
                 std::cerr << "--paged: failed to discover model attention shape\n";
-                return 1;
+                return result;
             }
-            // Capacity: enough pages for batch_size requests × ceil(max_tokens / PAGE_SIZE).
+            // Capacity: enough pages for run_batch requests × ceil(run_max / PAGE_SIZE).
             // Plus a margin for prompt-prefill state.
             uint32_t pages_per_req = static_cast<uint32_t>(
-                (max_tokens + 256 + PAGE_SIZE_TOKENS - 1) / PAGE_SIZE_TOKENS);
-            uint32_t capacity = static_cast<uint32_t>(batch_size + 4) * pages_per_req;
+                (run_max + 256 + PAGE_SIZE_TOKENS - 1) / PAGE_SIZE_TOKENS);
+            uint32_t capacity = static_cast<uint32_t>(run_batch + 4) * pages_per_req;
             page_pool = std::make_unique<mlc::runtime::PagePool>(capacity);
             paged_storage = std::make_unique<mlc::runtime::PagedKVStorage>(
                 capacity, static_cast<uint32_t>(n_layers),
@@ -1845,16 +1923,18 @@ int handleServeCommand(const std::vector<std::string>& args) {
                 static_cast<uint32_t>(head_dim), /*dtype_bytes=*/2);
             if (!paged_storage->initialize()) {
                 std::cerr << "--paged: failed to allocate paged KV storage\n";
-                return 1;
+                return result;
             }
             exec.attach_page_pool(page_pool.get(), PAGE_SIZE_TOKENS);
             exec.attach_paged_storage(paged_storage.get());
-            std::cout << "[paged] enabled (capacity=" << capacity << " pages, page_size="
-                      << PAGE_SIZE_TOKENS << ", n_layers=" << n_layers
-                      << ", n_kv_heads=" << n_kv_heads << ", head_dim=" << head_dim << ")\n";
+            if (!quiet_flag) {
+                std::cout << "[paged] enabled (capacity=" << capacity << " pages, page_size="
+                          << PAGE_SIZE_TOKENS << ", n_layers=" << n_layers
+                          << ", n_kv_heads=" << n_kv_heads << ", head_dim=" << head_dim << ")\n";
+            }
         }
 
-        mlc::runtime::Scheduler scheduler(&exec, batch_size);
+        mlc::runtime::Scheduler scheduler(&exec, run_batch);
 
         // Per-request bookkeeping for streaming + per-request tok/s.
         struct ReqInfo {
@@ -1874,17 +1954,17 @@ int handleServeCommand(const std::vector<std::string>& args) {
         tc.add_eos = false;
 
         mlc::runtime::GenerationParams params;
-        params.max_new_tokens = max_tokens;
+        params.max_new_tokens = run_max;
         int64_t eos = (tokenizer.eosId() != std::numeric_limits<uint64_t>::max())
                           ? static_cast<int64_t>(tokenizer.eosId())
                           : -1;
         params.eos_token_id = eos;
 
-        for (const auto& prompt_text : prompts) {
+        for (const auto& prompt_text : run_prompts) {
             auto tokens = tokenizer.encode(prompt_text, tc);
             if (tokens.empty()) {
                 std::cerr << "Tokenization produced no tokens for prompt: " << prompt_text << "\n";
-                return 1;
+                return result;
             }
             uint32_t id = scheduler.add_request(tokens, params);
             ReqInfo info;
@@ -1894,31 +1974,38 @@ int handleServeCommand(const std::vector<std::string>& args) {
             info.started = std::chrono::steady_clock::now();
             by_id.emplace(id, std::move(info));
             ordered_ids.push_back(id);
-            std::cout << "[req " << id << "] queued: \"" << prompt_text << "\" ("
-                      << tokens.size() << " prompt tokens)\n";
+            if (!quiet_flag) {
+                std::cout << "[req " << id << "] queued: \"" << prompt_text << "\" ("
+                          << tokens.size() << " prompt tokens)\n";
+            }
         }
 
         // Streaming token callback. We emit a single decoded glyph per token
         // (or its raw byte form when partial UTF-8). Per-request tag prefix.
-        scheduler.set_token_callback([&](uint32_t req_id, uint64_t tok) {
-            auto it = by_id.find(req_id);
-            if (it == by_id.end()) return;
-            it->second.generated_ids.push_back(tok);
-            // Decode incrementally: take last few tokens to handle BPE's
-            // multi-token glyphs robustly. Stream the difference.
-            const auto& gen = it->second.generated_ids;
-            std::string acc = tokenizer.decode(gen);
-            // Print the last decoded char(s) since previous emit. We
-            // re-decode from scratch each step which is O(N) but N is
-            // tiny here. A streaming-capable tokenizer would do better.
-            static thread_local std::unordered_map<uint32_t, size_t> printed;
-            size_t already = printed[req_id];
-            if (acc.size() > already) {
-                std::cout << "[req " << req_id << "] " << acc.substr(already) << "\n";
-                std::cout.flush();
-                printed[req_id] = acc.size();
-            }
-        });
+        // Suppressed in benchmark/quiet mode — multi-batch streaming is noise.
+        if (!quiet_flag) {
+            scheduler.set_token_callback([&](uint32_t req_id, uint64_t tok) {
+                auto it = by_id.find(req_id);
+                if (it == by_id.end()) return;
+                it->second.generated_ids.push_back(tok);
+                const auto& gen = it->second.generated_ids;
+                std::string acc = tokenizer.decode(gen);
+                static thread_local std::unordered_map<uint32_t, size_t> printed;
+                size_t already = printed[req_id];
+                if (acc.size() > already) {
+                    std::cout << "[req " << req_id << "] " << acc.substr(already) << "\n";
+                    std::cout.flush();
+                    printed[req_id] = acc.size();
+                }
+            });
+        } else {
+            // Still need to track tokens for per-request tok/s.
+            scheduler.set_token_callback([&](uint32_t req_id, uint64_t tok) {
+                auto it = by_id.find(req_id);
+                if (it == by_id.end()) return;
+                it->second.generated_ids.push_back(tok);
+            });
+        }
 
         scheduler.set_complete_callback([&](const mlc::runtime::Scheduler::Request& req) {
             auto it = by_id.find(req.id);
@@ -1936,7 +2023,8 @@ int handleServeCommand(const std::vector<std::string>& args) {
 
         // Final per-request report.
         size_t total_generated = 0;
-        std::cout << "\n--- final report ---\n";
+        if (!quiet_flag) std::cout << "\n--- final report ---\n";
+        double per_request_tok_s_sum = 0.0;
         for (uint32_t id : ordered_ids) {
             const ReqInfo& info = by_id[id];
             double per_s = std::chrono::duration<double>(info.finished - info.started).count();
@@ -1944,20 +2032,62 @@ int handleServeCommand(const std::vector<std::string>& args) {
             size_t n = info.generated_ids.size();
             total_generated += n;
             double tok_s = n / per_s;
-            std::string text = tokenizer.decode(info.generated_ids);
-            std::cout << "[req " << id << "] generated=" << n
-                      << " time=" << std::fixed << std::setprecision(2) << (per_s * 1000.0)
-                      << " ms tok/s=" << std::setprecision(1) << tok_s << "\n";
-            std::cout << "          prompt: \"" << info.prompt << "\"\n";
-            std::cout << "          output: \"" << text << "\"\n";
+            per_request_tok_s_sum += tok_s;
+            if (!quiet_flag) {
+                std::string text = tokenizer.decode(info.generated_ids);
+                std::cout << "[req " << id << "] generated=" << n
+                          << " time=" << std::fixed << std::setprecision(2) << (per_s * 1000.0)
+                          << " ms tok/s=" << std::setprecision(1) << tok_s << "\n";
+                std::cout << "          prompt: \"" << info.prompt << "\"\n";
+                std::cout << "          output: \"" << text << "\"\n";
+            }
         }
         double aggregate_tok_s = total_generated / wall_s;
-        std::cout << "[summary] requests=" << prompts.size()
-                  << " batch_size=" << batch_size
-                  << " decode_steps=" << decode_steps
-                  << " total_tokens=" << total_generated
-                  << " wall=" << std::fixed << std::setprecision(2) << (wall_s * 1000.0) << " ms"
-                  << " aggregate=" << std::setprecision(1) << aggregate_tok_s << " tok/s\n";
+        if (!quiet_flag) {
+            std::cout << "[summary] requests=" << run_prompts.size()
+                      << " batch_size=" << run_batch
+                      << " decode_steps=" << decode_steps
+                      << " total_tokens=" << total_generated
+                      << " wall=" << std::fixed << std::setprecision(2) << (wall_s * 1000.0) << " ms"
+                      << " aggregate=" << std::setprecision(1) << aggregate_tok_s << " tok/s\n";
+        }
+        result.total_generated = total_generated;
+        result.decode_steps = decode_steps;
+        result.wall_ms = wall_s * 1000.0;
+        result.aggregate_tok_s = aggregate_tok_s;
+        result.per_request_tok_s = run_prompts.empty() ? 0.0
+                                       : per_request_tok_s_sum / static_cast<double>(run_prompts.size());
+        return result;
+        };  // runOnce lambda end
+
+        if (benchmark_mode) {
+            std::cout << "[benchmark] sweep batches=";
+            for (size_t b : benchmark_batches) std::cout << b << " ";
+            std::cout << "max_tokens=" << max_tokens
+                      << " prompt=\"" << benchmark_prompt << "\"\n";
+            std::vector<RunResult> results;
+            for (size_t b : benchmark_batches) {
+                std::vector<std::string> sweep_prompts(b, benchmark_prompt);
+                std::cout << "[benchmark] running batch=" << b << "..." << std::flush;
+                auto r = runOnce(sweep_prompts, b, max_tokens, /*paged=*/true, /*quiet=*/true);
+                std::cout << " agg=" << std::fixed << std::setprecision(1) << r.aggregate_tok_s
+                          << " tok/s wall=" << std::setprecision(0) << r.wall_ms << " ms\n";
+                results.push_back(r);
+            }
+            // Scaling table.
+            std::cout << "\n";
+            std::cout << "batch | aggregate tok/s | per-request tok/s | scaling vs N=1\n";
+            std::cout << "------|-----------------|-------------------|----------------\n";
+            double base = results.empty() ? 0.0 : results.front().aggregate_tok_s;
+            for (const auto& r : results) {
+                double scaling = base > 0.0 ? r.aggregate_tok_s / base : 0.0;
+                std::printf("%5zu | %15.1f | %17.1f | %14.2fx\n",
+                            r.batch_size, r.aggregate_tok_s, r.per_request_tok_s, scaling);
+            }
+            return 0;
+        }
+
+        runOnce(prompts, batch_size, max_tokens, use_paged, quiet);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
