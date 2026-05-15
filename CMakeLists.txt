@@ -77,6 +77,19 @@ if(APPLE)
         "-framework Accelerate")
 endif()
 
+# Standalone benchmark: paged-flash vs sequential MPS attention.
+add_executable(paged_flash_bench tools/paged_flash_bench.cpp)
+target_link_libraries(paged_flash_bench PRIVATE mlc_lib)
+if(APPLE)
+    target_link_libraries(paged_flash_bench PRIVATE
+        "-framework Metal"
+        "-framework MetalPerformanceShaders"
+        "-framework Foundation"
+        "-framework CoreGraphics"
+        "-framework QuartzCore"
+        "-framework Accelerate")
+endif()
+
 # Future: MLIR/LLVM integration point
 # find_package(MLIR REQUIRED CONFIG)
 # find_package(LLVM REQUIRED CONFIG)
