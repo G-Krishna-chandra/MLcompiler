@@ -6836,6 +6836,334 @@ bool MetalExecutor::hasDequantQKKernel() const {
 }
 
 // ===========================================================================
+// Phase J1 — encode-to-buffer variants of the batched kernels.
+// ===========================================================================
+
+bool MetalExecutor::encodeRmsNormBatched(void* in_buf,
+                                         const std::vector<float>& weight,
+                                         float epsilon,
+                                         size_t batch,
+                                         size_t length,
+                                         void* out_buf) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->normPipelineV2Batched) return false;
+    if (!in_buf || !out_buf || batch == 0 || length == 0) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        // Weight buffer: cached by length (length is constant for a model).
+        size_t w_bytes = weight.size() * sizeof(float);
+        id<MTLBuffer> wBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+            "norm_w", w_bytes);
+        if (!wBuf) return false;
+        std::memcpy([wBuf contents], weight.data(), w_bytes);
+
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->normPipelineV2Batched];
+        [enc setBuffer:(__bridge id<MTLBuffer>)in_buf  offset:0 atIndex:0];
+        [enc setBuffer:wBuf                            offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:2];
+        uint32_t length32 = static_cast<uint32_t>(length);
+        [enc setBytes:&length32 length:sizeof(uint32_t) atIndex:3];
+        float eps = epsilon;
+        [enc setBytes:&eps length:sizeof(float) atIndex:4];
+        [enc setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(batch, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)in_buf; (void)weight; (void)epsilon; (void)batch; (void)length; (void)out_buf;
+    return false;
+}
+
+bool MetalExecutor::encodeMatMulQ4_0Batched(const std::string& weight_name,
+                                             const std::vector<uint8_t>& weights,
+                                             void* in_buf,
+                                             size_t batch,
+                                             size_t rows,
+                                             size_t cols,
+                                             size_t row_stride,
+                                             uint32_t quant_version,
+                                             void* out_buf) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->q4MatmulPipelineV3Batched) return false;
+    if (!in_buf || !out_buf || batch == 0 || rows == 0 || cols == 0) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (cols < 64 || (rows % 4u) != 0) return false;  // batched v3 constraints
+    if (@available(macOS 11.0, *)) {
+        id<MTLBuffer> wBuf = impl_->getOrCacheWeight(weight_name, weights);
+        if (!wBuf) return false;
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->q4MatmulPipelineV3Batched];
+        [enc setBuffer:wBuf                            offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)in_buf  offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:2];
+        struct ParamsHost {
+            uint32_t rows; uint32_t cols; uint32_t row_stride;
+            uint32_t quant_version; uint32_t batch;
+        } params;
+        params.rows          = static_cast<uint32_t>(rows);
+        params.cols          = static_cast<uint32_t>(cols);
+        params.row_stride    = static_cast<uint32_t>(row_stride);
+        params.quant_version = quant_version;
+        params.batch         = static_cast<uint32_t>(batch);
+        [enc setBytes:&params length:sizeof(params) atIndex:3];
+        size_t row_blocks = (rows + 3) / 4;
+        [enc dispatchThreadgroups:MTLSizeMake(batch * row_blocks, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)weight_name; (void)weights; (void)in_buf; (void)batch;
+    (void)rows; (void)cols; (void)row_stride; (void)quant_version; (void)out_buf;
+    return false;
+}
+
+bool MetalExecutor::encodeMatMulQ6KBatched(const std::string& weight_name,
+                                            const std::vector<uint8_t>& weights,
+                                            void* in_buf,
+                                            size_t batch,
+                                            size_t rows,
+                                            size_t cols,
+                                            size_t row_stride,
+                                            void* out_buf) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->q6KMatmulPipelineV3Batched) return false;
+    if (!in_buf || !out_buf || batch == 0 || rows == 0 || cols == 0) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (cols < 64 || (rows % 4u) != 0) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLBuffer> wBuf = impl_->getOrCacheWeight(weight_name, weights);
+        if (!wBuf) return false;
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->q6KMatmulPipelineV3Batched];
+        [enc setBuffer:wBuf                            offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)in_buf  offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:2];
+        struct ParamsHost { uint32_t rows; uint32_t cols; uint32_t row_stride; uint32_t batch; } params;
+        params.rows = static_cast<uint32_t>(rows);
+        params.cols = static_cast<uint32_t>(cols);
+        params.row_stride = static_cast<uint32_t>(row_stride);
+        params.batch = static_cast<uint32_t>(batch);
+        [enc setBytes:&params length:sizeof(params) atIndex:3];
+        size_t row_blocks = (rows + 3) / 4;
+        [enc dispatchThreadgroups:MTLSizeMake(batch * row_blocks, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)weight_name; (void)weights; (void)in_buf; (void)batch;
+    (void)rows; (void)cols; (void)row_stride; (void)out_buf;
+    return false;
+}
+
+bool MetalExecutor::encodeAddBatched(void* a_buf, void* b_buf, void* out_buf,
+                                     size_t total_elements) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->addPipeline) return false;
+    if (!a_buf || !b_buf || !out_buf || total_elements == 0) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->addPipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)a_buf   offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)b_buf   offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out_buf offset:0 atIndex:2];
+        uint32_t len = static_cast<uint32_t>(total_elements);
+        [enc setBytes:&len length:sizeof(uint32_t) atIndex:3];
+        NSUInteger tw = impl_->addPipeline.threadExecutionWidth;
+        if (tw == 0) tw = 32;
+        NSUInteger tg = (total_elements + tw - 1) / tw;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)a_buf; (void)b_buf; (void)out_buf; (void)total_elements;
+    return false;
+}
+
+bool MetalExecutor::encodeSiluMulBatched(void* gate_buf, void* up_buf, void* out_buf,
+                                         size_t total_elements) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->ffnPipeline) return false;
+    if (!gate_buf || !up_buf || !out_buf || total_elements == 0) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->ffnPipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)gate_buf offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)up_buf   offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out_buf  offset:0 atIndex:2];
+        uint32_t len = static_cast<uint32_t>(total_elements);
+        [enc setBytes:&len length:sizeof(uint32_t) atIndex:3];
+        NSUInteger tw = impl_->ffnPipeline.threadExecutionWidth;
+        if (tw == 0) tw = 32;
+        NSUInteger tg = (total_elements + tw - 1) / tw;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)gate_buf; (void)up_buf; (void)out_buf; (void)total_elements;
+    return false;
+}
+
+bool MetalExecutor::encodePagedFlashAttention(void* q_buf,
+                                              void* k_pages_buf,
+                                              void* v_pages_buf,
+                                              void* o_buf,
+                                              const std::vector<uint32_t>& page_tables_flat,
+                                              const std::vector<uint32_t>& page_table_offsets,
+                                              const std::vector<uint32_t>& seq_lens,
+                                              const std::vector<uint32_t>& q_positions,
+                                              size_t batch,
+                                              size_t num_heads,
+                                              size_t kv_heads,
+                                              size_t head_dim,
+                                              size_t page_size_tokens,
+                                              bool apply_causal) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->pagedFlashAttentionPipeline) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLBuffer> ptFlatBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+            "pf_pt_flat", page_tables_flat.size() * sizeof(uint32_t));
+        id<MTLBuffer> ptOffBuf  = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+            "pf_pt_off", page_table_offsets.size() * sizeof(uint32_t));
+        id<MTLBuffer> seqBuf    = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+            "pf_seq_lens", seq_lens.size() * sizeof(uint32_t));
+        id<MTLBuffer> qPosBuf   = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+            "pf_q_pos", q_positions.size() * sizeof(uint32_t));
+        if (!ptFlatBuf || !ptOffBuf || !seqBuf || !qPosBuf) return false;
+        std::memcpy([ptFlatBuf contents], page_tables_flat.data(),
+                    page_tables_flat.size() * sizeof(uint32_t));
+        std::memcpy([ptOffBuf contents], page_table_offsets.data(),
+                    page_table_offsets.size() * sizeof(uint32_t));
+        std::memcpy([seqBuf contents], seq_lens.data(), seq_lens.size() * sizeof(uint32_t));
+        std::memcpy([qPosBuf contents], q_positions.data(),
+                    q_positions.size() * sizeof(uint32_t));
+
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->pagedFlashAttentionPipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)q_buf       offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)k_pages_buf offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)v_pages_buf offset:0 atIndex:2];
+        [enc setBuffer:(__bridge id<MTLBuffer>)o_buf       offset:0 atIndex:3];
+        [enc setBuffer:ptFlatBuf  offset:0 atIndex:4];
+        [enc setBuffer:ptOffBuf   offset:0 atIndex:5];
+        [enc setBuffer:seqBuf     offset:0 atIndex:6];
+        [enc setBuffer:qPosBuf    offset:0 atIndex:7];
+
+        struct ParamsHost {
+            uint32_t num_heads; uint32_t kv_heads; uint32_t head_dim;
+            uint32_t page_size_tokens; uint32_t elements_per_page;
+            uint32_t apply_causal; float inv_sqrt_d;
+        } params;
+        params.num_heads = static_cast<uint32_t>(num_heads);
+        params.kv_heads  = static_cast<uint32_t>(kv_heads);
+        params.head_dim  = static_cast<uint32_t>(head_dim);
+        params.page_size_tokens  = static_cast<uint32_t>(page_size_tokens);
+        params.elements_per_page = static_cast<uint32_t>(page_size_tokens * kv_heads * head_dim);
+        params.apply_causal = apply_causal ? 1u : 0u;
+        params.inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        [enc setBytes:&params length:sizeof(params) atIndex:8];
+
+        constexpr uint32_t T = 32;
+        size_t tg_floats = head_dim + 2 * T * head_dim + T + head_dim;
+        [enc setThreadgroupMemoryLength:tg_floats * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(batch * num_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)q_buf; (void)k_pages_buf; (void)v_pages_buf; (void)o_buf;
+    (void)page_tables_flat; (void)page_table_offsets; (void)seq_lens; (void)q_positions;
+    (void)batch; (void)num_heads; (void)kv_heads; (void)head_dim;
+    (void)page_size_tokens; (void)apply_causal;
+    return false;
+}
+
+bool MetalExecutor::encodeScatterKVPagedBatched(void* page_storage_buffer,
+                                                const std::vector<uint32_t>& page_ids,
+                                                const std::vector<uint32_t>& slots_in_page,
+                                                size_t page_size_tokens,
+                                                size_t n_kv_heads,
+                                                size_t head_dim,
+                                                size_t batch,
+                                                const void* src_buffer) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->scatterKVPagedBatchedF16Pipeline) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        // Per-call upload of the page_ids and slots_in_page arrays via
+        // cached buffers. NOTE: same cache slot reused across calls; safe
+        // because each call reads its own bytes after upload, before next
+        // call writes.
+        id<MTLBuffer> pageIdsBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+            "kv_page_ids", batch * sizeof(uint32_t));
+        id<MTLBuffer> slotsBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+            "kv_slots", batch * sizeof(uint32_t));
+        if (!pageIdsBuf || !slotsBuf) return false;
+        std::memcpy([pageIdsBuf contents], page_ids.data(), batch * sizeof(uint32_t));
+        std::memcpy([slotsBuf contents], slots_in_page.data(), batch * sizeof(uint32_t));
+
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->scatterKVPagedBatchedF16Pipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)(void*)src_buffer offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)page_storage_buffer offset:0 atIndex:1];
+        [enc setBuffer:pageIdsBuf  offset:0 atIndex:2];
+        [enc setBuffer:slotsBuf    offset:0 atIndex:3];
+        struct ParamsHost {
+            uint32_t head_dim; uint32_t n_kv_heads; uint32_t page_size_tokens;
+            uint32_t batch; uint32_t elements_per_page;
+        } params;
+        params.head_dim          = static_cast<uint32_t>(head_dim);
+        params.n_kv_heads        = static_cast<uint32_t>(n_kv_heads);
+        params.page_size_tokens  = static_cast<uint32_t>(page_size_tokens);
+        params.batch             = static_cast<uint32_t>(batch);
+        params.elements_per_page = static_cast<uint32_t>(page_size_tokens * n_kv_heads * head_dim);
+        [enc setBytes:&params length:sizeof(params) atIndex:4];
+
+        size_t total = batch * n_kv_heads * head_dim;
+        NSUInteger tw = impl_->scatterKVPagedBatchedF16Pipeline.threadExecutionWidth;
+        if (tw == 0) tw = 32;
+        NSUInteger tg = (total + tw - 1) / tw;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)page_storage_buffer; (void)page_ids; (void)slots_in_page;
+    (void)page_size_tokens; (void)n_kv_heads; (void)head_dim; (void)batch; (void)src_buffer;
+    return false;
+}
+
+// ===========================================================================
 // Phase I2 (continuous batching v2) — batched paged-KV scatter.
 // ===========================================================================
 

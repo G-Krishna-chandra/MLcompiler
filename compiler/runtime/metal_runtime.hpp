@@ -458,6 +458,80 @@ public:
                              size_t row_stride,
                              std::vector<float>& output) const;
 
+    // ===========================================================================
+    // Phase J1 — encode-to-buffer variants of the batched kernels.
+    //
+    // These take MTLBuffer pointers (void*) for inputs/outputs and assume
+    // an open forward-pass CB (via beginForwardPassCB). They encode the
+    // dispatch onto that CB and DO NOT commit. The caller must
+    // flushForwardPassCB() to complete + wait + read final outputs.
+    //
+    // The walker chains these together so intermediate state stays GPU-
+    // resident across ops (no CPU roundtrip), and one CB carries all
+    // ~660 dispatches for one batched forward pass.
+    // ===========================================================================
+
+    bool encodeRmsNormBatched(void* in_buf,
+                              const std::vector<float>& weight,
+                              float epsilon,
+                              size_t batch,
+                              size_t length,
+                              void* out_buf) const;
+
+    bool encodeMatMulQ4_0Batched(const std::string& weight_name,
+                                  const std::vector<uint8_t>& weights,
+                                  void* in_buf,         // [batch * cols] fp32
+                                  size_t batch,
+                                  size_t rows,
+                                  size_t cols,
+                                  size_t row_stride,
+                                  uint32_t quant_version,
+                                  void* out_buf) const; // [batch * rows] fp32
+
+    bool encodeMatMulQ6KBatched(const std::string& weight_name,
+                                 const std::vector<uint8_t>& weights,
+                                 void* in_buf,
+                                 size_t batch,
+                                 size_t rows,
+                                 size_t cols,
+                                 size_t row_stride,
+                                 void* out_buf) const;
+
+    // Element-wise batched Add: out[i] = a[i] + b[i] for total elements.
+    bool encodeAddBatched(void* a_buf, void* b_buf, void* out_buf,
+                          size_t total_elements) const;
+
+    // Element-wise batched SiLU * mul: out[i] = silu(gate[i]) * up[i].
+    bool encodeSiluMulBatched(void* gate_buf, void* up_buf, void* out_buf,
+                              size_t total_elements) const;
+
+    // Paged flash attention as encode-onto-shared-CB. Inputs same as
+    // runPagedFlashAttention; doesn't commit.
+    bool encodePagedFlashAttention(void* q_buf,
+                                   void* k_pages_buf,
+                                   void* v_pages_buf,
+                                   void* o_buf,
+                                   const std::vector<uint32_t>& page_tables_flat,
+                                   const std::vector<uint32_t>& page_table_offsets,
+                                   const std::vector<uint32_t>& seq_lens,
+                                   const std::vector<uint32_t>& q_positions,
+                                   size_t batch,
+                                   size_t num_heads,
+                                   size_t kv_heads,
+                                   size_t head_dim,
+                                   size_t page_size_tokens,
+                                   bool   apply_causal) const;
+
+    // Paged-KV scatter (multi-request, fp16) onto the shared CB.
+    bool encodeScatterKVPagedBatched(void* page_storage_buffer,
+                                     const std::vector<uint32_t>& page_ids,
+                                     const std::vector<uint32_t>& slots_in_page,
+                                     size_t page_size_tokens,
+                                     size_t n_kv_heads,
+                                     size_t head_dim,
+                                     size_t batch,
+                                     const void* src_buffer) const;
+
     // Phase B2b (continuous batching) — looped Q4_0 mat-vec for N requests.
     // input is shape [batch, cols] (row n at offset n*cols); output is
     // [batch, rows]. Internally dispatches the existing q4_0 v2/v3 kernel
