@@ -204,10 +204,14 @@ void BatchedWalker::op_attention(const std::vector<ExecutionContext*>& ctxs,
     auto& metal = MetalExecutor::Instance();
     auto* storage = exec_.paged_storage_;
 
-    // Per-request: read q, k, v from contexts; rope-rotate q and k; pack q;
-    // scatter k, v into paged storage at the request's slot for this layer.
+    // I4: gather Q, K (per-request) into batched buffers; one GPU rope
+    // dispatch for Q and one for K; then scatter K + V into paged storage.
     std::vector<float> q_batch(N * num_heads_ * head_dim_, 0.0f);
-    std::vector<uint16_t> kv_scratch_f16(kv_heads_ * head_dim_);
+    std::vector<float> k_batch(N * kv_heads_  * head_dim_, 0.0f);
+    std::vector<float> v_batch(N * kv_heads_  * head_dim_, 0.0f);
+    std::vector<float> cos_table(N * (rotary_dim_ ? rotary_dim_ / 2 : 0), 0.0f);
+    std::vector<float> sin_table = cos_table;
+
     for (size_t r = 0; r < N; ++r) {
         const std::string q_name = "blk." + std::to_string(layer_idx) + ".attn_q.out";
         const std::string k_name = "blk." + std::to_string(layer_idx) + ".attn_k.out";
@@ -216,47 +220,57 @@ void BatchedWalker::op_attention(const std::vector<ExecutionContext*>& ctxs,
         const auto* kt = ctxs[r]->getTensor(k_name);
         const auto* vt = ctxs[r]->getTensor(v_name);
         if (!qt || !kt || !vt) continue;
-
-        // Make local copies so we can rotate without touching context tensors.
-        std::vector<float> q_local(qt->begin(), qt->end());
-        std::vector<float> k_local(kt->begin(), kt->end());
-        std::vector<float> v_local(vt->begin(), vt->end());
-
+        std::copy(qt->begin(), qt->end(), q_batch.begin() + r * num_heads_ * head_dim_);
+        std::copy(kt->begin(), kt->end(), k_batch.begin() + r * kv_heads_  * head_dim_);
+        std::copy(vt->begin(), vt->end(), v_batch.begin() + r * kv_heads_  * head_dim_);
         if (rotary_dim_ > 0) {
             std::vector<float> cos, sin;
             computeRotaryCoefficients(slots[r].sequence_position, rotary_dim_,
                                       rope_base_, rope_scale_, cos, sin);
-            for (size_t h = 0; h < num_heads_; ++h) {
-                applyRotaryEmbedding(q_local.data() + h * head_dim_,
-                                     cos, sin, head_dim_, rotary_dim_);
-            }
-            for (size_t h = 0; h < kv_heads_; ++h) {
-                applyRotaryEmbedding(k_local.data() + h * head_dim_,
-                                     cos, sin, head_dim_, rotary_dim_);
-            }
+            size_t pairs = rotary_dim_ / 2;
+            std::copy(cos.begin(), cos.begin() + pairs, cos_table.begin() + r * pairs);
+            std::copy(sin.begin(), sin.begin() + pairs, sin_table.begin() + r * pairs);
         }
+    }
 
-        std::copy(q_local.begin(), q_local.end(),
-                  q_batch.begin() + r * num_heads_ * head_dim_);
+    // RoPE for Q and K. Per-batch CPU is faster than GPU at the demo
+    // batch sizes — each rotation is ~10 µs and the GPU dispatch overhead
+    // (upload+dispatch+download) is ~100 µs. For larger batch sizes (N>=16)
+    // the GPU rope kernel (runBatchedRope, kept in MetalExecutor) wins.
+    if (rotary_dim_ > 0) {
+        for (size_t r = 0; r < N; ++r) {
+            size_t pairs = rotary_dim_ / 2;
+            std::vector<float> cos(cos_table.begin() + r * pairs,
+                                   cos_table.begin() + (r + 1) * pairs);
+            std::vector<float> sin(sin_table.begin() + r * pairs,
+                                   sin_table.begin() + (r + 1) * pairs);
+            for (size_t h = 0; h < num_heads_; ++h)
+                applyRotaryEmbedding(q_batch.data() + (r * num_heads_ + h) * head_dim_,
+                                     cos, sin, head_dim_, rotary_dim_);
+            for (size_t h = 0; h < kv_heads_; ++h)
+                applyRotaryEmbedding(k_batch.data() + (r * kv_heads_ + h) * head_dim_,
+                                     cos, sin, head_dim_, rotary_dim_);
+        }
+    }
 
-        // Scatter K (rotated) and V into paged storage.
+    // Scatter K (rotated) and V into paged storage per request.
+    std::vector<uint16_t> kv_scratch_f16(kv_heads_ * head_dim_);
+    for (size_t r = 0; r < N; ++r) {
         std::vector<uint32_t> single_pt = {page_ids[r]};
         size_t kv_elems = kv_heads_ * head_dim_;
-        castF32toF16(k_local.data(), kv_scratch_f16.data(), kv_elems);
-        void* k_src = metal.allocateScratchBuffer(kv_elems * sizeof(uint16_t));
+        castF32toF16(k_batch.data() + r * kv_elems, kv_scratch_f16.data(), kv_elems);
+        void* k_src = metal.getOrAllocCachedBuffer("kv_scatter_src",
+                                                   kv_elems * sizeof(uint16_t));
+        if (!k_src) continue;
         metal.uploadToBuffer(k_src, kv_scratch_f16.data(), kv_elems * sizeof(uint16_t));
         metal.scatterKVPaged(storage->k_buffer(layer_idx), single_pt,
                              storage->page_size_tokens(), kv_heads_, head_dim_,
                              /*tokens=*/1, slot_ids[r], k_src, /*dtype_bytes=*/2);
-        metal.releaseScratchBuffer(k_src);
-
-        castF32toF16(v_local.data(), kv_scratch_f16.data(), kv_elems);
-        void* v_src = metal.allocateScratchBuffer(kv_elems * sizeof(uint16_t));
-        metal.uploadToBuffer(v_src, kv_scratch_f16.data(), kv_elems * sizeof(uint16_t));
+        castF32toF16(v_batch.data() + r * kv_elems, kv_scratch_f16.data(), kv_elems);
+        metal.uploadToBuffer(k_src, kv_scratch_f16.data(), kv_elems * sizeof(uint16_t));
         metal.scatterKVPaged(storage->v_buffer(layer_idx), single_pt,
                              storage->page_size_tokens(), kv_heads_, head_dim_,
-                             /*tokens=*/1, slot_ids[r], v_src, /*dtype_bytes=*/2);
-        metal.releaseScratchBuffer(v_src);
+                             /*tokens=*/1, slot_ids[r], k_src, /*dtype_bytes=*/2);
     }
 
     // Build batched paged-flash inputs.
@@ -367,9 +381,21 @@ void BatchedWalker::op_lm_head(const std::vector<ExecutionContext*>& ctxs,
     size_t cols = static_cast<size_t>(info.shape[0]);
     size_t row_stride = raw.size() / rows;
     uint32_t qv = loader.quantizationVersion();
-    (void)qv;
 
     auto& metal = MetalExecutor::Instance();
+
+    // I3: batched Q6_K when shape fits and the model uses Q6_K (TinyLlama).
+    if (info.dtype == frontend::GGML_TYPE_Q6_K &&
+        cols >= 64 && (rows % 4u == 0u)) {
+        gather(ctxs, in_name, cols, scratch_a_);
+        if (metal.runMatMulQ6KBatched(head_name, raw, scratch_a_, N, rows, cols,
+                                      row_stride, scratch_b_)) {
+            scatter(ctxs, out_name, rows, scratch_b_);
+            return;
+        }
+    }
+
+    // Fallback: per-request loop (original path).
     for (size_t r = 0; r < N; ++r) {
         const auto* in = ctxs[r]->getTensor(in_name);
         if (!in) continue;

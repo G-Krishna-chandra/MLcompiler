@@ -273,6 +273,46 @@ struct KVWriteParams {
     uint base_pos;
 };
 
+// Phase I4 (continuous batching v2): batched RoPE kernel.
+// Rotates a [batch, n_heads, head_dim] tensor in place using per-request
+// position. cos/sin tables computed host-side per (request, dim_pair) and
+// uploaded as a flat array. Each thread handles one (req, head, pair) and
+// rotates the (2*pair, 2*pair+1) component of the head vector.
+struct BatchedRopeParams {
+    uint batch;
+    uint n_heads;
+    uint head_dim;
+    uint rotary_dim;
+};
+kernel void batched_rope(
+    device       float* data       [[buffer(0)]],   // [batch, n_heads, head_dim]
+    device const float* cos_table  [[buffer(1)]],   // [batch, rotary_dim/2]
+    device const float* sin_table  [[buffer(2)]],   // [batch, rotary_dim/2]
+    constant BatchedRopeParams& p  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint pairs = p.rotary_dim / 2u;
+    uint total = p.batch * p.n_heads * pairs;
+    if (gid >= total) return;
+
+    uint pair_idx = gid % pairs;
+    uint tmp      = gid / pairs;
+    uint head_idx = tmp % p.n_heads;
+    uint req_idx  = tmp / p.n_heads;
+
+    uint head_off = (req_idx * p.n_heads + head_idx) * p.head_dim;
+    uint c_off    = req_idx * pairs + pair_idx;
+
+    float c = cos_table[c_off];
+    float s = sin_table[c_off];
+
+    uint i0 = head_off + 2u * pair_idx;
+    uint i1 = head_off + 2u * pair_idx + 1u;
+    float x0 = data[i0];
+    float x1 = data[i1];
+    data[i0] = x0 * c - x1 * s;
+    data[i1] = x0 * s + x1 * c;
+}
+
 // Phase A2 (continuous batching): paged KV gather kernel.
 // Reads K or V from a paged storage buffer using a request's page table
 // and writes a contiguous [n_kv_heads, num_tokens, head_dim] output.
@@ -1451,6 +1491,92 @@ kernel void q6_k_matmul_v3(
     }
 }
 
+// Phase I3 (continuous batching v2): batched 4-row-per-simdgroup Q6_K
+// mat-vec. Mirrors the q4_0_matmul_v3_batched template — adds batch
+// dimension. Single dispatch handles all N requests against the lm_head
+// Q6_K weight matrix.
+struct Q6KBatchedParams {
+    uint rows;
+    uint cols;
+    uint row_stride;
+    uint batch;
+};
+kernel void q6_k_matmul_v3_batched(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant Q6KBatchedParams& params [[buffer(3)]],
+    uint  tgid      [[threadgroup_position_in_grid]],
+    uint  lane_idx  [[thread_index_in_simdgroup]]) {
+    uint row_blocks = (params.rows + 3u) / 4u;
+    uint req_idx = tgid / row_blocks;
+    uint quad_idx = tgid % row_blocks;
+    if (req_idx >= params.batch) return;
+    uint row_base = quad_idx * 4u;
+    if (row_base >= params.rows) return;
+
+    const uint block_size = 210u;
+    uint cols   = params.cols;
+    uint stride = params.row_stride;
+
+    const device uchar* rp[4];
+    bool active[4];
+    #pragma unroll
+    for (uint i = 0u; i < 4u; ++i) {
+        active[i] = (row_base + i < params.rows);
+        rp[i] = active[i] ? weights + (row_base + i) * stride : nullptr;
+    }
+
+    device const float* req_input  = input + req_idx * cols;
+    device       float* req_output = output + req_idx * params.rows;
+
+    float p[4] = {0,0,0,0};
+
+    for (uint c = lane_idx; c < cols; c += 32u) {
+        uint b           = c / 256u;
+        uint offset      = c % 256u;
+        uint half_idx    = offset / 128u;
+        uint after_half  = offset % 128u;
+        uint quarter     = after_half / 32u;
+        uint l           = after_half % 32u;
+        uint ql_off = half_idx * 64u + l + ((quarter & 1u) ? 32u : 0u);
+        uint qh_off = half_idx * 32u + l;
+        uint scale_idx = half_idx * 8u + quarter * 2u + (l / 16u);
+        float x = req_input[c];
+        uint blk_byte = b * block_size;
+
+        #pragma unroll
+        for (uint i = 0u; i < 4u; ++i) {
+            if (!active[i]) continue;
+            const device uchar* block = rp[i] + blk_byte;
+            const device uchar* ql    = block;
+            const device uchar* qh    = block + 128;
+            const device int8_t* sc   = reinterpret_cast<const device int8_t*>(block + 192);
+            const device half*  d_ptr = reinterpret_cast<const device half*>(block + 208);
+            float d = static_cast<float>(d_ptr[0]);
+            uchar ql_byte = ql[ql_off];
+            uint  ql_nibble = (quarter < 2u) ? (uint)(ql_byte & 0xFu)
+                                             : (uint)((ql_byte >> 4) & 0xFu);
+            uchar qh_byte = qh[qh_off];
+            uint  qh_bits = (uint)((qh_byte >> (quarter * 2u)) & 0x3u);
+            int q = static_cast<int>(ql_nibble | (qh_bits << 4)) - 32;
+            float scale = static_cast<float>(sc[scale_idx]);
+            p[i] += d * scale * static_cast<float>(q) * x;
+        }
+    }
+
+    #pragma unroll
+    for (uint i = 0u; i < 4u; ++i) {
+        p[i] = simd_sum(p[i]);
+    }
+    if (lane_idx == 0u) {
+        #pragma unroll
+        for (uint i = 0u; i < 4u; ++i) {
+            if (active[i]) req_output[row_base + i] = p[i];
+        }
+    }
+}
+
 kernel void q6_k_matmul_transposed(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -2195,11 +2321,13 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> q6KMatmulPipeline = nil;
     id<MTLComputePipelineState> q6KMatmulPipelineV2 = nil;
     id<MTLComputePipelineState> q6KMatmulPipelineV3 = nil;
+    id<MTLComputePipelineState> q6KMatmulPipelineV3Batched = nil;
     id<MTLComputePipelineState> q6KMatmulTransposedPipeline = nil;
     id<MTLComputePipelineState> q8KMatmulPipeline = nil;
     id<MTLComputePipelineState> q8_0MatmulPipeline = nil;
     id<MTLComputePipelineState> q8_1MatmulPipeline = nil;
     id<MTLComputePipelineState> rotaryPipeline = nil;
+    id<MTLComputePipelineState> batchedRopePipeline = nil;
     id<MTLComputePipelineState> dequantQ4Pipeline = nil;
     id<MTLComputePipelineState> dequantQ8Pipeline = nil;
     id<MTLComputePipelineState> dequantQ4_1Pipeline = nil;
@@ -2609,11 +2737,13 @@ struct MetalExecutor::Impl {
                 q6KMatmulPipeline = buildPipeline(@"q6_k_matmul");
                 q6KMatmulPipelineV2 = buildPipeline(@"q6_k_matmul_v2");
                 q6KMatmulPipelineV3 = buildPipeline(@"q6_k_matmul_v3");
+                q6KMatmulPipelineV3Batched = buildPipeline(@"q6_k_matmul_v3_batched");
                 q6KMatmulTransposedPipeline = buildPipeline(@"q6_k_matmul_transposed");
                 q8KMatmulPipeline = buildPipeline(@"q8_k_matmul");
                 q8_0MatmulPipeline = buildPipeline(@"q8_0_matmul");
                 q8_1MatmulPipeline = buildPipeline(@"q8_1_matmul");
                 rotaryPipeline = buildPipeline(@"apply_rotary_batch");
+                batchedRopePipeline = buildPipeline(@"batched_rope");
                 dequantQ4Pipeline = buildPipeline(@"dequant_q4_0_block");
                 dequantQ8Pipeline = buildPipeline(@"dequant_q8_0_block");
                 dequantQ4_1Pipeline = buildPipeline(@"dequant_q4_1_block");
@@ -6666,6 +6796,135 @@ bool MetalExecutor::hasKVWriteKernel() const {
 
 bool MetalExecutor::hasDequantQKKernel() const {
     return impl_ && impl_->available() && impl_->dequantQKPipeline != nil;
+}
+
+// ===========================================================================
+// Phase I4 (continuous batching v2) — batched RoPE.
+// ===========================================================================
+
+bool MetalExecutor::runBatchedRope(void* data_buffer,
+                                   const std::vector<float>& cos_table,
+                                   const std::vector<float>& sin_table,
+                                   size_t batch,
+                                   size_t n_heads,
+                                   size_t head_dim,
+                                   size_t rotary_dim) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->batchedRopePipeline) return false;
+    if (!data_buffer || batch == 0 || n_heads == 0 || head_dim == 0) return false;
+    if (rotary_dim == 0 || rotary_dim > head_dim) return false;
+    size_t pairs = rotary_dim / 2;
+    if (cos_table.size() != batch * pairs || sin_table.size() != batch * pairs) return false;
+
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            id<MTLBuffer> dataBuf = (__bridge id<MTLBuffer>)data_buffer;
+            size_t table_bytes = cos_table.size() * sizeof(float);
+            id<MTLBuffer> cosBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "rope_cos", table_bytes);
+            id<MTLBuffer> sinBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "rope_sin", table_bytes);
+            if (!cosBuf || !sinBuf) return false;
+            std::memcpy([cosBuf contents], cos_table.data(), table_bytes);
+            std::memcpy([sinBuf contents], sin_table.data(), table_bytes);
+
+            id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+            [enc setComputePipelineState:impl_->batchedRopePipeline];
+            [enc setBuffer:dataBuf offset:0 atIndex:0];
+            [enc setBuffer:cosBuf  offset:0 atIndex:1];
+            [enc setBuffer:sinBuf  offset:0 atIndex:2];
+            struct ParamsHost {
+                uint32_t batch; uint32_t n_heads;
+                uint32_t head_dim; uint32_t rotary_dim;
+            } params;
+            params.batch = static_cast<uint32_t>(batch);
+            params.n_heads = static_cast<uint32_t>(n_heads);
+            params.head_dim = static_cast<uint32_t>(head_dim);
+            params.rotary_dim = static_cast<uint32_t>(rotary_dim);
+            [enc setBytes:&params length:sizeof(params) atIndex:3];
+            size_t total = batch * n_heads * pairs;
+            NSUInteger tw = impl_->batchedRopePipeline.threadExecutionWidth;
+            if (tw == 0) tw = 32;
+            NSUInteger tg = (total + tw - 1) / tw;
+            if (tg == 0) tg = 1;
+            [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            return cb.status == MTLCommandBufferStatusCompleted;
+        }
+    }
+#endif
+    (void)data_buffer; (void)cos_table; (void)sin_table;
+    (void)batch; (void)n_heads; (void)head_dim; (void)rotary_dim;
+    return false;
+}
+
+// ===========================================================================
+// Phase I3 (continuous batching v2) — batched Q6_K mat-vec for lm_head.
+// ===========================================================================
+
+bool MetalExecutor::runMatMulQ6KBatched(const std::string& weight_name,
+                                        const std::vector<uint8_t>& weights,
+                                        const std::vector<float>& input,
+                                        size_t batch,
+                                        size_t rows,
+                                        size_t cols,
+                                        size_t row_stride,
+                                        std::vector<float>& output) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->q6KMatmulPipelineV3Batched) return false;
+    if (batch == 0 || rows == 0 || cols == 0) return false;
+    if (input.size() != batch * cols) return false;
+    if (weights.size() < row_stride * rows) return false;
+    output.assign(batch * rows, 0.0f);
+
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            id<MTLBuffer> wBuf = impl_->getOrCacheWeight(weight_name, weights);
+            if (!wBuf) return false;
+            size_t in_bytes  = batch * cols * sizeof(float);
+            size_t out_bytes = batch * rows * sizeof(float);
+            id<MTLBuffer> inBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "q6_matmul_in", in_bytes);
+            id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "q6_matmul_out", out_bytes);
+            if (!inBuf || !outBuf) return false;
+            std::memcpy([inBuf contents], input.data(), in_bytes);
+
+            id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+            [enc setComputePipelineState:impl_->q6KMatmulPipelineV3Batched];
+            [enc setBuffer:wBuf   offset:0 atIndex:0];
+            [enc setBuffer:inBuf  offset:0 atIndex:1];
+            [enc setBuffer:outBuf offset:0 atIndex:2];
+            struct ParamsHost {
+                uint32_t rows; uint32_t cols; uint32_t row_stride; uint32_t batch;
+            } params;
+            params.rows = static_cast<uint32_t>(rows);
+            params.cols = static_cast<uint32_t>(cols);
+            params.row_stride = static_cast<uint32_t>(row_stride);
+            params.batch = static_cast<uint32_t>(batch);
+            [enc setBytes:&params length:sizeof(params) atIndex:3];
+            size_t row_blocks = (rows + 3) / 4;
+            [enc dispatchThreadgroups:MTLSizeMake(batch * row_blocks, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) return false;
+            std::memcpy(output.data(), [outBuf contents], out_bytes);
+            return true;
+        }
+    }
+#endif
+    (void)weight_name; (void)weights; (void)input; (void)batch;
+    (void)rows; (void)cols; (void)row_stride; (void)output;
+    return false;
 }
 
 // ===========================================================================

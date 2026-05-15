@@ -447,6 +447,17 @@ public:
                            size_t length,
                            std::vector<float>& output) const;
 
+    // Phase I3 (continuous batching v2) — batched Q6_K mat-vec for lm_head.
+    // Single dispatch handles all N requests against one Q6_K weight matrix.
+    bool runMatMulQ6KBatched(const std::string& weight_name,
+                             const std::vector<uint8_t>& weights,
+                             const std::vector<float>& input,  // [batch * cols]
+                             size_t batch,
+                             size_t rows,
+                             size_t cols,
+                             size_t row_stride,
+                             std::vector<float>& output) const;
+
     // Phase B2b (continuous batching) — looped Q4_0 mat-vec for N requests.
     // input is shape [batch, cols] (row n at offset n*cols); output is
     // [batch, rows]. Internally dispatches the existing q4_0 v2/v3 kernel
@@ -462,6 +473,18 @@ public:
                               size_t row_stride,
                               uint32_t quant_version,
                               std::vector<float>& output) const;  // [batch, rows]
+
+    // Phase I4 (continuous batching v2) — batched RoPE.
+    // Rotates a [batch, n_heads, head_dim] tensor in place. cos/sin tables
+    // are flat arrays of size [batch * rotary_dim/2] — host-side caller
+    // computes per-request coefficients via computeRotaryCoefficients.
+    bool runBatchedRope(void* data_buffer,            // [batch, n_heads, head_dim] fp32
+                        const std::vector<float>& cos_table,  // [batch, rotary_dim/2]
+                        const std::vector<float>& sin_table,
+                        size_t batch,
+                        size_t n_heads,
+                        size_t head_dim,
+                        size_t rotary_dim) const;
 
     // Phase A2 (continuous batching) — gather K or V from a paged buffer
     // into a contiguous [n_kv_heads, num_tokens, head_dim] output.
