@@ -32,6 +32,7 @@ set(COMPILER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/decode_runner.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/parity_harness.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/paged_kv.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/batched_executor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/model_runner.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/cli_helpers.cpp
 )
@@ -69,6 +70,7 @@ set(COMPILER_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/decode_runner.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/parity_harness.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/paged_kv.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime/batched_executor.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/model_runner.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime/float_convert.hpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/cli_helpers.hpp

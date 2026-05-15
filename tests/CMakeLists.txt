@@ -26,6 +26,7 @@ set(TEST_SOURCES
     test_execution_graph.cpp
     test_ir_pipeline.cpp
     test_paged_kv.cpp
+    test_batched_executor.cpp
 )
 
 # Create test executable
