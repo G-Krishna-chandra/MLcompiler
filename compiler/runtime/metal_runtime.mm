@@ -570,6 +570,103 @@ kernel void q4_0_matmul_v3(
     }
 }
 
+// Phase H5 (continuous batching v2): batched 4-row-per-simdgroup Q4_0
+// mat-vec. Adds a batch dimension to v3's grid: each threadgroup handles
+// (request_idx, row_quad_idx). Same simdgroup pattern as v3 — 32 lanes
+// stride K, simd_sum on 4 partial accumulators per lane, 4 outputs written
+// per threadgroup. One dispatch handles all N requests' work against a
+// single weight matrix.
+//
+// Inputs:
+//   weights: device const uchar* — Q4_0 packed weight matrix [rows, cols]
+//   input:   device const float* — flat [batch * cols] input vectors
+//   output:  device       float* — flat [batch * rows] output vectors
+//   params: rows, cols, row_stride, quant_version, batch
+// Dispatch: ((rows + 3)/4, batch, 1) threadgroups × 32 threads.
+struct Q4_0BatchedParams {
+    uint rows;
+    uint cols;
+    uint row_stride;
+    uint quant_version;
+    uint batch;
+};
+kernel void q4_0_matmul_v3_batched(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant Q4_0BatchedParams& params [[buffer(3)]],
+    uint  tgid      [[threadgroup_position_in_grid]],
+    uint  lane_idx  [[thread_index_in_simdgroup]]) {
+    // 1D grid decomposed: tgid = req_idx * row_blocks + row_quad_idx.
+    uint row_blocks = (params.rows + 3u) / 4u;
+    uint req_idx = tgid / row_blocks;
+    uint quad_idx = tgid % row_blocks;
+    if (req_idx >= params.batch) return;
+
+    uint row_base = quad_idx * 4u;
+    if (row_base >= params.rows) return;
+
+    const uint block_size = 18u;
+    uint cols   = params.cols;
+    uint stride = params.row_stride;
+
+    const device uchar* r0 = weights + (row_base + 0u) * stride;
+    const device uchar* r1 = (row_base + 1u < params.rows) ? weights + (row_base + 1u) * stride : nullptr;
+    const device uchar* r2 = (row_base + 2u < params.rows) ? weights + (row_base + 2u) * stride : nullptr;
+    const device uchar* r3 = (row_base + 3u < params.rows) ? weights + (row_base + 3u) * stride : nullptr;
+
+    device const float* req_input = input + req_idx * cols;
+    device       float* req_output = output + req_idx * params.rows;
+
+    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+    for (uint c = lane_idx; c < cols; c += 32u) {
+        uint block_idx = c / 32u;
+        uint in_block  = c % 32u;
+        uint byte_off  = (in_block < 16u) ? in_block : (in_block - 16u);
+        bool high_nib  = (in_block >= 16u);
+        float x = req_input[c];
+
+        const device uchar* b0 = r0 + block_idx * block_size;
+        float d0 = static_cast<float>(*reinterpret_cast<const device half*>(b0));
+        uchar byte0 = b0[2 + byte_off];
+        int q0 = static_cast<int>(high_nib ? ((byte0 >> 4) & 0x0F) : (byte0 & 0x0F)) - 8;
+        p0 += d0 * static_cast<float>(q0) * x;
+
+        if (r1) {
+            const device uchar* b1 = r1 + block_idx * block_size;
+            float d1 = static_cast<float>(*reinterpret_cast<const device half*>(b1));
+            uchar byte1 = b1[2 + byte_off];
+            int q1 = static_cast<int>(high_nib ? ((byte1 >> 4) & 0x0F) : (byte1 & 0x0F)) - 8;
+            p1 += d1 * static_cast<float>(q1) * x;
+        }
+        if (r2) {
+            const device uchar* b2 = r2 + block_idx * block_size;
+            float d2 = static_cast<float>(*reinterpret_cast<const device half*>(b2));
+            uchar byte2 = b2[2 + byte_off];
+            int q2 = static_cast<int>(high_nib ? ((byte2 >> 4) & 0x0F) : (byte2 & 0x0F)) - 8;
+            p2 += d2 * static_cast<float>(q2) * x;
+        }
+        if (r3) {
+            const device uchar* b3 = r3 + block_idx * block_size;
+            float d3 = static_cast<float>(*reinterpret_cast<const device half*>(b3));
+            uchar byte3 = b3[2 + byte_off];
+            int q3 = static_cast<int>(high_nib ? ((byte3 >> 4) & 0x0F) : (byte3 & 0x0F)) - 8;
+            p3 += d3 * static_cast<float>(q3) * x;
+        }
+    }
+
+    p0 = simd_sum(p0);
+    p1 = simd_sum(p1);
+    p2 = simd_sum(p2);
+    p3 = simd_sum(p3);
+    if (lane_idx == 0u) {
+        req_output[row_base + 0u] = p0;
+        if (r1) req_output[row_base + 1u] = p1;
+        if (r2) req_output[row_base + 2u] = p2;
+        if (r3) req_output[row_base + 3u] = p3;
+    }
+}
+
 kernel void q4_0_matmul_transposed(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -2086,6 +2183,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> q4MatmulPipeline = nil;
     id<MTLComputePipelineState> q4MatmulPipelineV2 = nil;
     id<MTLComputePipelineState> q4MatmulPipelineV3 = nil;
+    id<MTLComputePipelineState> q4MatmulPipelineV3Batched = nil;
     id<MTLComputePipelineState> q4MatmulTransposedPipeline = nil;
     id<MTLComputePipelineState> q4_1MatmulPipeline = nil;
     id<MTLComputePipelineState> q5_0MatmulPipeline = nil;
@@ -2493,6 +2591,7 @@ struct MetalExecutor::Impl {
                 q4MatmulPipeline = buildPipeline(@"q4_0_matmul");
                 q4MatmulPipelineV2 = buildPipeline(@"q4_0_matmul_v2");
                 q4MatmulPipelineV3 = buildPipeline(@"q4_0_matmul_v3");
+                q4MatmulPipelineV3Batched = buildPipeline(@"q4_0_matmul_v3_batched");
                 q4MatmulTransposedPipeline = buildPipeline(@"q4_0_matmul_transposed");
                 q4_1MatmulPipeline = buildPipeline(@"q4_1_matmul");
                 q5_0MatmulPipeline = buildPipeline(@"q5_0_matmul");
@@ -6589,9 +6688,50 @@ bool MetalExecutor::runMatMulQ4_0Batched(const std::string& weight_name,
             id<MTLBuffer> weightBuffer = impl_->getOrCacheWeight(weight_name, weights);
             if (!weightBuffer) return false;
 
-            // One CB + one encoder; N dispatches into it. Pipeline state +
-            // weight buffer set once; per-request input/output buffers
-            // rebound per dispatch.
+            // H5: prefer the truly-batched v3 kernel when shape fits — one
+            // dispatch handles all N requests in a single grid spanning
+            // (batch * row_blocks) threadgroups.
+            const bool use_v3_batched = impl_->q4MatmulPipelineV3Batched != nil
+                                     && cols >= 64 && (rows % 4u == 0u);
+            if (use_v3_batched) {
+                size_t in_bytes  = batch * cols * sizeof(float);
+                size_t out_bytes = batch * rows * sizeof(float);
+                id<MTLBuffer> inBuf = [impl_->device newBufferWithBytes:input.data()
+                                                                  length:in_bytes
+                                                                 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> outBuf = [impl_->device newBufferWithLength:out_bytes
+                                                                   options:MTLResourceStorageModeShared];
+                if (!inBuf || !outBuf) return false;
+
+                id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                if (!enc) return false;
+                [enc setComputePipelineState:impl_->q4MatmulPipelineV3Batched];
+                [enc setBuffer:weightBuffer offset:0 atIndex:0];
+                [enc setBuffer:inBuf        offset:0 atIndex:1];
+                [enc setBuffer:outBuf       offset:0 atIndex:2];
+                struct ParamsHost {
+                    uint32_t rows; uint32_t cols; uint32_t row_stride;
+                    uint32_t quant_version; uint32_t batch;
+                } params;
+                params.rows          = static_cast<uint32_t>(rows);
+                params.cols          = static_cast<uint32_t>(cols);
+                params.row_stride    = static_cast<uint32_t>(row_stride);
+                params.quant_version = quant_version;
+                params.batch         = static_cast<uint32_t>(batch);
+                [enc setBytes:&params length:sizeof(params) atIndex:3];
+                size_t row_blocks = (rows + 3) / 4;
+                [enc dispatchThreadgroups:MTLSizeMake(batch * row_blocks, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [enc endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                if (cb.status != MTLCommandBufferStatusCompleted) return false;
+                std::memcpy(output.data(), [outBuf contents], out_bytes);
+                return true;
+            }
+
+            // Fall through to looped path (per-request dispatch in shared encoder).
             id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             if (!enc) return false;

@@ -1,5 +1,6 @@
 #include "runtime/batched_executor.hpp"
 
+#include "runtime/batched_walker.hpp"
 #include "runtime/execution_plan_builder.hpp"
 #include "runtime/kernel_registry.hpp"
 #include "runtime/operator_backend.hpp"
@@ -183,6 +184,12 @@ BatchedDecodeOutput BatchedExecutor::run_decode_paged_impl(
         // Fall back to the non-paged sequential path.
         return run_decode(slots);
     }
+
+    // H3: when paged storage is attached, dispatch through BatchedWalker
+    // (op-by-op batched). Each request's per-op work is gathered into a
+    // [N, dim] dispatch instead of N sequential per-request executor calls.
+    BatchedWalker walker(*this);
+    return walker.step(slots);
 
     cache_topology();
     const size_t N = slots.size();
