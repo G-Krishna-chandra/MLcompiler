@@ -270,6 +270,56 @@ kernel void q4_0_matmul(
     output[gid] = acc;
 }
 
+// Q4_0 mat-vec v2 (Sink 3 / commit E1). Same per-row Q4_0 dequant +
+// dot-product as v1, but parallelized: 1 simdgroup per output row,
+// 32 lanes split the K dimension via stride, simd_sum reduces lane
+// partials. v1 was a single thread per row doing all cols serially;
+// v2 cuts per-row latency by ~32x worth of parallelism (modulo dispatch
+// overhead). Dispatch: rows threadgroups × 32 threads.
+kernel void q4_0_matmul_v2(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant Q4_0Params& params [[buffer(3)]],
+    uint  tg_x      [[threadgroup_position_in_grid]],
+    uint  lane_idx  [[thread_index_in_simdgroup]]) {
+    uint row = tg_x;
+    if (row >= params.rows) return;
+
+    const device uchar* row_ptr = weights + row * params.row_stride;
+    const uint block_size = 18u;       // Q4_0: 2-byte fp16 scale + 16 bytes nibbles
+    uint cols = params.cols;
+
+    float partial = 0.0f;
+    // Stride-32 across K. Each thread handles cols/32 elements.
+    for (uint c = lane_idx; c < cols; c += 32u) {
+        uint block_idx = c / 32u;
+        uint in_block  = c % 32u;
+        const device uchar* block = row_ptr + block_idx * block_size;
+        float d = static_cast<float>(*reinterpret_cast<const device half*>(block));
+        const device uchar* qs = block + 2;
+        // Match v1's nibble unpack convention (kernel q4_0_matmul, lines 261-265):
+        //   element j      → low nibble of byte j
+        //   element j + 16 → high nibble of byte j
+        uchar byte;
+        int q;
+        if (in_block < 16u) {
+            byte = qs[in_block];
+            q = static_cast<int>(byte & 0x0F);
+        } else {
+            byte = qs[in_block - 16u];
+            q = static_cast<int>((byte >> 4) & 0x0F);
+        }
+        q -= 8;
+        partial += d * static_cast<float>(q) * input[c];
+    }
+
+    partial = simd_sum(partial);
+    if (lane_idx == 0u) {
+        output[row] = partial;
+    }
+}
+
 kernel void q4_0_matmul_transposed(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -1500,6 +1550,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> layerNormPipeline = nil;
     id<MTLComputePipelineState> softmaxPipeline = nil;
     id<MTLComputePipelineState> q4MatmulPipeline = nil;
+    id<MTLComputePipelineState> q4MatmulPipelineV2 = nil;
     id<MTLComputePipelineState> q4MatmulTransposedPipeline = nil;
     id<MTLComputePipelineState> q4_1MatmulPipeline = nil;
     id<MTLComputePipelineState> q5_0MatmulPipeline = nil;
@@ -1744,6 +1795,7 @@ struct MetalExecutor::Impl {
                 layerNormPipeline = buildPipeline(@"layer_norm_kernel");
                 softmaxPipeline = buildPipeline(@"vector_softmax");
                 q4MatmulPipeline = buildPipeline(@"q4_0_matmul");
+                q4MatmulPipelineV2 = buildPipeline(@"q4_0_matmul_v2");
                 q4MatmulTransposedPipeline = buildPipeline(@"q4_0_matmul_transposed");
                 q4_1MatmulPipeline = buildPipeline(@"q4_1_matmul");
                 q5_0MatmulPipeline = buildPipeline(@"q5_0_matmul");
@@ -2900,6 +2952,55 @@ bool matmulQ4_0(const std::string& weight_name,
                 uint32_t quant_version,
                 const std::vector<float>* bias,
                 std::vector<float>& output) const {
+#if defined(__APPLE__)
+    // Prefer v2 (simd_sum reduction): 1 simdgroup per output row, 32 lanes
+    // split the K dimension via stride. v1 (single thread per row, serial K
+    // loop) kept as defensive fallback for cols < 64 where stride-32 has
+    // < 2 cols/lane and the per-call overhead would swamp any compute win.
+    if (q4MatmulPipelineV2 != nil && cols >= 64 && available()) {
+        if (input.size() != cols) return false;
+        if (weights.size() < row_stride * rows) return false;
+        if (@available(macOS 11.0, *)) {
+            @autoreleasepool {
+                id<MTLBuffer> weightBuffer = getOrCacheWeight(weight_name, weights);
+                id<MTLBuffer> inputBuffer = [device newBufferWithBytes:input.data()
+                                                                length:input.size() * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+                id<MTLBuffer> outputBuffer = [device newBufferWithLength:rows * sizeof(float)
+                                                                  options:MTLResourceStorageModeShared];
+                if (!weightBuffer || !inputBuffer || !outputBuffer) return false;
+
+                id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                if (!encoder) return false;
+                [encoder setComputePipelineState:q4MatmulPipelineV2];
+                [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+                [encoder setBuffer:inputBuffer offset:0 atIndex:1];
+                [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+                Q4_0ParamsNative params = {static_cast<uint32_t>(rows),
+                                           static_cast<uint32_t>(cols),
+                                           static_cast<uint32_t>(row_stride),
+                                           quant_version};
+                [encoder setBytes:&params length:sizeof(Q4_0ParamsNative) atIndex:3];
+                [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                [encoder endEncoding];
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+
+                bool ok = commandBuffer.status == MTLCommandBufferStatusCompleted;
+                output.resize(rows);
+                std::memcpy(output.data(), [outputBuffer contents], rows * sizeof(float));
+                if (bias && !bias->empty()) {
+                    for (size_t i = 0; i < rows && i < bias->size(); ++i) {
+                        output[i] += (*bias)[i];
+                    }
+                }
+                return ok;
+            }
+        }
+    }
+#endif
     return matmulQuant(weight_name, weights, input, rows, cols, row_stride, quant_version,
                        q4MatmulPipeline, bias, output);
 }
@@ -5093,7 +5194,8 @@ bool MetalExecutor::encodeMatMulQ4_0FromHost(const std::string& weight_name,
         if (!weightBuffer || !inputBuffer) return false;
         id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
-        [encoder setComputePipelineState:impl_->q4MatmulPipeline];
+        const bool use_v2 = impl_->q4MatmulPipelineV2 != nil && cols >= 64;
+        [encoder setComputePipelineState:(use_v2 ? impl_->q4MatmulPipelineV2 : impl_->q4MatmulPipeline)];
         [encoder setBuffer:weightBuffer offset:0 atIndex:0];
         [encoder setBuffer:inputBuffer offset:0 atIndex:1];
         [encoder setBuffer:outBuf offset:0 atIndex:2];
@@ -5102,12 +5204,18 @@ bool MetalExecutor::encodeMatMulQ4_0FromHost(const std::string& weight_name,
                                    static_cast<uint32_t>(row_stride),
                                    quant_version};
         [encoder setBytes:&params length:sizeof(Q4_0ParamsNative) atIndex:3];
-        NSUInteger threadsPerGroup = impl_->q4MatmulPipeline.threadExecutionWidth;
-        if (threadsPerGroup == 0) threadsPerGroup = 32;
-        NSUInteger groups = (rows + threadsPerGroup - 1) / threadsPerGroup;
-        if (groups == 0) groups = 1;
-        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        if (use_v2) {
+            // v2: 1 simdgroup (32 threads) per output row.
+            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        } else {
+            NSUInteger threadsPerGroup = impl_->q4MatmulPipeline.threadExecutionWidth;
+            if (threadsPerGroup == 0) threadsPerGroup = 32;
+            NSUInteger groups = (rows + threadsPerGroup - 1) / threadsPerGroup;
+            if (groups == 0) groups = 1;
+            [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        }
         [encoder endEncoding];
         impl_->pass_retained_.push_back(inputBuffer);
         impl_->recordReadback(outBuf, host_dst, rows * sizeof(float), needs_host);
@@ -5143,7 +5251,8 @@ bool MetalExecutor::encodeMatMulQ4_0FromBuffer(const std::string& weight_name,
         if (!weightBuffer) return false;
         id<MTLComputeCommandEncoder> encoder = [impl_->open_forward_pass_cb_ computeCommandEncoder];
         if (!encoder) return false;
-        [encoder setComputePipelineState:impl_->q4MatmulPipeline];
+        const bool use_v2 = impl_->q4MatmulPipelineV2 != nil && cols >= 64;
+        [encoder setComputePipelineState:(use_v2 ? impl_->q4MatmulPipelineV2 : impl_->q4MatmulPipeline)];
         [encoder setBuffer:weightBuffer offset:0 atIndex:0];
         [encoder setBuffer:inputBuf offset:0 atIndex:1];
         [encoder setBuffer:outBuf offset:0 atIndex:2];
@@ -5152,12 +5261,17 @@ bool MetalExecutor::encodeMatMulQ4_0FromBuffer(const std::string& weight_name,
                                    static_cast<uint32_t>(row_stride),
                                    quant_version};
         [encoder setBytes:&params length:sizeof(Q4_0ParamsNative) atIndex:3];
-        NSUInteger threadsPerGroup = impl_->q4MatmulPipeline.threadExecutionWidth;
-        if (threadsPerGroup == 0) threadsPerGroup = 32;
-        NSUInteger groups = (rows + threadsPerGroup - 1) / threadsPerGroup;
-        if (groups == 0) groups = 1;
-        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        if (use_v2) {
+            [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        } else {
+            NSUInteger threadsPerGroup = impl_->q4MatmulPipeline.threadExecutionWidth;
+            if (threadsPerGroup == 0) threadsPerGroup = 32;
+            NSUInteger groups = (rows + threadsPerGroup - 1) / threadsPerGroup;
+            if (groups == 0) groups = 1;
+            [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        }
         [encoder endEncoding];
         impl_->recordReadback(outBuf, host_dst, rows * sizeof(float), needs_host);
         return true;
