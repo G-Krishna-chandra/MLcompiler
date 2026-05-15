@@ -388,6 +388,41 @@ struct KVScatterPagedParams {
     uint elements_per_page;  // = page_size_tokens * n_kv_heads * head_dim
 };
 
+// Phase I2-adjacent (continuous batching v2): multi-request paged scatter.
+// Writes ONE new K/V row per request into per-request (page_id, slot_in_page)
+// destinations. Single dispatch handles all N requests for one tensor (K or V).
+//
+// Source layout: [batch, n_kv_heads, head_dim] of half — one row per request.
+// Per-request destination: page_ids[r], slots_in_page[r].
+struct KVScatterPagedBatchedParams {
+    uint head_dim;
+    uint n_kv_heads;
+    uint page_size_tokens;
+    uint batch;
+    uint elements_per_page;  // page_size_tokens * n_kv_heads * head_dim
+};
+
+kernel void scatter_kv_paged_batched_f16(
+    device const half* src [[buffer(0)]],            // [batch, n_kv_heads, head_dim]
+    device       half* page_storage [[buffer(1)]],
+    constant uint* page_ids [[buffer(2)]],            // [batch]
+    constant uint* slots_in_page [[buffer(3)]],       // [batch]
+    constant KVScatterPagedBatchedParams& p [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.batch * p.n_kv_heads * p.head_dim;
+    if (gid >= total) return;
+    uint dim   = gid % p.head_dim;
+    uint tmp   = gid / p.head_dim;
+    uint kv    = tmp % p.n_kv_heads;
+    uint req   = tmp / p.n_kv_heads;
+    uint page_id = page_ids[req];
+    uint slot    = slots_in_page[req];
+    uint dst_idx = page_id * p.elements_per_page +
+                   slot * (p.n_kv_heads * p.head_dim) +
+                   kv * p.head_dim + dim;
+    page_storage[dst_idx] = src[gid];
+}
+
 kernel void scatter_kv_paged_f16(
     device const half* src [[buffer(0)]],
     device       half* page_storage [[buffer(1)]],
@@ -2341,6 +2376,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> gatherKVPagesF32Pipeline = nil;
     id<MTLComputePipelineState> scatterKVPagedF16Pipeline = nil;
     id<MTLComputePipelineState> scatterKVPagedF32Pipeline = nil;
+    id<MTLComputePipelineState> scatterKVPagedBatchedF16Pipeline = nil;
     id<MTLComputePipelineState> flashAttentionPipeline = nil;
     id<MTLComputePipelineState> pagedFlashAttentionPipeline = nil;
     id<MTLComputePipelineState> castF16toF32Pipeline = nil;
@@ -2757,6 +2793,7 @@ struct MetalExecutor::Impl {
                 gatherKVPagesF32Pipeline = buildPipeline(@"gather_kv_pages_f32");
                 scatterKVPagedF16Pipeline = buildPipeline(@"scatter_kv_paged_f16");
                 scatterKVPagedF32Pipeline = buildPipeline(@"scatter_kv_paged_f32");
+                scatterKVPagedBatchedF16Pipeline = buildPipeline(@"scatter_kv_paged_batched_f16");
                 flashAttentionPipeline = buildPipeline(@"flash_attention_v1");
                 pagedFlashAttentionPipeline = buildPipeline(@"paged_flash_attention");
                 castF16toF32Pipeline = buildPipeline(@"cast_f16_to_f32");
@@ -6796,6 +6833,75 @@ bool MetalExecutor::hasKVWriteKernel() const {
 
 bool MetalExecutor::hasDequantQKKernel() const {
     return impl_ && impl_->available() && impl_->dequantQKPipeline != nil;
+}
+
+// ===========================================================================
+// Phase I2 (continuous batching v2) — batched paged-KV scatter.
+// ===========================================================================
+
+bool MetalExecutor::scatterKVPagedBatched(void* page_storage_buffer,
+                                          const std::vector<uint32_t>& page_ids,
+                                          const std::vector<uint32_t>& slots_in_page,
+                                          size_t page_size_tokens,
+                                          size_t n_kv_heads,
+                                          size_t head_dim,
+                                          size_t batch,
+                                          const void* src_buffer) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->scatterKVPagedBatchedF16Pipeline) return false;
+    if (!page_storage_buffer || !src_buffer) return false;
+    if (batch == 0 || n_kv_heads == 0 || head_dim == 0 || page_size_tokens == 0) return false;
+    if (page_ids.size() != batch || slots_in_page.size() != batch) return false;
+
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            id<MTLBuffer> storageBuf = (__bridge id<MTLBuffer>)page_storage_buffer;
+            id<MTLBuffer> srcBuf     = (__bridge id<MTLBuffer>)(void*)src_buffer;
+
+            id<MTLBuffer> pageIdsBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "kv_page_ids", batch * sizeof(uint32_t));
+            id<MTLBuffer> slotsBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "kv_slots", batch * sizeof(uint32_t));
+            if (!pageIdsBuf || !slotsBuf) return false;
+            std::memcpy([pageIdsBuf contents], page_ids.data(), batch * sizeof(uint32_t));
+            std::memcpy([slotsBuf contents], slots_in_page.data(), batch * sizeof(uint32_t));
+
+            id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+            [enc setComputePipelineState:impl_->scatterKVPagedBatchedF16Pipeline];
+            [enc setBuffer:srcBuf       offset:0 atIndex:0];
+            [enc setBuffer:storageBuf   offset:0 atIndex:1];
+            [enc setBuffer:pageIdsBuf   offset:0 atIndex:2];
+            [enc setBuffer:slotsBuf     offset:0 atIndex:3];
+            struct ParamsHost {
+                uint32_t head_dim; uint32_t n_kv_heads; uint32_t page_size_tokens;
+                uint32_t batch; uint32_t elements_per_page;
+            } params;
+            params.head_dim          = static_cast<uint32_t>(head_dim);
+            params.n_kv_heads        = static_cast<uint32_t>(n_kv_heads);
+            params.page_size_tokens  = static_cast<uint32_t>(page_size_tokens);
+            params.batch             = static_cast<uint32_t>(batch);
+            params.elements_per_page = static_cast<uint32_t>(page_size_tokens * n_kv_heads * head_dim);
+            [enc setBytes:&params length:sizeof(params) atIndex:4];
+
+            size_t total = batch * n_kv_heads * head_dim;
+            NSUInteger tw = impl_->scatterKVPagedBatchedF16Pipeline.threadExecutionWidth;
+            if (tw == 0) tw = 32;
+            NSUInteger tg = (total + tw - 1) / tw;
+            if (tg == 0) tg = 1;
+            [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            return cb.status == MTLCommandBufferStatusCompleted;
+        }
+    }
+#endif
+    (void)page_storage_buffer; (void)page_ids; (void)slots_in_page;
+    (void)page_size_tokens; (void)n_kv_heads; (void)head_dim; (void)batch; (void)src_buffer;
+    return false;
 }
 
 // ===========================================================================

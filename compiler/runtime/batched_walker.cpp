@@ -257,24 +257,32 @@ void BatchedWalker::op_attention(const std::vector<ExecutionContext*>& ctxs,
         }
     }
 
-    // Scatter K (rotated) and V into paged storage per request.
-    std::vector<uint16_t> kv_scratch_f16(kv_heads_ * head_dim_);
-    for (size_t r = 0; r < N; ++r) {
-        std::vector<uint32_t> single_pt = {page_ids[r]};
-        size_t kv_elems = kv_heads_ * head_dim_;
-        castF32toF16(k_batch.data() + r * kv_elems, kv_scratch_f16.data(), kv_elems);
-        void* k_src = metal.getOrAllocCachedBuffer("kv_scatter_src",
-                                                   kv_elems * sizeof(uint16_t));
-        if (!k_src) continue;
-        metal.uploadToBuffer(k_src, kv_scratch_f16.data(), kv_elems * sizeof(uint16_t));
-        metal.scatterKVPaged(storage->k_buffer(layer_idx), single_pt,
-                             storage->page_size_tokens(), kv_heads_, head_dim_,
-                             /*tokens=*/1, slot_ids[r], k_src, /*dtype_bytes=*/2);
-        castF32toF16(v_batch.data() + r * kv_elems, kv_scratch_f16.data(), kv_elems);
-        metal.uploadToBuffer(k_src, kv_scratch_f16.data(), kv_elems * sizeof(uint16_t));
-        metal.scatterKVPaged(storage->v_buffer(layer_idx), single_pt,
-                             storage->page_size_tokens(), kv_heads_, head_dim_,
-                             /*tokens=*/1, slot_ids[r], k_src, /*dtype_bytes=*/2);
+    // Scatter K (rotated) and V into paged storage. I2: batched scatter —
+    // one dispatch handles all N requests for K, one for V (instead of
+    // 2 × N per-request dispatches).
+    {
+        size_t kv_elems = N * kv_heads_ * head_dim_;
+        size_t kv_bytes = kv_elems * sizeof(uint16_t);
+        std::vector<uint16_t> k_f16(kv_elems), v_f16(kv_elems);
+        castF32toF16(k_batch.data(), k_f16.data(), kv_elems);
+        castF32toF16(v_batch.data(), v_f16.data(), kv_elems);
+
+        void* k_src = metal.getOrAllocCachedBuffer("kv_scatter_src_k", kv_bytes);
+        void* v_src = metal.getOrAllocCachedBuffer("kv_scatter_src_v", kv_bytes);
+        if (k_src && v_src) {
+            metal.uploadToBuffer(k_src, k_f16.data(), kv_bytes);
+            metal.uploadToBuffer(v_src, v_f16.data(), kv_bytes);
+            std::vector<uint32_t> page_ids_v(page_ids.begin(), page_ids.begin() + N);
+            std::vector<uint32_t> slot_ids_v(slot_ids.begin(), slot_ids.begin() + N);
+            metal.scatterKVPagedBatched(storage->k_buffer(layer_idx),
+                                        page_ids_v, slot_ids_v,
+                                        storage->page_size_tokens(),
+                                        kv_heads_, head_dim_, N, k_src);
+            metal.scatterKVPagedBatched(storage->v_buffer(layer_idx),
+                                        page_ids_v, slot_ids_v,
+                                        storage->page_size_tokens(),
+                                        kv_heads_, head_dim_, N, v_src);
+        }
     }
 
     // Build batched paged-flash inputs.

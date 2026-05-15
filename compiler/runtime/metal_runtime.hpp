@@ -554,6 +554,19 @@ public:
                         const void* src_buffer,
                         size_t dtype_bytes) const;
 
+    // Phase I2 — multi-request paged scatter. One dispatch writes one new
+    // K (or V) row per request to its (page_id[r], slot_in_page[r])
+    // destination. fp16 only.
+    // src_buffer layout: [batch, n_kv_heads, head_dim] of half.
+    bool scatterKVPagedBatched(void* page_storage_buffer,
+                               const std::vector<uint32_t>& page_ids,
+                               const std::vector<uint32_t>& slots_in_page,
+                               size_t page_size_tokens,
+                               size_t n_kv_heads,
+                               size_t head_dim,
+                               size_t batch,
+                               const void* src_buffer) const;
+
     // Phase A2 — minimal test helpers for paged-KV unit tests. allocateScratchBuffer
     // returns a fresh shared-storage MTLBuffer of `bytes` bytes (or nullptr).
     // upload/download wrap memcpy to/from contents() for the buffer. Safe to use
