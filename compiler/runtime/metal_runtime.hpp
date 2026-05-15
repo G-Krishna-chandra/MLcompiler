@@ -436,6 +436,17 @@ public:
                       size_t row_stride,
                       std::vector<float>& dst) const;
 
+    // Phase B2a (continuous batching) — batched RMSNorm. input/output have
+    // shape [batch, length] (row-major: row n at offset n*length); weight is
+    // a single [length] vector applied to every row. Each row is normed
+    // independently by its own threadgroup; one dispatch handles all rows.
+    bool runRmsNormBatched(const std::vector<float>& input,
+                           const std::vector<float>& weight,
+                           float epsilon,
+                           size_t batch,
+                           size_t length,
+                           std::vector<float>& output) const;
+
     // Phase A2 (continuous batching) — gather K or V from a paged buffer
     // into a contiguous [n_kv_heads, num_tokens, head_dim] output.
     //

@@ -158,6 +158,56 @@ kernel void rms_norm_kernel_v2(
     }
 }
 
+// RMSNorm batched (Phase B2a — continuous batching). Same per-row reduction
+// as rms_norm_kernel_v2 but each threadgroup picks its row from
+// threadgroup_position_in_grid. Dispatch: batch threadgroups × 256 threads.
+// input/output: [batch, length] float, row n at offset n*length.
+// weight: shared [length] across all rows.
+kernel void rms_norm_kernel_v2_batched(
+    device const float* input    [[buffer(0)]],
+    device const float* weight   [[buffer(1)]],
+    device       float* output   [[buffer(2)]],
+    constant uint&     length    [[buffer(3)]],
+    constant float&    epsilon   [[buffer(4)]],
+    threadgroup float* shmem     [[threadgroup(0)]],
+    uint  row_idx   [[threadgroup_position_in_grid]],
+    uint  tid_local [[thread_position_in_threadgroup]],
+    uint  sg_idx    [[simdgroup_index_in_threadgroup]],
+    uint  lane_idx  [[thread_index_in_simdgroup]],
+    uint  ntg       [[threads_per_threadgroup]]) {
+    if (length == 0) return;
+
+    device const float* row_in  = input  + row_idx * length;
+    device       float* row_out = output + row_idx * length;
+
+    float sumf = 0.0f;
+    for (uint i = tid_local; i < length; i += ntg) {
+        float v = row_in[i];
+        sumf += v * v;
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane_idx == 0u) shmem[sg_idx] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_idx == 0u) {
+        uint num_sg = ntg / 32u;
+        sumf = (lane_idx < num_sg) ? shmem[lane_idx] : 0.0f;
+        sumf = simd_sum(sumf);
+        if (lane_idx == 0u) {
+            float mean = sumf / static_cast<float>(length);
+            shmem[0] = rsqrt(mean + epsilon);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = shmem[0];
+
+    for (uint i = tid_local; i < length; i += ntg) {
+        float gamma = weight[i];
+        row_out[i] = row_in[i] * scale * gamma;
+    }
+}
+
 kernel void layer_norm_kernel(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],
@@ -1883,6 +1933,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> addResidualPipeline = nil;
     id<MTLComputePipelineState> normPipeline = nil;
     id<MTLComputePipelineState> normPipelineV2 = nil;
+    id<MTLComputePipelineState> normPipelineV2Batched = nil;
     id<MTLComputePipelineState> layerNormPipeline = nil;
     id<MTLComputePipelineState> softmaxPipeline = nil;
     id<MTLComputePipelineState> q4MatmulPipeline = nil;
@@ -2288,6 +2339,7 @@ struct MetalExecutor::Impl {
                 addResidualPipeline = buildPipeline(@"add_residual_bias");
                 normPipeline = buildPipeline(@"rms_norm_kernel");
                 normPipelineV2 = buildPipeline(@"rms_norm_kernel_v2");
+                normPipelineV2Batched = buildPipeline(@"rms_norm_kernel_v2_batched");
                 layerNormPipeline = buildPipeline(@"layer_norm_kernel");
                 softmaxPipeline = buildPipeline(@"vector_softmax");
                 q4MatmulPipeline = buildPipeline(@"q4_0_matmul");
@@ -6360,6 +6412,69 @@ bool MetalExecutor::hasKVWriteKernel() const {
 
 bool MetalExecutor::hasDequantQKKernel() const {
     return impl_ && impl_->available() && impl_->dequantQKPipeline != nil;
+}
+
+// ===========================================================================
+// Phase B2a (continuous batching) — batched RMSNorm.
+// ===========================================================================
+
+bool MetalExecutor::runRmsNormBatched(const std::vector<float>& input,
+                                      const std::vector<float>& weight,
+                                      float epsilon,
+                                      size_t batch,
+                                      size_t length,
+                                      std::vector<float>& output) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available()) return false;
+    if (batch == 0 || length == 0) return false;
+    if (input.size() != batch * length) return false;
+    if (weight.size() != length) return false;
+    if (length > std::numeric_limits<uint32_t>::max()) return false;
+    if (!impl_->normPipelineV2Batched) return false;
+
+    output.assign(batch * length, 0.0f);
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            size_t in_bytes  = input.size() * sizeof(float);
+            size_t w_bytes   = weight.size() * sizeof(float);
+            size_t out_bytes = output.size() * sizeof(float);
+
+            id<MTLBuffer> inBuf = [impl_->device newBufferWithBytes:input.data()
+                                                             length:in_bytes
+                                                            options:MTLResourceStorageModeShared];
+            id<MTLBuffer> wBuf  = [impl_->device newBufferWithBytes:weight.data()
+                                                             length:w_bytes
+                                                            options:MTLResourceStorageModeShared];
+            id<MTLBuffer> outBuf = [impl_->device newBufferWithLength:out_bytes
+                                                              options:MTLResourceStorageModeShared];
+            if (!inBuf || !wBuf || !outBuf) return false;
+
+            id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+            [enc setComputePipelineState:impl_->normPipelineV2Batched];
+            [enc setBuffer:inBuf  offset:0 atIndex:0];
+            [enc setBuffer:wBuf   offset:0 atIndex:1];
+            [enc setBuffer:outBuf offset:0 atIndex:2];
+            uint32_t length32 = static_cast<uint32_t>(length);
+            [enc setBytes:&length32 length:sizeof(uint32_t) atIndex:3];
+            float eps = epsilon;
+            [enc setBytes:&eps length:sizeof(float) atIndex:4];
+            // Threadgroup memory: one float per simdgroup (8 simdgroups @ 256 threads).
+            [enc setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(batch, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status != MTLCommandBufferStatusCompleted) return false;
+            std::memcpy(output.data(), [outBuf contents], out_bytes);
+            return true;
+        }
+    }
+#endif
+    (void)input; (void)weight; (void)epsilon; (void)batch; (void)length; (void)output;
+    return false;
 }
 
 // ===========================================================================
