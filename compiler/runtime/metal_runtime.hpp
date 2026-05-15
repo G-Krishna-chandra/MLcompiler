@@ -456,6 +456,22 @@ public:
                        void* dst_buffer,
                        size_t dtype_bytes) const;
 
+    // Phase A3 (continuous batching) — paged scatter. Writes K or V from a
+    // contiguous source buffer with layout [n_kv_heads, tokens, head_dim]
+    // into the paged storage. The destination slot for token t is page
+    // (start_slot + t) / page_size_tokens, slot (start_slot + t) %
+    // page_size_tokens. Caller must size page_table to cover the write
+    // range. dtype_bytes must be 2 (fp16) or 4 (fp32).
+    bool scatterKVPaged(void* page_storage_buffer,
+                        const std::vector<uint32_t>& page_table,
+                        size_t page_size_tokens,
+                        size_t n_kv_heads,
+                        size_t head_dim,
+                        size_t tokens,
+                        size_t start_slot,
+                        const void* src_buffer,
+                        size_t dtype_bytes) const;
+
     // Phase A2 — minimal test helpers for paged-KV unit tests. allocateScratchBuffer
     // returns a fresh shared-storage MTLBuffer of `bytes` bytes (or nullptr).
     // upload/download wrap memcpy to/from contents() for the buffer. Safe to use

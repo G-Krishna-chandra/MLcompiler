@@ -279,6 +279,71 @@ kernel void gather_kv_pages_f32(
     dst[gid] = page_storage[src_off];
 }
 
+// Phase A3 (continuous batching): paged KV scatter.
+// Writes K or V into a paged storage buffer using a request's page table.
+// Source layout: [n_kv_heads, tokens, head_dim] of half/float (matches the
+// existing K/V projection output shape that the contiguous scatter_kv kernel
+// already consumes).
+// Destination: paged storage with token-major within page
+//   [page i bytes][page_size_tokens, n_kv_heads, head_dim]
+// page_table covers the write range; absolute_slot = start_slot + token, then
+// page_idx = absolute_slot / page_size_tokens. Caller must size page_table to
+// cover (start_slot + tokens) destinations.
+struct KVScatterPagedParams {
+    uint head_dim;
+    uint n_kv_heads;
+    uint page_size_tokens;
+    uint tokens;
+    uint start_slot;
+    uint elements_per_page;  // = page_size_tokens * n_kv_heads * head_dim
+};
+
+kernel void scatter_kv_paged_f16(
+    device const half* src [[buffer(0)]],
+    device       half* page_storage [[buffer(1)]],
+    constant uint* page_table [[buffer(2)]],
+    constant KVScatterPagedParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.head_dim * p.n_kv_heads * p.tokens;
+    if (gid >= total) return;
+    uint dim   = gid % p.head_dim;
+    uint tmp   = gid / p.head_dim;
+    uint token = tmp % p.tokens;
+    uint kv    = tmp / p.tokens;
+    uint absolute_slot = p.start_slot + token;
+    uint page_idx = absolute_slot / p.page_size_tokens;
+    uint slot     = absolute_slot % p.page_size_tokens;
+    uint page_id  = page_table[page_idx];
+    uint dst_idx  = page_id * p.elements_per_page +
+                    slot * p.n_kv_heads * p.head_dim +
+                    kv * p.head_dim +
+                    dim;
+    page_storage[dst_idx] = src[gid];
+}
+
+kernel void scatter_kv_paged_f32(
+    device const float* src [[buffer(0)]],
+    device       float* page_storage [[buffer(1)]],
+    constant uint* page_table [[buffer(2)]],
+    constant KVScatterPagedParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.head_dim * p.n_kv_heads * p.tokens;
+    if (gid >= total) return;
+    uint dim   = gid % p.head_dim;
+    uint tmp   = gid / p.head_dim;
+    uint token = tmp % p.tokens;
+    uint kv    = tmp / p.tokens;
+    uint absolute_slot = p.start_slot + token;
+    uint page_idx = absolute_slot / p.page_size_tokens;
+    uint slot     = absolute_slot % p.page_size_tokens;
+    uint page_id  = page_table[page_idx];
+    uint dst_idx  = page_id * p.elements_per_page +
+                    slot * p.n_kv_heads * p.head_dim +
+                    kv * p.head_dim +
+                    dim;
+    page_storage[dst_idx] = src[gid];
+}
+
 kernel void scatter_kv(
     device const float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],
@@ -1850,6 +1915,8 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> kvWritePipeline = nil;
     id<MTLComputePipelineState> gatherKVPagesF16Pipeline = nil;
     id<MTLComputePipelineState> gatherKVPagesF32Pipeline = nil;
+    id<MTLComputePipelineState> scatterKVPagedF16Pipeline = nil;
+    id<MTLComputePipelineState> scatterKVPagedF32Pipeline = nil;
     id<MTLComputePipelineState> flashAttentionPipeline = nil;
     id<MTLComputePipelineState> castF16toF32Pipeline = nil;
     id<MTLComputePipelineState> sliceF32Pipeline = nil;
@@ -2253,6 +2320,8 @@ struct MetalExecutor::Impl {
                 kvWritePipeline = buildPipeline(@"scatter_kv");
                 gatherKVPagesF16Pipeline = buildPipeline(@"gather_kv_pages_f16");
                 gatherKVPagesF32Pipeline = buildPipeline(@"gather_kv_pages_f32");
+                scatterKVPagedF16Pipeline = buildPipeline(@"scatter_kv_paged_f16");
+                scatterKVPagedF32Pipeline = buildPipeline(@"scatter_kv_paged_f32");
                 flashAttentionPipeline = buildPipeline(@"flash_attention_v1");
                 castF16toF32Pipeline = buildPipeline(@"cast_f16_to_f32");
                 sliceF32Pipeline = buildPipeline(@"slice_f32");
@@ -6370,6 +6439,86 @@ bool MetalExecutor::gatherKVPages(void* page_storage_buffer,
     (void)page_storage_buffer; (void)page_table; (void)page_size_tokens;
     (void)n_kv_heads; (void)head_dim; (void)num_tokens; (void)dst_buffer;
     (void)dtype_bytes;
+    return false;
+}
+
+bool MetalExecutor::scatterKVPaged(void* page_storage_buffer,
+                                   const std::vector<uint32_t>& page_table,
+                                   size_t page_size_tokens,
+                                   size_t n_kv_heads,
+                                   size_t head_dim,
+                                   size_t tokens,
+                                   size_t start_slot,
+                                   const void* src_buffer,
+                                   size_t dtype_bytes) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available()) return false;
+    if (!page_storage_buffer || !src_buffer) return false;
+    if (page_size_tokens == 0 || n_kv_heads == 0 || head_dim == 0 || tokens == 0) return false;
+    if (dtype_bytes != 2 && dtype_bytes != 4) return false;
+    if (start_slot >= page_size_tokens) return false;
+    size_t end_slot_exclusive = start_slot + tokens;
+    size_t needed_pages = (end_slot_exclusive + page_size_tokens - 1) / page_size_tokens;
+    if (page_table.size() < needed_pages) return false;
+
+    id<MTLComputePipelineState> pipe = (dtype_bytes == 2)
+        ? impl_->scatterKVPagedF16Pipeline
+        : impl_->scatterKVPagedF32Pipeline;
+    if (!pipe) return false;
+
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            id<MTLBuffer> storageBuf = (__bridge id<MTLBuffer>)page_storage_buffer;
+            id<MTLBuffer> srcBuf     = (__bridge id<MTLBuffer>)(void*)src_buffer;
+            id<MTLBuffer> pageTableBuf =
+                [impl_->device newBufferWithBytes:page_table.data()
+                                           length:page_table.size() * sizeof(uint32_t)
+                                          options:MTLResourceStorageModeShared];
+            if (!pageTableBuf) return false;
+
+            id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!enc) return false;
+
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:srcBuf       offset:0 atIndex:0];
+            [enc setBuffer:storageBuf   offset:0 atIndex:1];
+            [enc setBuffer:pageTableBuf offset:0 atIndex:2];
+
+            struct ScatterPagedParamsHost {
+                uint32_t head_dim;
+                uint32_t n_kv_heads;
+                uint32_t page_size_tokens;
+                uint32_t tokens;
+                uint32_t start_slot;
+                uint32_t elements_per_page;
+            } params;
+            params.head_dim          = static_cast<uint32_t>(head_dim);
+            params.n_kv_heads        = static_cast<uint32_t>(n_kv_heads);
+            params.page_size_tokens  = static_cast<uint32_t>(page_size_tokens);
+            params.tokens            = static_cast<uint32_t>(tokens);
+            params.start_slot        = static_cast<uint32_t>(start_slot);
+            params.elements_per_page = static_cast<uint32_t>(page_size_tokens * n_kv_heads * head_dim);
+            [enc setBytes:&params length:sizeof(params) atIndex:3];
+
+            size_t total_elems = n_kv_heads * tokens * head_dim;
+            NSUInteger threadWidth = pipe.threadExecutionWidth;
+            if (threadWidth == 0) threadWidth = 32;
+            NSUInteger threadgroups = (total_elems + threadWidth - 1) / threadWidth;
+            if (threadgroups == 0) threadgroups = 1;
+
+            [enc dispatchThreadgroups:MTLSizeMake(threadgroups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            return cb.status == MTLCommandBufferStatusCompleted;
+        }
+    }
+#endif
+    (void)page_storage_buffer; (void)page_table; (void)page_size_tokens;
+    (void)n_kv_heads; (void)head_dim; (void)tokens; (void)start_slot;
+    (void)src_buffer; (void)dtype_bytes;
     return false;
 }
 

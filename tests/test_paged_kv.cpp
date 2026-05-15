@@ -372,6 +372,200 @@ TEST(GatherKVPages, F16_RoundTrips) {
     exec.releaseScratchBuffer(dst);
 }
 
+// =====================================================================
+// Phase A3: scatter_kv_paged round-trips against gather_kv_pages.
+// =====================================================================
+
+namespace {
+
+// Build a contiguous K (or V) "projection output" with shape
+// [n_kv_heads, tokens, head_dim] following a deterministic per-element
+// pattern for round-trip verification.
+std::vector<float> buildProjOutputFloat(uint32_t n_kv_heads,
+                                        uint32_t tokens,
+                                        uint32_t head_dim,
+                                        float scale = 1.0f) {
+    std::vector<float> out(n_kv_heads * tokens * head_dim);
+    for (uint32_t kv = 0; kv < n_kv_heads; ++kv) {
+        for (uint32_t t = 0; t < tokens; ++t) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                size_t idx = kv * tokens * head_dim + t * head_dim + d;
+                out[idx] = scale * (static_cast<float>(kv) * 1000.f
+                                  + static_cast<float>(t)  * 10.f
+                                  + static_cast<float>(d));
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(ScatterKVPaged, F32_RoundTripWithGather) {
+    auto& exec = MetalExecutor::Instance();
+    if (!exec.isAvailable()) {
+        GTEST_SKIP() << "Metal unavailable on this host";
+    }
+
+    constexpr uint32_t capacity_pages   = 8;
+    constexpr uint32_t page_size_tokens = 8;
+    constexpr uint32_t n_kv_heads       = 4;
+    constexpr uint32_t head_dim         = 16;
+    constexpr uint32_t tokens           = 11;   // spans 2 pages from start_slot=3
+    constexpr uint32_t start_slot       = 3;
+
+    // Page storage zero-initialized.
+    size_t storage_bytes = capacity_pages * page_size_tokens * n_kv_heads * head_dim * sizeof(float);
+    void* storage = exec.allocateScratchBuffer(storage_bytes);
+    ASSERT_NE(storage, nullptr);
+    std::vector<float> zeros(storage_bytes / sizeof(float), 0.f);
+    exec.uploadToBuffer(storage, zeros.data(), storage_bytes);
+
+    // Source projection output and source GPU buffer.
+    auto src_host = buildProjOutputFloat(n_kv_heads, tokens, head_dim);
+    size_t src_bytes = src_host.size() * sizeof(float);
+    void* src_buf = exec.allocateScratchBuffer(src_bytes);
+    ASSERT_NE(src_buf, nullptr);
+    exec.uploadToBuffer(src_buf, src_host.data(), src_bytes);
+
+    // Page table covers writes (start_slot=3, tokens=11) → end_slot_exclusive=14
+    // → ceil(14/8) = 2 pages.
+    std::vector<uint32_t> page_table = {5, 1};
+
+    bool ok = exec.scatterKVPaged(storage, page_table, page_size_tokens,
+                                  n_kv_heads, head_dim, tokens, start_slot,
+                                  src_buf, /*dtype_bytes=*/4);
+    ASSERT_TRUE(ok);
+
+    // Now gather pages [5, 1] starting from slot 0 of page 5 — but our writes
+    // started at slot 3, so the first 3 slots are zero. To verify, gather both
+    // pages fully (16 slots) and check element-wise against the expected layout.
+    // Expected dst[h, t, d] = src_host[h, (t - start_slot if start_slot<=t<start_slot+tokens), d]
+    //                       = 0 otherwise.
+    constexpr uint32_t gather_tokens = 2 * page_size_tokens;  // both pages, full
+    size_t dst_bytes = n_kv_heads * gather_tokens * head_dim * sizeof(float);
+    void* dst_buf = exec.allocateScratchBuffer(dst_bytes);
+    ASSERT_NE(dst_buf, nullptr);
+    bool gok = exec.gatherKVPages(storage, page_table, page_size_tokens,
+                                  n_kv_heads, head_dim, gather_tokens,
+                                  dst_buf, /*dtype_bytes=*/4);
+    ASSERT_TRUE(gok);
+    std::vector<float> dst_host(n_kv_heads * gather_tokens * head_dim);
+    exec.downloadFromBuffer(dst_buf, dst_host.data(), dst_bytes);
+
+    for (uint32_t h = 0; h < n_kv_heads; ++h) {
+        for (uint32_t t = 0; t < gather_tokens; ++t) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float expected = 0.f;
+                if (t >= start_slot && t < start_slot + tokens) {
+                    uint32_t src_t = t - start_slot;
+                    expected = src_host[h * tokens * head_dim + src_t * head_dim + d];
+                }
+                size_t idx = h * gather_tokens * head_dim + t * head_dim + d;
+                EXPECT_FLOAT_EQ(dst_host[idx], expected)
+                    << "h=" << h << " t=" << t << " d=" << d;
+            }
+        }
+    }
+
+    exec.releaseScratchBuffer(storage);
+    exec.releaseScratchBuffer(src_buf);
+    exec.releaseScratchBuffer(dst_buf);
+}
+
+TEST(ScatterKVPaged, F16_RoundTripWithGather) {
+    auto& exec = MetalExecutor::Instance();
+    if (!exec.isAvailable()) {
+        GTEST_SKIP() << "Metal unavailable on this host";
+    }
+
+    constexpr uint32_t capacity_pages   = 8;
+    constexpr uint32_t page_size_tokens = 8;
+    constexpr uint32_t n_kv_heads       = 4;
+    constexpr uint32_t head_dim         = 16;
+    constexpr uint32_t tokens           = 7;
+    constexpr uint32_t start_slot       = 0;
+
+    size_t storage_bytes = capacity_pages * page_size_tokens * n_kv_heads * head_dim * sizeof(uint16_t);
+    void* storage = exec.allocateScratchBuffer(storage_bytes);
+    ASSERT_NE(storage, nullptr);
+    std::vector<uint16_t> zeros(storage_bytes / sizeof(uint16_t), 0);
+    exec.uploadToBuffer(storage, zeros.data(), storage_bytes);
+
+    // Source: small magnitudes for fp16.
+    auto src_host_f32 = buildProjOutputFloat(n_kv_heads, tokens, head_dim, /*scale=*/1e-3f);
+    std::vector<uint16_t> src_host_f16(src_host_f32.size());
+    mlc::runtime::castF32toF16(src_host_f32.data(), src_host_f16.data(), src_host_f32.size());
+    size_t src_bytes = src_host_f16.size() * sizeof(uint16_t);
+    void* src_buf = exec.allocateScratchBuffer(src_bytes);
+    ASSERT_NE(src_buf, nullptr);
+    exec.uploadToBuffer(src_buf, src_host_f16.data(), src_bytes);
+
+    std::vector<uint32_t> page_table = {2};
+    ASSERT_TRUE(exec.scatterKVPaged(storage, page_table, page_size_tokens,
+                                    n_kv_heads, head_dim, tokens, start_slot,
+                                    src_buf, /*dtype_bytes=*/2));
+
+    constexpr uint32_t gather_tokens = page_size_tokens;
+    size_t dst_bytes = n_kv_heads * gather_tokens * head_dim * sizeof(uint16_t);
+    void* dst_buf = exec.allocateScratchBuffer(dst_bytes);
+    ASSERT_NE(dst_buf, nullptr);
+    ASSERT_TRUE(exec.gatherKVPages(storage, page_table, page_size_tokens,
+                                   n_kv_heads, head_dim, gather_tokens,
+                                   dst_buf, /*dtype_bytes=*/2));
+    std::vector<uint16_t> dst_host_f16(n_kv_heads * gather_tokens * head_dim);
+    exec.downloadFromBuffer(dst_buf, dst_host_f16.data(), dst_bytes);
+    std::vector<float> dst_host_f32(dst_host_f16.size());
+    mlc::runtime::castF16toF32(dst_host_f16.data(), dst_host_f32.data(), dst_host_f16.size());
+
+    for (uint32_t h = 0; h < n_kv_heads; ++h) {
+        for (uint32_t t = 0; t < gather_tokens; ++t) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float expected = 0.f;
+                if (t < tokens) {
+                    expected = src_host_f32[h * tokens * head_dim + t * head_dim + d];
+                }
+                size_t idx = h * gather_tokens * head_dim + t * head_dim + d;
+                float tol = std::max(1e-3f, std::abs(expected) * 1e-3f);
+                EXPECT_NEAR(dst_host_f32[idx], expected, tol)
+                    << "h=" << h << " t=" << t << " d=" << d;
+            }
+        }
+    }
+
+    exec.releaseScratchBuffer(storage);
+    exec.releaseScratchBuffer(src_buf);
+    exec.releaseScratchBuffer(dst_buf);
+}
+
+TEST(ScatterKVPaged, RejectsBadArgs) {
+    auto& exec = MetalExecutor::Instance();
+    if (!exec.isAvailable()) {
+        GTEST_SKIP() << "Metal unavailable on this host";
+    }
+    void* dummy = exec.allocateScratchBuffer(1024);
+    void* dummy_src = exec.allocateScratchBuffer(1024);
+    ASSERT_NE(dummy, nullptr);
+    ASSERT_NE(dummy_src, nullptr);
+
+    // start_slot out of range
+    std::vector<uint32_t> pt = {0};
+    EXPECT_FALSE(exec.scatterKVPaged(dummy, pt, /*pgsz=*/8, 4, 16,
+                                     /*tokens=*/1, /*start_slot=*/8,
+                                     dummy_src, 4));
+    // page_table too short
+    EXPECT_FALSE(exec.scatterKVPaged(dummy, pt, /*pgsz=*/8, 4, 16,
+                                     /*tokens=*/12, /*start_slot=*/3,
+                                     dummy_src, 4));
+    // bad dtype
+    EXPECT_FALSE(exec.scatterKVPaged(dummy, pt, /*pgsz=*/8, 4, 16,
+                                     /*tokens=*/4, /*start_slot=*/0,
+                                     dummy_src, 8));
+
+    exec.releaseScratchBuffer(dummy);
+    exec.releaseScratchBuffer(dummy_src);
+}
+
 TEST(GatherKVPages, RejectsOversizedRequest) {
     auto& exec = MetalExecutor::Instance();
     if (!exec.isAvailable()) {
