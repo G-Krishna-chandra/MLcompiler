@@ -2344,6 +2344,12 @@ struct MetalExecutor::Impl {
     // graph; ~half are hot on each token's path).
     mutable std::unordered_map<std::string, id<MTLBuffer>> small_param_cache_;
 
+    // Phase I1: name-keyed persistent scratch buffer cache. One MTLBuffer
+    // per name, grown on demand. Used by the BatchedWalker per-op kernel
+    // calls so each pass doesn't pay newBufferWith{Bytes,Length} overhead.
+    mutable std::unordered_map<std::string, id<MTLBuffer>> kernel_scratch_cache_;
+    mutable std::unordered_map<std::string, size_t> kernel_scratch_bytes_;
+
     // Lever 3 (final-push): per-call persistent attention scratch buffers.
     // Each unique attention output_tensor_name (one per layer) gets its
     // own 5-buffer slot (q, k_batch, v_batch, logits, result). Buffers
@@ -6696,12 +6702,15 @@ bool MetalExecutor::runMatMulQ4_0Batched(const std::string& weight_name,
             if (use_v3_batched) {
                 size_t in_bytes  = batch * cols * sizeof(float);
                 size_t out_bytes = batch * rows * sizeof(float);
-                id<MTLBuffer> inBuf = [impl_->device newBufferWithBytes:input.data()
-                                                                  length:in_bytes
-                                                                 options:MTLResourceStorageModeShared];
-                id<MTLBuffer> outBuf = [impl_->device newBufferWithLength:out_bytes
-                                                                   options:MTLResourceStorageModeShared];
+                // I1: cached scratch buffers — keyed by name to allow growth.
+                // The walker's per-op shapes are stable across passes, so the
+                // first pass primes the cache and subsequent passes reuse.
+                id<MTLBuffer> inBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                    "q4_matmul_in", in_bytes);
+                id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                    "q4_matmul_out", out_bytes);
                 if (!inBuf || !outBuf) return false;
+                std::memcpy([inBuf contents], input.data(), in_bytes);
 
                 id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -6838,15 +6847,16 @@ bool MetalExecutor::runRmsNormBatched(const std::vector<float>& input,
             size_t w_bytes   = weight.size() * sizeof(float);
             size_t out_bytes = output.size() * sizeof(float);
 
-            id<MTLBuffer> inBuf = [impl_->device newBufferWithBytes:input.data()
-                                                             length:in_bytes
-                                                            options:MTLResourceStorageModeShared];
-            id<MTLBuffer> wBuf  = [impl_->device newBufferWithBytes:weight.data()
-                                                             length:w_bytes
-                                                            options:MTLResourceStorageModeShared];
-            id<MTLBuffer> outBuf = [impl_->device newBufferWithLength:out_bytes
-                                                              options:MTLResourceStorageModeShared];
+            // I1: cached scratch — name-keyed, grown on demand.
+            id<MTLBuffer> inBuf  = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "norm_batched_in", in_bytes);
+            id<MTLBuffer> wBuf   = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "norm_batched_w", w_bytes);
+            id<MTLBuffer> outBuf = (__bridge id<MTLBuffer>)getOrAllocCachedBuffer(
+                "norm_batched_out", out_bytes);
             if (!inBuf || !wBuf || !outBuf) return false;
+            std::memcpy([inBuf contents], input.data(),  in_bytes);
+            std::memcpy([wBuf contents],  weight.data(), w_bytes);
 
             id<MTLCommandBuffer> cb = [impl_->queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -7139,6 +7149,29 @@ bool MetalExecutor::scatterKVPaged(void* page_storage_buffer,
     (void)n_kv_heads; (void)head_dim; (void)tokens; (void)start_slot;
     (void)src_buffer; (void)dtype_bytes;
     return false;
+}
+
+void* MetalExecutor::getOrAllocCachedBuffer(const char* name, size_t bytes) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || bytes == 0) return nullptr;
+    if (@available(macOS 11.0, *)) {
+        std::string key(name);
+        auto it = impl_->kernel_scratch_cache_.find(key);
+        if (it != impl_->kernel_scratch_cache_.end() &&
+            impl_->kernel_scratch_bytes_[key] >= bytes) {
+            return (__bridge void*)it->second;
+        }
+        // Allocate (or reallocate larger).
+        id<MTLBuffer> buf = [impl_->device newBufferWithLength:bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (!buf) return nullptr;
+        impl_->kernel_scratch_cache_[key] = buf;
+        impl_->kernel_scratch_bytes_[key] = bytes;
+        return (__bridge void*)buf;
+    }
+#endif
+    (void)name; (void)bytes;
+    return nullptr;
 }
 
 void* MetalExecutor::allocateScratchBuffer(size_t bytes) const {

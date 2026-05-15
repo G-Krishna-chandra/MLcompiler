@@ -540,6 +540,13 @@ public:
     void  uploadToBuffer(void* buffer, const void* src, size_t bytes, size_t dst_offset = 0) const;
     void  downloadFromBuffer(const void* buffer, void* dst, size_t bytes, size_t src_offset = 0) const;
 
+    // Phase I1 — name-keyed persistent scratch cache. Returns a buffer of
+    // at least `bytes` bytes; cached for the lifetime of the executor.
+    // First call for a given name allocates; subsequent calls return the
+    // cached pointer. If the cached buffer is smaller than the requested
+    // size, it's reallocated. Caller does NOT free.
+    void* getOrAllocCachedBuffer(const char* name, size_t bytes) const;
+
 private:
     MetalExecutor();
     ~MetalExecutor();
