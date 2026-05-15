@@ -9,10 +9,14 @@
 #include "frontends/ggml_types.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace mlc {
 namespace runtime {
@@ -416,6 +420,35 @@ BatchedDecodeOutput BatchedWalker::step(const std::vector<RequestSlot>& slots) {
     if (slots.empty()) return out;
     cache_shape();
 
+    // Optional per-op profiling. Set MLC_BATCHED_PROFILE=1 to enable.
+    static const bool kProfile = std::getenv("MLC_BATCHED_PROFILE") != nullptr;
+    static std::unordered_map<std::string, double> prof_total;
+    static std::unordered_map<std::string, size_t> prof_count;
+    auto profile = [&](const char* op, std::chrono::steady_clock::time_point t0) {
+        if (!kProfile) return;
+        auto t1 = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        prof_total[op] += ms;
+        prof_count[op] += 1;
+    };
+    auto dump_profile = [&]() {
+        if (!kProfile) return;
+        static int passes = 0;
+        if (++passes % 20 != 0) return;
+        std::vector<std::pair<std::string, double>> rows(prof_total.begin(), prof_total.end());
+        std::sort(rows.begin(), rows.end(),
+                  [](const auto& a, const auto& b){ return a.second > b.second; });
+        std::fprintf(stderr, "[walker-prof] after %d passes:\n", passes);
+        double total = 0.0;
+        for (auto& kv : rows) total += kv.second;
+        for (auto& kv : rows) {
+            std::fprintf(stderr, "  %-22s %8.1f ms total %5zu calls %6.2f ms/call %5.1f%%\n",
+                         kv.first.c_str(), kv.second, prof_count[kv.first],
+                         kv.second / static_cast<double>(prof_count[kv.first]),
+                         100.0 * kv.second / total);
+        }
+    };
+
     const size_t N = slots.size();
     std::vector<ExecutionContext*> ctxs;
     std::vector<BatchedExecutor::PerRequest*> reqs;
@@ -454,75 +487,94 @@ BatchedDecodeOutput BatchedWalker::step(const std::vector<RequestSlot>& slots) {
     }
 
     // Embedding.
+    auto t_emb = std::chrono::steady_clock::now();
     op_embedding(ctxs, tokens);
+    profile("embedding", t_emb);
     // First layer reads 'hidden_state_0'; subsequent reads from prev layer's residual_2.
     std::string current_input = "hidden_state_0";
     const std::string final_norm_in_after_loop = "blk." + std::to_string(n_layers_ - 1) + ".residual_2";
 
     for (size_t L = 0; L < n_layers_; ++L) {
         std::string prefix = "blk." + std::to_string(L) + ".";
+        std::chrono::steady_clock::time_point tp;
 
-        // attn_norm
+        tp = std::chrono::steady_clock::now();
         op_norm(ctxs, current_input, prefix + "attn_norm.out",
                 prefix + "attn_norm.weight", hidden_size_);
+        profile("norm", tp);
 
-        // attn_qkv matmul (Q4_0 fused)
+        tp = std::chrono::steady_clock::now();
         op_q4_matmul(ctxs, prefix + "attn_norm.out", prefix + "attn_qkv.out_stacked",
                      prefix + "attn_qkv.weight", hidden_size_, qkv_rows_);
+        profile("q4_matmul_qkv", tp);
 
-        // slices
+        tp = std::chrono::steady_clock::now();
         op_slice(ctxs, prefix + "attn_qkv.out_stacked", prefix + "attn_q.out",
                  0, q_rows_);
         op_slice(ctxs, prefix + "attn_qkv.out_stacked", prefix + "attn_k.out",
                  q_rows_, k_rows_);
         op_slice(ctxs, prefix + "attn_qkv.out_stacked", prefix + "attn_v.out",
                  q_rows_ + k_rows_, v_rows_);
+        profile("slice", tp);
 
-        // attention
+        tp = std::chrono::steady_clock::now();
         op_attention(ctxs, slots, reqs, page_ids, slot_ids, L);
+        profile("attention", tp);
 
-        // attn_output projection
+        tp = std::chrono::steady_clock::now();
         op_q4_matmul(ctxs, prefix + "attention_mix", prefix + "attn_output.out",
                      prefix + "attn_output.weight", hidden_size_, hidden_size_);
+        profile("q4_matmul_attn_out", tp);
 
-        // residual_add1
+        tp = std::chrono::steady_clock::now();
         op_add(ctxs, current_input, prefix + "attn_output.out",
                prefix + "residual_1", hidden_size_);
+        profile("add", tp);
 
-        // ffn_norm
+        tp = std::chrono::steady_clock::now();
         op_norm(ctxs, prefix + "residual_1", prefix + "ffn_norm.out",
                 prefix + "ffn_norm.weight", hidden_size_);
+        profile("norm", tp);
 
-        // ffn_gate_up matmul
+        tp = std::chrono::steady_clock::now();
         op_q4_matmul(ctxs, prefix + "ffn_norm.out", prefix + "ffn_gate_up.out_stacked",
                      prefix + "ffn_gate_up.weight", hidden_size_, ffn_gate_up_rows_);
+        profile("q4_matmul_ffn_gu", tp);
 
-        // slices
+        tp = std::chrono::steady_clock::now();
         op_slice(ctxs, prefix + "ffn_gate_up.out_stacked", prefix + "ffn_gate.out",
                  0, ffn_inner_);
         op_slice(ctxs, prefix + "ffn_gate_up.out_stacked", prefix + "ffn_up.out",
                  ffn_inner_, ffn_inner_);
+        profile("slice", tp);
 
-        // silu * mul
+        tp = std::chrono::steady_clock::now();
         op_silu_mul(ctxs, prefix + "ffn_gate.out", prefix + "ffn_up.out",
                     prefix + "ffn_mix", ffn_inner_);
+        profile("silu_mul", tp);
 
-        // ffn_down matmul
+        tp = std::chrono::steady_clock::now();
         op_q4_matmul(ctxs, prefix + "ffn_mix", prefix + "ffn_down.out",
                      prefix + "ffn_down.weight", ffn_inner_, hidden_size_);
+        profile("q4_matmul_ffn_down", tp);
 
-        // residual_add2
+        tp = std::chrono::steady_clock::now();
         op_add(ctxs, prefix + "residual_1", prefix + "ffn_down.out",
                prefix + "residual_2", hidden_size_);
+        profile("add", tp);
 
         current_input = prefix + "residual_2";
     }
 
-    // final_norm
+    auto t_fn = std::chrono::steady_clock::now();
     op_norm(ctxs, current_input, "final_norm_out", "output_norm.weight", hidden_size_);
+    profile("final_norm", t_fn);
 
-    // lm_head
+    auto t_lm = std::chrono::steady_clock::now();
     op_lm_head(ctxs, "final_norm_out", "logits");
+    profile("lm_head", t_lm);
+
+    dump_profile();
 
     // Collect.
     for (size_t r = 0; r < N; ++r) {
