@@ -1108,6 +1108,81 @@ kernel void q6_k_matmul_v2(
     }
 }
 
+// Q6_K mat-vec v3 (Lever 9 of sweep-75): 4-row-per-simdgroup variant.
+// Same simd_sum reduction as v2, but each lane contributes to 4 row
+// dot products instead of 1. Shares the input[c] fetch across 4 rows.
+// Falls back to v2 when (rows % 4) != 0. Dispatch:
+//   ((rows + 3) / 4) threadgroups × 32 threads.
+kernel void q6_k_matmul_v3(
+    device const uchar* weights [[buffer(0)]],
+    device const float* input   [[buffer(1)]],
+    device       float* output  [[buffer(2)]],
+    constant QKParams& params   [[buffer(3)]],
+    uint  tg_x      [[threadgroup_position_in_grid]],
+    uint  lane_idx  [[thread_index_in_simdgroup]]) {
+    uint row_base = tg_x * 4u;
+    if (row_base >= params.rows) return;
+
+    const uint block_size = 210u;
+    uint cols   = params.cols;
+    uint stride = params.row_stride;
+
+    const device uchar* rp[4];
+    bool active[4];
+    #pragma unroll
+    for (uint i = 0u; i < 4u; ++i) {
+        active[i] = (row_base + i < params.rows);
+        rp[i] = active[i] ? weights + (row_base + i) * stride : nullptr;
+    }
+
+    float p[4] = {0,0,0,0};
+
+    for (uint c = lane_idx; c < cols; c += 32u) {
+        uint b           = c / 256u;
+        uint offset      = c % 256u;
+        uint half_idx    = offset / 128u;
+        uint after_half  = offset % 128u;
+        uint quarter     = after_half / 32u;
+        uint l           = after_half % 32u;
+        uint ql_off = half_idx * 64u + l + ((quarter & 1u) ? 32u : 0u);
+        uint qh_off = half_idx * 32u + l;
+        uint scale_idx = half_idx * 8u + quarter * 2u + (l / 16u);
+        float x = input[c];
+        uint blk_byte = b * block_size;
+
+        #pragma unroll
+        for (uint i = 0u; i < 4u; ++i) {
+            if (!active[i]) continue;
+            const device uchar* block = rp[i] + blk_byte;
+            const device uchar* ql    = block;
+            const device uchar* qh    = block + 128;
+            const device int8_t* sc   = reinterpret_cast<const device int8_t*>(block + 192);
+            const device half*  d_ptr = reinterpret_cast<const device half*>(block + 208);
+            float d = static_cast<float>(d_ptr[0]);
+
+            uchar ql_byte = ql[ql_off];
+            uint  ql_nibble = (quarter < 2u) ? (uint)(ql_byte & 0xFu)
+                                             : (uint)((ql_byte >> 4) & 0xFu);
+            uchar qh_byte = qh[qh_off];
+            uint  qh_bits = (uint)((qh_byte >> (quarter * 2u)) & 0x3u);
+            int q = static_cast<int>(ql_nibble | (qh_bits << 4)) - 32;
+            float scale = static_cast<float>(sc[scale_idx]);
+            p[i] += d * scale * static_cast<float>(q) * x;
+        }
+    }
+
+    #pragma unroll
+    for (uint i = 0u; i < 4u; ++i) {
+        p[i] = simd_sum(p[i]);
+    }
+    if (lane_idx == 0u) {
+        #pragma unroll
+        for (uint i = 0u; i < 4u; ++i) {
+            if (active[i]) output[row_base + i] = p[i];
+        }
+    }
+}
+
 kernel void q6_k_matmul_transposed(
     device const uchar* weights [[buffer(0)]],
     device const float* input [[buffer(1)]],
@@ -1702,6 +1777,7 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> q5KMatmulPipeline = nil;
     id<MTLComputePipelineState> q6KMatmulPipeline = nil;
     id<MTLComputePipelineState> q6KMatmulPipelineV2 = nil;
+    id<MTLComputePipelineState> q6KMatmulPipelineV3 = nil;
     id<MTLComputePipelineState> q6KMatmulTransposedPipeline = nil;
     id<MTLComputePipelineState> q8KMatmulPipeline = nil;
     id<MTLComputePipelineState> q8_0MatmulPipeline = nil;
@@ -2039,6 +2115,7 @@ struct MetalExecutor::Impl {
                 q5KMatmulPipeline = buildPipeline(@"q5_k_matmul");
                 q6KMatmulPipeline = buildPipeline(@"q6_k_matmul");
                 q6KMatmulPipelineV2 = buildPipeline(@"q6_k_matmul_v2");
+                q6KMatmulPipelineV3 = buildPipeline(@"q6_k_matmul_v3");
                 q6KMatmulTransposedPipeline = buildPipeline(@"q6_k_matmul_transposed");
                 q8KMatmulPipeline = buildPipeline(@"q8_k_matmul");
                 q8_0MatmulPipeline = buildPipeline(@"q8_0_matmul");
@@ -3432,7 +3509,9 @@ bool matmulQ4_K(const std::string& weight_name,
                     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
                     id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
                     if (!encoder) return false;
-                    [encoder setComputePipelineState:q6KMatmulPipelineV2];
+                    // Lever 9: prefer Q6_K v3 (4 rows/sg) when rows%4==0.
+                    const bool q6_use_v3 = (q6KMatmulPipelineV3 != nil) && (rows % 4u == 0u);
+                    [encoder setComputePipelineState:(q6_use_v3 ? q6KMatmulPipelineV3 : q6KMatmulPipelineV2)];
                     [encoder setBuffer:weightBuffer offset:0 atIndex:0];
                     [encoder setBuffer:inputBuffer offset:0 atIndex:1];
                     [encoder setBuffer:outputBuffer offset:0 atIndex:2];
@@ -3440,7 +3519,10 @@ bool matmulQ4_K(const std::string& weight_name,
                                              static_cast<uint32_t>(cols),
                                              static_cast<uint32_t>(row_stride)};
                     [encoder setBytes:&params length:sizeof(QKParamsNative) atIndex:3];
-                    [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                    MTLSize tg = q6_use_v3
+                        ? MTLSizeMake((rows + 3u) / 4u, 1, 1)
+                        : MTLSizeMake(rows, 1, 1);
+                    [encoder dispatchThreadgroups:tg
                             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                     [encoder endEncoding];
                     [commandBuffer commit];
