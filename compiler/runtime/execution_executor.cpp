@@ -209,13 +209,25 @@ ExecutionExecutor::ExecutionExecutor(const ExecutionGraph& graph,
 }
 
 ExecutionExecutor::Result ExecutionExecutor::run(size_t max_nodes) const {
+    return run_range(0, max_nodes);
+}
+
+ExecutionExecutor::Result ExecutionExecutor::run_range(size_t start_node,
+                                                       size_t node_count) const {
     Result result;
     const bool verbose = (std::getenv("MLC_VERBOSE") != nullptr);
         const TraceConfig& trace_cfg = traceConfig();
     const TracePreviewConfig& preview_cfg = tracePreviewConfig();
     auto order = graph_.topologicalOrder();
-    if (max_nodes > 0 && max_nodes < order.size()) {
-        order.resize(max_nodes);
+    // Apply [start_node, start_node + node_count) slice. When start_node==0 and
+    // node_count==0, run all (preserves the historical run() behavior).
+    if (start_node > order.size()) start_node = order.size();
+    size_t end_idx = (node_count == 0) ? order.size()
+                                       : std::min(order.size(), start_node + node_count);
+    if (start_node > 0 || end_idx < order.size()) {
+        std::vector<std::string> sliced(order.begin() + start_node,
+                                         order.begin() + end_idx);
+        order = std::move(sliced);
     }
 
     std::unordered_map<std::string, const ExecutionNode*> node_lookup;
