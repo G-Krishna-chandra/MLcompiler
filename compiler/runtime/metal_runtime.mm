@@ -1937,6 +1937,18 @@ struct MetalExecutor::Impl {
         id<MTLBuffer> v = nil;       size_t v_bytes = 0;
         id<MTLBuffer> logits = nil;  size_t logits_bytes = 0;
         id<MTLBuffer> result = nil;  size_t result_bytes = 0;
+        // Cached MPSMatrix wrappers — invalidated when (tokens, dtype, head_dim)
+        // change. Wrappers reference the buffer pointers above by stable address.
+        MPSMatrix* qMat = nil;
+        MPSMatrix* kMat = nil;
+        MPSMatrix* lMatBatched = nil;
+        MPSMatrix* lMatSoftmax = nil;
+        MPSMatrix* vMat = nil;
+        MPSMatrix* rMat = nil;
+        size_t cached_tokens = 0;
+        uint32_t cached_dtype = 0;
+        size_t cached_head_dim = 0;
+        size_t cached_num_heads = 0;
     };
     mutable std::unordered_map<std::string, AttnScratchSlot> attn_scratch_per_call_;
     mutable AttnScratchSlot attn_scratch_anonymous_;  // fallback when name empty
@@ -4798,49 +4810,68 @@ bool matmulQ4_K(const std::string& weight_name,
                                  num_heads * tokens);
                 }
 
-                // 4. Build batched MPS descriptors + matrices.
-                MPSMatrixDescriptor* qDesc =
-                    [MPSMatrixDescriptor matrixDescriptorWithRows:1
-                                                          columns:head_dim
-                                                         matrices:num_heads
-                                                         rowBytes:kHeadDimBytes
-                                                      matrixBytes:kHeadDimBytes
-                                                         dataType:mpsDtype];
-                MPSMatrixDescriptor* kDesc =
-                    [MPSMatrixDescriptor matrixDescriptorWithRows:tokens
-                                                          columns:head_dim
-                                                         matrices:num_heads
-                                                         rowBytes:kHeadDimBytes
-                                                      matrixBytes:kKVMatrixBytes
-                                                         dataType:mpsDtype];
-                MPSMatrixDescriptor* lBatchDesc =
-                    [MPSMatrixDescriptor matrixDescriptorWithRows:1
-                                                          columns:tokens
-                                                         matrices:num_heads
-                                                         rowBytes:kLogitsRowBytes
-                                                      matrixBytes:kLogitsRowBytes
-                                                         dataType:mpsDtype];
-                MPSMatrixDescriptor* lSoftmaxDesc =
-                    [MPSMatrixDescriptor matrixDescriptorWithRows:num_heads
-                                                          columns:tokens
-                                                         matrices:1
-                                                         rowBytes:kLogitsRowBytes
-                                                      matrixBytes:num_heads * kLogitsRowBytes
-                                                         dataType:mpsDtype];
-                MPSMatrixDescriptor* rDesc =
-                    [MPSMatrixDescriptor matrixDescriptorWithRows:1
-                                                          columns:head_dim
-                                                         matrices:num_heads
-                                                         rowBytes:kHeadDimBytes
-                                                      matrixBytes:kHeadDimBytes
-                                                         dataType:mpsDtype];
+                // 4. Build batched MPS descriptors + matrices, or reuse cached.
+                // Lever 3+: cache MPS matrix wrappers per slot. Invalidate when
+                // any shape parameter changes (tokens, dtype, head_dim, num_heads).
+                bool mps_cache_hit = (slot.qMat != nil) &&
+                                     (slot.cached_tokens == tokens) &&
+                                     (slot.cached_dtype == (uint32_t)mpsDtype) &&
+                                     (slot.cached_head_dim == head_dim) &&
+                                     (slot.cached_num_heads == num_heads);
+                if (!mps_cache_hit) {
+                    MPSMatrixDescriptor* qDesc =
+                        [MPSMatrixDescriptor matrixDescriptorWithRows:1
+                                                              columns:head_dim
+                                                             matrices:num_heads
+                                                             rowBytes:kHeadDimBytes
+                                                          matrixBytes:kHeadDimBytes
+                                                             dataType:mpsDtype];
+                    MPSMatrixDescriptor* kDesc =
+                        [MPSMatrixDescriptor matrixDescriptorWithRows:tokens
+                                                              columns:head_dim
+                                                             matrices:num_heads
+                                                             rowBytes:kHeadDimBytes
+                                                          matrixBytes:kKVMatrixBytes
+                                                             dataType:mpsDtype];
+                    MPSMatrixDescriptor* lBatchDesc =
+                        [MPSMatrixDescriptor matrixDescriptorWithRows:1
+                                                              columns:tokens
+                                                             matrices:num_heads
+                                                             rowBytes:kLogitsRowBytes
+                                                          matrixBytes:kLogitsRowBytes
+                                                             dataType:mpsDtype];
+                    MPSMatrixDescriptor* lSoftmaxDesc =
+                        [MPSMatrixDescriptor matrixDescriptorWithRows:num_heads
+                                                              columns:tokens
+                                                             matrices:1
+                                                             rowBytes:kLogitsRowBytes
+                                                          matrixBytes:num_heads * kLogitsRowBytes
+                                                             dataType:mpsDtype];
+                    MPSMatrixDescriptor* rDesc =
+                        [MPSMatrixDescriptor matrixDescriptorWithRows:1
+                                                              columns:head_dim
+                                                             matrices:num_heads
+                                                             rowBytes:kHeadDimBytes
+                                                          matrixBytes:kHeadDimBytes
+                                                             dataType:mpsDtype];
 
-                MPSMatrix* qMat = [[MPSMatrix alloc] initWithBuffer:qBuffer descriptor:qDesc];
-                MPSMatrix* kMat = [[MPSMatrix alloc] initWithBuffer:kBatchBuffer descriptor:kDesc];
-                MPSMatrix* lMatBatched = [[MPSMatrix alloc] initWithBuffer:logitsBuffer descriptor:lBatchDesc];
-                MPSMatrix* lMatSoftmax = [[MPSMatrix alloc] initWithBuffer:logitsBuffer descriptor:lSoftmaxDesc];
-                MPSMatrix* vMat = [[MPSMatrix alloc] initWithBuffer:vBatchBuffer descriptor:kDesc];
-                MPSMatrix* rMat = [[MPSMatrix alloc] initWithBuffer:resultBuffer descriptor:rDesc];
+                    slot.qMat        = [[MPSMatrix alloc] initWithBuffer:qBuffer descriptor:qDesc];
+                    slot.kMat        = [[MPSMatrix alloc] initWithBuffer:kBatchBuffer descriptor:kDesc];
+                    slot.lMatBatched = [[MPSMatrix alloc] initWithBuffer:logitsBuffer descriptor:lBatchDesc];
+                    slot.lMatSoftmax = [[MPSMatrix alloc] initWithBuffer:logitsBuffer descriptor:lSoftmaxDesc];
+                    slot.vMat        = [[MPSMatrix alloc] initWithBuffer:vBatchBuffer descriptor:kDesc];
+                    slot.rMat        = [[MPSMatrix alloc] initWithBuffer:resultBuffer descriptor:rDesc];
+                    slot.cached_tokens    = tokens;
+                    slot.cached_dtype     = (uint32_t)mpsDtype;
+                    slot.cached_head_dim  = head_dim;
+                    slot.cached_num_heads = num_heads;
+                }
+                MPSMatrix* qMat        = slot.qMat;
+                MPSMatrix* kMat        = slot.kMat;
+                MPSMatrix* lMatBatched = slot.lMatBatched;
+                MPSMatrix* lMatSoftmax = slot.lMatSoftmax;
+                MPSMatrix* vMat        = slot.vMat;
+                MPSMatrix* rMat        = slot.rMat;
 
                 // 5. CB selection: in deferred mode we encode onto the
                 //    executor's open forward-pass CB; otherwise we own a
@@ -4893,18 +4924,10 @@ bool matmulQ4_K(const std::string& weight_name,
                 //     MTLBuffer objects in pass_retained_ so they
                 //     survive until the CB commits.
                 if (deferred_mode) {
-                    // Lever 3: q/k/v/logits/result are cache-owned (per-layer
-                    // slot). MPS matrix wrappers reference them, so the
-                    // wrappers still need to survive until CB commit.
-                    pass_retained_.push_back((id)qMat);
-                    pass_retained_.push_back((id)kMat);
-                    pass_retained_.push_back((id)lMatBatched);
-                    pass_retained_.push_back((id)lMatSoftmax);
-                    pass_retained_.push_back((id)vMat);
-                    pass_retained_.push_back((id)rMat);
-                    // qk, softmaxKernel, av are owned by the MPS object cache
-                    // (retained for the lifetime of the executor) — no need
-                    // to add them to pass_retained_.
+                    // Lever 3+: q/k/v/logits/result buffers AND MPSMatrix
+                    // wrappers are slot-owned across passes. qk, softmaxKernel,
+                    // av are owned by the MPS object cache. No pass_retained_
+                    // pushes needed for any of them.
 
                     // Establish the convention "every op's downstream-
                     // visible output buffer is fp32". When fp16_attn is
