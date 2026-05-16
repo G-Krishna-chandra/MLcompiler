@@ -47,6 +47,13 @@ endif()
 add_executable(metal_diag tools/metal_diag.mm)
 target_link_libraries(metal_diag PRIVATE "-framework Foundation" "-framework Metal" "-framework CoreGraphics" "-framework QuartzCore")
 
+# Standalone Metal hazard reproducer for the N1 single-encoder design work.
+# Runs a sequence of single-encoder, multi-encoder, fence, and useResource
+# variants of a "scale twice and verify the product" computation; tells us
+# which sync primitives are actually necessary.
+add_executable(metal_hazard_test tools/metal_hazard_test.mm)
+target_link_libraries(metal_hazard_test PRIVATE "-framework Foundation" "-framework Metal")
+
 # llama.cpp activation dumper for the parity harness.
 # Builds only when libllama is present at the conventional sibling path.
 set(LLAMA_CPP_ROOT ${CMAKE_SOURCE_DIR}/../llama.cpp)
