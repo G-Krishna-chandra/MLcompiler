@@ -423,6 +423,48 @@ kernel void scatter_kv_paged_batched_f16(
     page_storage[dst_idx] = src[gid];
 }
 
+// ===========================================================================
+// Phase M1 — batched strided copy + fp32→fp16 cast.
+//
+// Lets the BatchedWalker extract Q/K/V (and gate/up) slices from a
+// per-request strided source buffer onto contiguous destination buffers
+// while staying on the open forward-pass CB. Eliminates the previous
+// "flush + host download + CPU split + upload + reopen CB" pattern that
+// cost two CB sync points per layer (~3 ms each × 56 per pass on M3 Pro
+// = ~170 ms of pure overhead per forward pass).
+//
+// Strided copy: each thread copies one (request, dim) element.
+//   dst[r*dim + i] = src[r*src_stride + offset + i]
+// Cast: bulk fp32→fp16, scalar-per-thread.
+// ===========================================================================
+struct StridedCopyF32Params {
+    uint dim;
+    uint src_stride;
+    uint offset;
+    uint batch;
+};
+
+kernel void strided_copy_f32(
+    device const float* src [[buffer(0)]],
+    device       float* dst [[buffer(1)]],
+    constant StridedCopyF32Params& p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint total = p.batch * p.dim;
+    if (gid >= total) return;
+    uint r = gid / p.dim;
+    uint i = gid - r * p.dim;
+    dst[gid] = src[r * p.src_stride + p.offset + i];
+}
+
+kernel void cast_f32_to_f16(
+    device const float* src [[buffer(0)]],
+    device       half*  dst [[buffer(1)]],
+    constant uint& length    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= length) return;
+    dst[gid] = half(src[gid]);
+}
+
 kernel void scatter_kv_paged_f16(
     device const half* src [[buffer(0)]],
     device       half* page_storage [[buffer(1)]],
@@ -2379,7 +2421,9 @@ struct MetalExecutor::Impl {
     id<MTLComputePipelineState> flashAttentionPipeline = nil;
     id<MTLComputePipelineState> pagedFlashAttentionPipeline = nil;
     id<MTLComputePipelineState> castF16toF32Pipeline = nil;
+    id<MTLComputePipelineState> castF32toF16Pipeline = nil;
     id<MTLComputePipelineState> sliceF32Pipeline = nil;
+    id<MTLComputePipelineState> stridedCopyF32Pipeline = nil;
     bool debug_log = false;
 
     // Persistent device-side weight cache. Weights are immutable for the
@@ -2796,7 +2840,9 @@ struct MetalExecutor::Impl {
                 flashAttentionPipeline = buildPipeline(@"flash_attention_v1");
                 pagedFlashAttentionPipeline = buildPipeline(@"paged_flash_attention");
                 castF16toF32Pipeline = buildPipeline(@"cast_f16_to_f32");
+                castF32toF16Pipeline = buildPipeline(@"cast_f32_to_f16");
                 sliceF32Pipeline = buildPipeline(@"slice_f32");
+                stridedCopyF32Pipeline = buildPipeline(@"strided_copy_f32");
             }
         }
 #endif
@@ -7859,6 +7905,316 @@ bool MetalExecutor::scatterKVPaged(void* page_storage_buffer,
     return false;
 }
 
+// Phase M1: compound encode — QKV split + RoPE + fp32→fp16 cast in
+// ONE serial compute encoder with explicit memory barriers between
+// dispatches. Cross-encoder hazard tracking on the cached buffers is
+// proven unreliable for our back-to-back small kernels (rope→cast,
+// split→silu_mul), so bundle all dependent ops into a single encoder
+// where `memoryBarrierWithScope:MTLBarrierScopeBuffers` guarantees the
+// ordering Apple's Compute Programming Guide promises.
+bool MetalExecutor::encodeQkvSplitRopeCast(void* qkv_buf,
+                                            void* q_buf,
+                                            void* k_buf,
+                                            void* v_buf,
+                                            void* k_f16_buf,
+                                            void* v_f16_buf,
+                                            void* cos_buf,
+                                            void* sin_buf,
+                                            size_t batch,
+                                            size_t num_heads,
+                                            size_t kv_heads,
+                                            size_t head_dim,
+                                            size_t qkv_rows,
+                                            size_t q_rows,
+                                            size_t k_rows,
+                                            size_t v_rows,
+                                            size_t rotary_dim) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available()) return false;
+    if (!impl_->stridedCopyF32Pipeline || !impl_->castF32toF16Pipeline) return false;
+    if (rotary_dim > 0 && !impl_->batchedRopePipeline) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+
+        auto dispatchCopy = [&](void* dst, size_t dim, size_t offset) {
+            [enc setComputePipelineState:impl_->stridedCopyF32Pipeline];
+            [enc setBuffer:(__bridge id<MTLBuffer>)qkv_buf offset:0 atIndex:0];
+            [enc setBuffer:(__bridge id<MTLBuffer>)dst     offset:0 atIndex:1];
+            struct ParamsHost { uint32_t dim; uint32_t src_stride;
+                                uint32_t offset; uint32_t batch; } p;
+            p.dim = static_cast<uint32_t>(dim);
+            p.src_stride = static_cast<uint32_t>(qkv_rows);
+            p.offset = static_cast<uint32_t>(offset);
+            p.batch = static_cast<uint32_t>(batch);
+            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            size_t total = batch * dim;
+            NSUInteger tw = impl_->stridedCopyF32Pipeline.threadExecutionWidth * 4;
+            if (tw == 0) tw = 64;
+            if (tw > 256) tw = 256;
+            NSUInteger tg = (total + tw - 1) / tw;
+            if (tg == 0) tg = 1;
+            [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        };
+
+        dispatchCopy(q_buf, q_rows, 0);
+        dispatchCopy(k_buf, k_rows, q_rows);
+        dispatchCopy(v_buf, v_rows, q_rows + k_rows);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        if (rotary_dim > 0) {
+            auto dispatchRope = [&](void* data, size_t n_heads_in) {
+                [enc setComputePipelineState:impl_->batchedRopePipeline];
+                [enc setBuffer:(__bridge id<MTLBuffer>)data    offset:0 atIndex:0];
+                [enc setBuffer:(__bridge id<MTLBuffer>)cos_buf offset:0 atIndex:1];
+                [enc setBuffer:(__bridge id<MTLBuffer>)sin_buf offset:0 atIndex:2];
+                struct ParamsHost { uint32_t batch; uint32_t n_heads;
+                                    uint32_t head_dim; uint32_t rotary_dim; } params;
+                params.batch = static_cast<uint32_t>(batch);
+                params.n_heads = static_cast<uint32_t>(n_heads_in);
+                params.head_dim = static_cast<uint32_t>(head_dim);
+                params.rotary_dim = static_cast<uint32_t>(rotary_dim);
+                [enc setBytes:&params length:sizeof(params) atIndex:3];
+                size_t pairs = rotary_dim / 2;
+                size_t total = batch * n_heads_in * pairs;
+                NSUInteger tw = impl_->batchedRopePipeline.threadExecutionWidth;
+                if (tw == 0) tw = 32;
+                NSUInteger tg = (total + tw - 1) / tw;
+                if (tg == 0) tg = 1;
+                [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+            };
+            dispatchRope(q_buf, num_heads);
+            dispatchRope(k_buf, kv_heads);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
+        auto dispatchCast = [&](void* src, void* dst, size_t length) {
+            [enc setComputePipelineState:impl_->castF32toF16Pipeline];
+            [enc setBuffer:(__bridge id<MTLBuffer>)src offset:0 atIndex:0];
+            [enc setBuffer:(__bridge id<MTLBuffer>)dst offset:0 atIndex:1];
+            uint32_t n = static_cast<uint32_t>(length);
+            [enc setBytes:&n length:sizeof(n) atIndex:2];
+            NSUInteger tw = impl_->castF32toF16Pipeline.threadExecutionWidth * 4;
+            if (tw == 0) tw = 64;
+            if (tw > 256) tw = 256;
+            NSUInteger tg = (length + tw - 1) / tw;
+            if (tg == 0) tg = 1;
+            [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        };
+        dispatchCast(k_buf, k_f16_buf, batch * k_rows);
+        dispatchCast(v_buf, v_f16_buf, batch * v_rows);
+        // No barrier after — the scatter encoder that follows will be a
+        // separate encoder; cross-encoder hazard tracking handles the
+        // k_f16_buf/v_f16_buf reads (proven to work for the existing
+        // scatter path that ran after CPU-uploaded fp16 buffers).
+
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)qkv_buf; (void)q_buf; (void)k_buf; (void)v_buf;
+    (void)k_f16_buf; (void)v_f16_buf; (void)cos_buf; (void)sin_buf;
+    (void)batch; (void)num_heads; (void)kv_heads; (void)head_dim;
+    (void)qkv_rows; (void)q_rows; (void)k_rows; (void)v_rows; (void)rotary_dim;
+    return false;
+}
+
+// Phase M1: compound encode — gate_up split + SiLU·up in one encoder
+// with explicit barrier between split dispatches and silu_mul.
+bool MetalExecutor::encodeGateUpSplitSiluMul(void* gate_up_buf,
+                                              void* gate_buf,
+                                              void* up_buf,
+                                              void* out_buf,
+                                              size_t batch,
+                                              size_t ffn_inner,
+                                              size_t ffn_gate_up_rows) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available()) return false;
+    if (!impl_->stridedCopyF32Pipeline || !impl_->ffnPipeline) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+
+        auto dispatchCopy = [&](void* dst, size_t offset) {
+            [enc setComputePipelineState:impl_->stridedCopyF32Pipeline];
+            [enc setBuffer:(__bridge id<MTLBuffer>)gate_up_buf offset:0 atIndex:0];
+            [enc setBuffer:(__bridge id<MTLBuffer>)dst         offset:0 atIndex:1];
+            struct ParamsHost { uint32_t dim; uint32_t src_stride;
+                                uint32_t offset; uint32_t batch; } p;
+            p.dim = static_cast<uint32_t>(ffn_inner);
+            p.src_stride = static_cast<uint32_t>(ffn_gate_up_rows);
+            p.offset = static_cast<uint32_t>(offset);
+            p.batch = static_cast<uint32_t>(batch);
+            [enc setBytes:&p length:sizeof(p) atIndex:2];
+            size_t total = batch * ffn_inner;
+            NSUInteger tw = impl_->stridedCopyF32Pipeline.threadExecutionWidth * 4;
+            if (tw == 0) tw = 64;
+            if (tw > 256) tw = 256;
+            NSUInteger tg = (total + tw - 1) / tw;
+            if (tg == 0) tg = 1;
+            [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        };
+
+        dispatchCopy(gate_buf, 0);
+        dispatchCopy(up_buf, ffn_inner);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // SiLU * up.
+        [enc setComputePipelineState:impl_->ffnPipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)gate_buf offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)up_buf   offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)out_buf  offset:0 atIndex:2];
+        uint32_t total_elements = static_cast<uint32_t>(batch * ffn_inner);
+        [enc setBytes:&total_elements length:sizeof(uint32_t) atIndex:3];
+        NSUInteger tw = impl_->ffnPipeline.threadExecutionWidth;
+        if (tw == 0) tw = 32;
+        NSUInteger tg = (total_elements + tw - 1) / tw;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)gate_up_buf; (void)gate_buf; (void)up_buf; (void)out_buf;
+    (void)batch; (void)ffn_inner; (void)ffn_gate_up_rows;
+    return false;
+}
+
+// Phase M1: strided slice copy on the open forward-pass CB.
+// Replaces "flush + download + CPU split + upload + reopen CB" per layer
+// in the BatchedWalker. Output dst[r*dim + i] = src[r*src_stride + offset + i].
+bool MetalExecutor::encodeStridedCopyF32(void* src_buf,
+                                          size_t src_stride,
+                                          size_t offset,
+                                          void* dst_buf,
+                                          size_t dim,
+                                          size_t batch) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->stridedCopyF32Pipeline) return false;
+    if (!src_buf || !dst_buf || dim == 0 || batch == 0) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->stridedCopyF32Pipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)src_buf offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)dst_buf offset:0 atIndex:1];
+        struct ParamsHost { uint32_t dim; uint32_t src_stride; uint32_t offset; uint32_t batch; } p;
+        p.dim = static_cast<uint32_t>(dim);
+        p.src_stride = static_cast<uint32_t>(src_stride);
+        p.offset = static_cast<uint32_t>(offset);
+        p.batch = static_cast<uint32_t>(batch);
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        size_t total = batch * dim;
+        NSUInteger tw = impl_->stridedCopyF32Pipeline.threadExecutionWidth * 4;
+        if (tw == 0) tw = 64;
+        if (tw > 256) tw = 256;
+        NSUInteger tg = (total + tw - 1) / tw;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)src_buf; (void)src_stride; (void)offset;
+    (void)dst_buf; (void)dim; (void)batch;
+    return false;
+}
+
+// Phase M1: bulk fp32→fp16 cast on the open forward-pass CB.
+// Used to materialize K/V as fp16 for the scatter kernel without a host
+// round-trip.
+bool MetalExecutor::encodeCastF32ToF16(void* src_buf,
+                                        void* dst_buf,
+                                        size_t length) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->castF32toF16Pipeline) return false;
+    if (!src_buf || !dst_buf || length == 0) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->castF32toF16Pipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)src_buf offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)dst_buf offset:0 atIndex:1];
+        uint32_t n = static_cast<uint32_t>(length);
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        NSUInteger tw = impl_->castF32toF16Pipeline.threadExecutionWidth * 4;
+        if (tw == 0) tw = 64;
+        if (tw > 256) tw = 256;
+        NSUInteger tg = (length + tw - 1) / tw;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)src_buf; (void)dst_buf; (void)length;
+    return false;
+}
+
+// Phase M1: batched RoPE encoded onto the open forward-pass CB.
+// Mirrors runBatchedRope but uses the shared CB and takes pre-uploaded
+// cos/sin buffers (caller computes once per pass, reused across layers).
+bool MetalExecutor::encodeBatchedRope(void* data_buf,
+                                       void* cos_buf,
+                                       void* sin_buf,
+                                       size_t batch,
+                                       size_t n_heads,
+                                       size_t head_dim,
+                                       size_t rotary_dim) const {
+#if defined(__APPLE__)
+    if (!impl_ || !impl_->available() || !impl_->batchedRopePipeline) return false;
+    if (!data_buf || !cos_buf || !sin_buf) return false;
+    if (batch == 0 || n_heads == 0 || head_dim == 0 || rotary_dim == 0) return false;
+    if (rotary_dim > head_dim) return false;
+    if (impl_->open_forward_pass_cb_ == nil) return false;
+    if (@available(macOS 11.0, *)) {
+        id<MTLComputeCommandEncoder> enc =
+            [impl_->open_forward_pass_cb_ computeCommandEncoder];
+        if (!enc) return false;
+        [enc setComputePipelineState:impl_->batchedRopePipeline];
+        [enc setBuffer:(__bridge id<MTLBuffer>)data_buf offset:0 atIndex:0];
+        [enc setBuffer:(__bridge id<MTLBuffer>)cos_buf  offset:0 atIndex:1];
+        [enc setBuffer:(__bridge id<MTLBuffer>)sin_buf  offset:0 atIndex:2];
+        struct ParamsHost { uint32_t batch; uint32_t n_heads;
+                            uint32_t head_dim; uint32_t rotary_dim; } params;
+        params.batch = static_cast<uint32_t>(batch);
+        params.n_heads = static_cast<uint32_t>(n_heads);
+        params.head_dim = static_cast<uint32_t>(head_dim);
+        params.rotary_dim = static_cast<uint32_t>(rotary_dim);
+        [enc setBytes:&params length:sizeof(params) atIndex:3];
+        size_t pairs = rotary_dim / 2;
+        size_t total = batch * n_heads * pairs;
+        NSUInteger tw = impl_->batchedRopePipeline.threadExecutionWidth;
+        if (tw == 0) tw = 32;
+        NSUInteger tg = (total + tw - 1) / tw;
+        if (tg == 0) tg = 1;
+        [enc dispatchThreadgroups:MTLSizeMake(tg, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        [enc endEncoding];
+        return true;
+    }
+#endif
+    (void)data_buf; (void)cos_buf; (void)sin_buf;
+    (void)batch; (void)n_heads; (void)head_dim; (void)rotary_dim;
+    return false;
+}
+
 void* MetalExecutor::getOrAllocCachedBuffer(const char* name, size_t bytes) const {
 #if defined(__APPLE__)
     if (!impl_ || !impl_->available() || bytes == 0) return nullptr;
@@ -7869,9 +8225,16 @@ void* MetalExecutor::getOrAllocCachedBuffer(const char* name, size_t bytes) cons
             impl_->kernel_scratch_bytes_[key] >= bytes) {
             return (__bridge void*)it->second;
         }
-        // Allocate (or reallocate larger).
+        // M1: explicit MTLResourceHazardTrackingModeTracked so the GPU
+        // tracks read-after-write across separately-encoded compute
+        // dispatches in the same CB. Without this, back-to-back small
+        // kernels (rope→cast, strided_copy→silu_mul) can observe stale
+        // reads despite the "default" tracking mode supposedly being
+        // enabled for shared-storage buffers.
+        MTLResourceOptions opts =
+            MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked;
         id<MTLBuffer> buf = [impl_->device newBufferWithLength:bytes
-                                                       options:MTLResourceStorageModeShared];
+                                                       options:opts];
         if (!buf) return nullptr;
         impl_->kernel_scratch_cache_[key] = buf;
         impl_->kernel_scratch_bytes_[key] = bytes;

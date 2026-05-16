@@ -209,6 +209,32 @@ BatchedDecodeOutput BatchedWalker::step(const std::vector<RequestSlot>& slots) {
     }
     profile("embedding", t_emb);
 
+    // M1: precompute the RoPE cos/sin tables for this pass and upload to
+    // cached GPU buffers ONCE. The tables are position-only (not
+    // layer-dependent), so the same buffers are reused across all
+    // n_layers encodeBatchedRope dispatches inside the loop.
+    void* rope_cos_buf = nullptr;
+    void* rope_sin_buf = nullptr;
+    if (rotary_dim_ > 0) {
+        size_t pairs = rotary_dim_ / 2;
+        size_t table_bytes = N * pairs * sizeof(float);
+        rope_cos_buf = metal.getOrAllocCachedBuffer("w_rope_cos", table_bytes);
+        rope_sin_buf = metal.getOrAllocCachedBuffer("w_rope_sin", table_bytes);
+        if (rope_cos_buf && rope_sin_buf) {
+            std::vector<float> cos_flat(N * pairs);
+            std::vector<float> sin_flat(N * pairs);
+            std::vector<float> cos_one, sin_one;
+            for (size_t r = 0; r < N; ++r) {
+                computeRotaryCoefficients(slots[r].sequence_position, rotary_dim_,
+                                          rope_base_, rope_scale_, cos_one, sin_one);
+                std::copy(cos_one.begin(), cos_one.end(), cos_flat.begin() + r * pairs);
+                std::copy(sin_one.begin(), sin_one.end(), sin_flat.begin() + r * pairs);
+            }
+            metal.uploadToBuffer(rope_cos_buf, cos_flat.data(), table_bytes);
+            metal.uploadToBuffer(rope_sin_buf, sin_flat.data(), table_bytes);
+        }
+    }
+
     // ===== Open the single shared CB for the entire forward pass =====
     metal.beginForwardPassCB();
 
@@ -241,76 +267,34 @@ BatchedDecodeOutput BatchedWalker::step(const std::vector<RequestSlot>& slots) {
             profile("q4_matmul_qkv", tp);
         }
 
-        // We need to slice qkv into Q, K, V. Slicing is a memcpy on GPU
-        // buffer's contents — but contents() reads aren't safe until the
-        // CB executes. So slice via download → CPU split → upload? That
-        // breaks the single-CB. Instead: we pass slice offsets to the
-        // attention path directly. For now, do a CB flush + slice + open
-        // new CB. This is a temporary intermediate sync; J2 will optimize.
+        // M1: split qkv into Q/K/V + RoPE + fp16 cast in ONE compound
+        // encoder. All on the shared CB. The cos/sin tables for this pass
+        // were uploaded once outside the layer loop (position-only,
+        // reused across all layers).
         //
-        // Alternative working option: each batched matmul kernel writes
-        // outputs in interleaved layout that we can directly slice via
-        // pointer arithmetic on the GPU buffer (offset into the same
-        // buffer). The qkv_out_stacked layout is [N, qkv_rows] — slicing
-        // for request r, q rows is offset r*qkv_rows + 0 .. r*qkv_rows + q_rows.
+        //   buf_qkv → buf_q (Q after rope) / buf_kv_f16_k (K post-rope as fp16)
+        //                                  / buf_kv_f16_v (V cast to fp16)
         //
-        // BUT all N requests' Q is interleaved, not contiguous. So we
-        // can't pass a single offset pointer for the q_buf to attention.
-        //
-        // Solution: use a small re-pack kernel (or ditch slice for Q —
-        // just have attention read the qkv buffer with strides). For now,
-        // let's flush, gather Q/K/V by hand to CPU, re-upload. This costs
-        // a CB sync per layer — undermines the point.
-        //
-        // BETTER: load the qkv buffer into a CPU staging vector once per
-        // layer (after CB sync), then proceed. But that means per-layer CB
-        // commits.
-        //
-        // BEST: write a slice/re-pack kernel that takes [N, qkv_rows] and
-        // writes into [N, q_rows], [N, k_rows], [N, v_rows] in one
-        // dispatch. All on the shared CB. Below: do this CPU-side for now
-        // and optimize in J2.
-
-        // Flush to read qkv. Then re-open. (Penalty: CB commit per layer
-        // for this slice. To fix in J2 with a re-pack kernel.)
-        metal.flushForwardPassCB();
-        std::vector<float> qkv_host(N * qkv_rows_);
-        metal.downloadFromBuffer(buf_qkv, qkv_host.data(), N * qkv_rows_ * sizeof(float));
-        std::vector<float> q_host(N * q_rows_);
-        std::vector<float> k_host(N * k_rows_);
-        std::vector<float> v_host(N * v_rows_);
-        for (size_t r = 0; r < N; ++r) {
-            const float* src = qkv_host.data() + r * qkv_rows_;
-            std::copy(src, src + q_rows_, q_host.data() + r * q_rows_);
-            std::copy(src + q_rows_, src + q_rows_ + k_rows_, k_host.data() + r * k_rows_);
-            std::copy(src + q_rows_ + k_rows_, src + qkv_rows_, v_host.data() + r * v_rows_);
+        // The compound encoder uses memoryBarrierWithScope:Buffers between
+        // its internal split→rope→cast dispatches. Cross-encoder hazard
+        // tracking (next encoder = scatter) is THEN handled by a forced
+        // CB boundary — empirically Metal's tracked-mode buffers don't
+        // see the dep without one, even with explicit options bits set.
+        // Single per-layer commit, no host roundtrip = ~1 ms each vs the
+        // ~3-5 ms download+upload of the pre-M1 walker.
+        {
+            auto tp = std::chrono::steady_clock::now();
+            metal.encodeQkvSplitRopeCast(buf_qkv,
+                                          buf_q, buf_k, buf_v,
+                                          buf_kv_f16_k, buf_kv_f16_v,
+                                          rope_cos_buf, rope_sin_buf,
+                                          N, num_heads_, kv_heads_, head_dim_,
+                                          qkv_rows_, q_rows_, k_rows_, v_rows_,
+                                          rotary_dim_);
+            metal.flushForwardPassCB();
+            metal.beginForwardPassCB();
+            profile("qkv_split_rope_cast", tp);
         }
-
-        // CPU rope for Q + K (both arrive pre-rope from qkv matmul).
-        if (rotary_dim_ > 0) {
-            for (size_t r = 0; r < N; ++r) {
-                std::vector<float> cos, sin;
-                computeRotaryCoefficients(slots[r].sequence_position, rotary_dim_,
-                                          rope_base_, rope_scale_, cos, sin);
-                for (size_t h = 0; h < num_heads_; ++h)
-                    applyRotaryEmbedding(q_host.data() + (r * num_heads_ + h) * head_dim_,
-                                         cos, sin, head_dim_, rotary_dim_);
-                for (size_t h = 0; h < kv_heads_; ++h)
-                    applyRotaryEmbedding(k_host.data() + (r * kv_heads_ + h) * head_dim_,
-                                         cos, sin, head_dim_, rotary_dim_);
-            }
-        }
-        // Upload rotated Q to buf_q. K/V to fp16 staging buffers for scatter.
-        metal.uploadToBuffer(buf_q, q_host.data(), q_bytes);
-        std::vector<uint16_t> k_f16(N * kv_heads_ * head_dim_);
-        std::vector<uint16_t> v_f16(N * kv_heads_ * head_dim_);
-        castF32toF16(k_host.data(), k_f16.data(), k_f16.size());
-        castF32toF16(v_host.data(), v_f16.data(), v_f16.size());
-        metal.uploadToBuffer(buf_kv_f16_k, k_f16.data(), kv_f16_bytes);
-        metal.uploadToBuffer(buf_kv_f16_v, v_f16.data(), kv_f16_bytes);
-
-        // Re-open CB for the rest of this layer.
-        metal.beginForwardPassCB();
 
         // Scatter K, V into per-layer paged storage.
         {
@@ -387,28 +371,17 @@ BatchedDecodeOutput BatchedWalker::step(const std::vector<RequestSlot>& slots) {
             profile("q4_matmul_ffn_gu", tp);
         }
 
-        // Slice gate_up to gate, up — same problem as qkv. Flush and CPU split.
-        metal.flushForwardPassCB();
-        std::vector<float> gu_host(N * ffn_gate_up_rows_);
-        metal.downloadFromBuffer(buf_gate_up, gu_host.data(), gu_host.size() * sizeof(float));
-        std::vector<float> gate_host(N * ffn_inner_);
-        std::vector<float> up_host(N * ffn_inner_);
-        for (size_t r = 0; r < N; ++r) {
-            const float* src = gu_host.data() + r * ffn_gate_up_rows_;
-            std::copy(src, src + ffn_inner_, gate_host.data() + r * ffn_inner_);
-            std::copy(src + ffn_inner_, src + ffn_gate_up_rows_,
-                      up_host.data() + r * ffn_inner_);
-        }
-        metal.uploadToBuffer(buf_gate, gate_host.data(), ffn_inner_bytes);
-        metal.uploadToBuffer(buf_up,   up_host.data(),   ffn_inner_bytes);
-
-        metal.beginForwardPassCB();
-
-        // SiLU * mul: buf_gate, buf_up → buf_ffn_mix
+        // M1: gate/up split + SiLU·up in one compound encoder + forced
+        // CB boundary so the next encoder (ffn_down matmul) reads the
+        // committed buf_ffn_mix value.
         {
             auto tp = std::chrono::steady_clock::now();
-            metal.encodeSiluMulBatched(buf_gate, buf_up, buf_ffn_mix, N * ffn_inner_);
-            profile("silu_mul", tp);
+            metal.encodeGateUpSplitSiluMul(buf_gate_up,
+                                            buf_gate, buf_up, buf_ffn_mix,
+                                            N, ffn_inner_, ffn_gate_up_rows_);
+            metal.flushForwardPassCB();
+            metal.beginForwardPassCB();
+            profile("gate_up_silu_mul", tp);
         }
 
         // ffn_down matmul: buf_ffn_mix → buf_ffn_down

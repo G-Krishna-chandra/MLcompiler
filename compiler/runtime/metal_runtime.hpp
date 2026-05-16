@@ -532,6 +532,51 @@ public:
                                      size_t batch,
                                      const void* src_buffer) const;
 
+    // Phase M1 — compound encoders. Cross-encoder hazard tracking on
+    // back-to-back small kernels (rope→cast, split→silu_mul) is
+    // unreliable; bundling dependent dispatches into one serial
+    // compute encoder + memoryBarrierWithScope gives the documented
+    // ordering guarantee. Used by BatchedWalker.
+    bool encodeQkvSplitRopeCast(void* qkv_buf,
+                                void* q_buf, void* k_buf, void* v_buf,
+                                void* k_f16_buf, void* v_f16_buf,
+                                void* cos_buf, void* sin_buf,
+                                size_t batch, size_t num_heads, size_t kv_heads,
+                                size_t head_dim, size_t qkv_rows,
+                                size_t q_rows, size_t k_rows, size_t v_rows,
+                                size_t rotary_dim) const;
+
+    bool encodeGateUpSplitSiluMul(void* gate_up_buf,
+                                   void* gate_buf, void* up_buf, void* out_buf,
+                                   size_t batch, size_t ffn_inner,
+                                   size_t ffn_gate_up_rows) const;
+
+    // Phase M1 — strided slice copy onto the open forward-pass CB.
+    // Output: dst[r*dim + i] = src[r*src_stride + offset + i]. Used by
+    // BatchedWalker to extract Q/K/V from a fused qkv buffer (or
+    // gate/up from gate_up) without round-tripping to the host.
+    bool encodeStridedCopyF32(void* src_buf,
+                              size_t src_stride,
+                              size_t offset,
+                              void* dst_buf,
+                              size_t dim,
+                              size_t batch) const;
+
+    // Phase M1 — bulk fp32→fp16 cast on the open forward-pass CB.
+    bool encodeCastF32ToF16(void* src_buf, void* dst_buf, size_t length) const;
+
+    // Phase M1 — batched RoPE encoded onto the open forward-pass CB.
+    // cos/sin are pre-uploaded GPU buffers (caller uploads once per pass
+    // and reuses across all layers; tables are position-only, not
+    // layer-dependent). Same kernel as runBatchedRope but no commit/wait.
+    bool encodeBatchedRope(void* data_buf,
+                           void* cos_buf,
+                           void* sin_buf,
+                           size_t batch,
+                           size_t n_heads,
+                           size_t head_dim,
+                           size_t rotary_dim) const;
+
     // Phase B2b (continuous batching) — looped Q4_0 mat-vec for N requests.
     // input is shape [batch, cols] (row n at offset n*cols); output is
     // [batch, rows]. Internally dispatches the existing q4_0 v2/v3 kernel
