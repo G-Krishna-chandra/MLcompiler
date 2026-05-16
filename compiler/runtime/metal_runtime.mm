@@ -2167,10 +2167,9 @@ struct PagedFlashParams {
     uint page_size_tokens;
     uint elements_per_page;   // page_size_tokens * kv_heads * head_dim
     uint apply_causal;        // 0 or 1
+    uint tile_size;           // tokens per softmax tile (16 or 32; capped by tg memory)
     float inv_sqrt_d;
 };
-
-constant uint PAGED_FLASH_TILE = 32u;
 
 kernel void paged_flash_attention(
     device const float* Q                 [[buffer(0)]],   // [batch, num_heads, head_dim]
@@ -2185,7 +2184,7 @@ kernel void paged_flash_attention(
     threadgroup float* tg_buf             [[threadgroup(0)]],
     uint  tgid [[threadgroup_position_in_grid]],
     uint  t    [[thread_position_in_threadgroup]]) {
-    const uint T = PAGED_FLASH_TILE;
+    const uint T = params.tile_size;
     const uint D = params.head_dim;
 
     // 1D dispatch: tgid = req_idx * num_heads + head_idx.
@@ -7077,7 +7076,7 @@ bool MetalExecutor::encodePagedFlashAttention(void* q_buf,
         struct ParamsHost {
             uint32_t num_heads; uint32_t kv_heads; uint32_t head_dim;
             uint32_t page_size_tokens; uint32_t elements_per_page;
-            uint32_t apply_causal; float inv_sqrt_d;
+            uint32_t apply_causal; uint32_t tile_size; float inv_sqrt_d;
         } params;
         params.num_heads = static_cast<uint32_t>(num_heads);
         params.kv_heads  = static_cast<uint32_t>(kv_heads);
@@ -7086,10 +7085,26 @@ bool MetalExecutor::encodePagedFlashAttention(void* q_buf,
         params.elements_per_page = static_cast<uint32_t>(page_size_tokens * kv_heads * head_dim);
         params.apply_causal = apply_causal ? 1u : 0u;
         params.inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+        // Threadgroup memory layout: shared_q[D] + tile_K[T*D] + tile_V[T*D]
+        // + tile_scores[T] + partial[D] = 2*D + T*(2*D + 1) floats. M3 Pro
+        // caps threadgroup memory at 32 KB = 8192 floats, so cap T such that
+        // 2*D + T*(2*D+1) <= 8192. For head_dim=64 this allows T=32; for
+        // head_dim=128 it forces T=16. Round down to the nearest multiple
+        // of 8 to keep K/V load loops well-aligned.
+        const size_t kTGFloatBudget = 8192;  // 32 KB / sizeof(float)
+        size_t budget = (kTGFloatBudget > 2 * head_dim) ? (kTGFloatBudget - 2 * head_dim) : 0;
+        size_t denom  = 2 * head_dim + 1;
+        size_t tile = denom > 0 ? std::min<size_t>(32, budget / denom) : 1;
+        if (tile < 1) tile = 1;
+        // Round to multiple of 8 (down) so loops divide evenly. 8 is the
+        // smallest tile we still permit; below that perf collapses.
+        if (tile >= 8) tile -= (tile % 8);
+        params.tile_size = static_cast<uint32_t>(tile);
+        size_t T_runtime = params.tile_size;
         [enc setBytes:&params length:sizeof(params) atIndex:8];
 
-        constexpr uint32_t T = 32;
-        size_t tg_floats = head_dim + 2 * T * head_dim + T + head_dim;
+        size_t tg_floats = head_dim + 2 * T_runtime * head_dim + T_runtime + head_dim;
         [enc setThreadgroupMemoryLength:tg_floats * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(batch * num_heads, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(head_dim, 1, 1)];

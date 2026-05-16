@@ -437,12 +437,21 @@ bool ExecutionPlanBuilder::tensorMatchesHidden(const frontend::GGUFTensorInfo& i
 }
 
 std::string ExecutionPlanBuilder::selectHeadTensor(const frontend::GGUFLoader& loader, size_t hidden_size) {
+    // Named candidates checked in order. For tied-embedding models (Llama
+    // 3.x, Gemma) the head IS the embedding tensor, so include token_embd
+    // explicitly rather than relying on the "any matching tensor"
+    // fallback below — that fallback would happily pick a per-block weight
+    // like `blk.N.ffn_gate_up.weight` which also matches hidden_size in
+    // dim 0 but produces garbage logits at the lm_head matmul.
     static const std::vector<std::string> candidates = {
         "output.weight",
         "lm_head.weight",
         "model.output.weight",
         "model.lm_head.weight",
-        "head.weight"
+        "head.weight",
+        "token_embd.weight",
+        "model.token_embd.weight",
+        "tok_embeddings.weight"
     };
 
     const auto& tensors = loader.tensors();
@@ -458,7 +467,10 @@ std::string ExecutionPlanBuilder::selectHeadTensor(const frontend::GGUFLoader& l
         }
     }
 
+    // Last-resort fallback: any matching tensor that does NOT live inside a
+    // transformer block (per-layer weights are never the head).
     for (const auto& [name, info] : tensors) {
+        if (name.rfind("blk.", 0) == 0) continue;
         if (is_valid(info)) return name;
     }
     return "";
