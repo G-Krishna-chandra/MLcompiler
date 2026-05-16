@@ -384,7 +384,13 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
         }
     }
 
-    // LM head / logits
+    // LM head / logits.
+    //
+    // Some models (Llama 3.x, Gemma) tie the lm_head to the embedding
+    // matrix and ship no separate output.weight tensor. Fall through to
+    // token_embd.weight (the embedding tensor we already located) so the
+    // graph still gets a head node — the executor reads it transposed
+    // for the matmul, the same way upstream runtimes do.
     static const std::vector<std::string> head_candidates = {
         "output.weight",
         "lm_head.weight",
@@ -397,6 +403,10 @@ std::unique_ptr<Graph> IRBuilder::BuildFromLoader(const frontend::GGUFLoader& lo
             head_name = candidate;
             break;
         }
+    }
+    if (head_name.empty() && !embedding_name.empty() &&
+        loader.tensors().count(embedding_name)) {
+        head_name = embedding_name;
     }
     if (head_name.empty()) head_name = head_candidates.front();
     Tensor* head_weight = lookupWeight(*graph, head_name);
