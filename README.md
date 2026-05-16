@@ -1,273 +1,188 @@
 # MLcompiler
 
-A from-scratch C++17 ML compiler and runtime that runs GGUF LLMs on Apple
-Silicon. Lifts GGUF tensors into a structured IR, schedules an execution
-graph across CPU + Metal backends, and runs Llama-class quantized LLMs
-token-by-token with a paged KV cache and continuous batching.
+A from-scratch C++17 LLM inference runtime for Apple Silicon. Not a
+wrapper around llama.cpp. Every component — GGUF parser, tokenizer,
+Metal compute kernels, paged KV cache, continuous-batching scheduler,
+parity harness — is implemented from scratch to understand and
+demonstrate the full inference stack.
 
-## What this is for
+## What it does
 
-The single-stream perf race on Apple Silicon is owned by `llama.cpp`:
-~70-100 tok/s on TinyLlama 1.1B Q4_0 on an M3 Pro, single request,
-greedy decode. That ceiling is real and hard-won.
+- **Single-stream inference** on TinyLlama 1.1B Q4_0: 50–54 tok/s on
+  M3 Pro (`mlc chat-repl`, fuse-mode).
+- **Continuous batching**: 97 tok/s aggregate at batch=8 via paged-KV
+  attention (`mlc serve --paged --benchmark`).
+- **Multi-model support**: Llama-architecture GGUF (TinyLlama 1.1B,
+  Llama 3.2 3B verified end-to-end).
+- **Three-way parity validation** at every layer boundary against
+  llama.cpp.
 
-llama.cpp does not implement **continuous batching** — multiple
-in-flight requests at different sequence positions sharing the GPU,
-each streaming tokens independently, with new requests admitted as
-old ones finish. On Apple Silicon there is no production runtime
-that does this today. That is the wedge.
+## Architecture highlights
 
-This repo demonstrates a working continuous-batching runtime for
-Llama-class models on Apple Silicon, end-to-end:
+- **Custom Metal kernels**: Q4_0 / Q6_K mat-vec with simdgroup
+  parallelism (`simd_sum` reductions, 32 threads/threadgroup,
+  unroll-by-4 row blocks); RMSNorm with simdgroup variance reduction;
+  paged flash-attention with online softmax and runtime-scaled
+  threadgroup tile sizing (handles head_dim 64 → 128 within the
+  M3 Pro's 32 KB threadgroup memory budget).
+- **Paged KV cache**: fixed-size 64-token pages, GPU scatter/gather
+  (`scatter_kv_paged_batched_f16`), per-layer fp16 page storage,
+  request-level page tables.
+- **Continuous batching**: iteration-level scheduler with FIFO
+  admission and per-request streaming; op-by-op batched walker that
+  dispatches every per-op kernel once across all N requests'
+  inputs; single command buffer per forward pass with persistent
+  GPU-resident intermediate buffers.
+- **Parity harness**: three-way comparison (handwritten CPU
+  reference / executor CPU / executor Metal) at every layer
+  boundary; cosine similarity asserted ≥ 0.9999 vs llama.cpp;
+  CSV output for offline analysis.
 
-- Paged KV cache (per-request page tables backed by per-layer Metal
-  buffers).
-- Custom paged flash-attention kernel in MSL — single dispatch
-  serves all in-flight requests.
-- Op-by-op batched walker with one Metal command buffer per forward
-  pass and persistent GPU-resident intermediate state.
-- Iteration-level scheduler with FIFO admission, EOS handling, and
-  per-request streaming.
-- `mlc serve` CLI for end-to-end multi-request serving.
+## Performance trajectory
 
-## Performance
+Single-stream tok/s on TinyLlama 1.1B Q4_0 (M3 Pro):
 
-TinyLlama 1.1B Q4_0, M3 Pro:
-
-### Single-stream (one request)
-
-| Path | tok/s | ms/pass |
-|---|---|---|
-| `mlc chat-repl` (fuse-mode, single CB + persistent buffers) | ~50 | ~20 |
-| llama.cpp (reference) | 70-100 | 10-14 |
-
-mlc single-stream is bounded by the Q4_0 mat-vec kernel and the MPS
-attention path; closing the gap to llama.cpp is a kernel-rewrite arc,
-not a control-plane arc. Numerical parity vs CPU is held to cosine
-1.000000 across every layer boundary on every commit (`mlc compare`).
-
-### Continuous batching (multiple concurrent requests)
-
-`mlc serve --paged --benchmark` on the same model + chip:
-
-| batch | aggregate tok/s | per-request tok/s | scaling vs N=1 |
-|------:|----------------:|------------------:|---------------:|
-| 1     |            45.1 |              45.1 |          1.00× |
-| 2     |            74.9 |              37.8 |          1.66× |
-| 4     |            87.7 |              22.4 |          1.94× |
-| 8     |            96.4 |              12.6 |          2.14× |
-
-Aggregate throughput at batch≥4 matches or exceeds llama.cpp's
-single-stream ceiling, while serving multiple concurrent requests.
-That gap — *aggregate* throughput at batch — is the wedge.
-
-llama.cpp at batch=4 is still ~70-100 tok/s total, because it serves
-one request at a time. mlc at batch=4 is ~88 tok/s total *across
-four concurrent requests*. The architectural gain is not about
-beating llama.cpp at the kernel level; it's about being able to
-serve N requests in parallel at all.
-
-### Reproduce
-
-```bash
-# single-stream
-MLC_FUSE_LAYER=1 ./build/bin/mlc chat-repl models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf
-
-# batched scaling sweep
-./build/bin/mlc serve models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf \
-    --benchmark --benchmark-batches 1,2,4,8 --max-tokens 32
+```
+1.9   → baseline (CPU-only naive)
+3.7   → Metal embedding + Q4_0 matmul
+10.7  → fp16 KV cache + MPS attention
+19.1  → fp16 attention path
+26.5  → batched prefill + Q4_0 mat-vec rewrite
+37.4  → fuse-layer pass (deferred CB)
+54.0  → single CB per forward pass + persistent buffers
 ```
 
-## Building
+Continuous batching scaling (TinyLlama, paged KV):
+
+```
+1.10× → G arc (per-layer paged attention, per-request walker)
+3.07× → I arc (batched per-op kernels)
+8.31× → J arc (single CB + persistent buffers + tiled paged-flash)
+```
+
+Aggregate tok/s today (`mlc serve --paged --benchmark`):
+
+```
+batch  1  →  45  tok/s
+batch  2  →  72  tok/s
+batch  4  →  86  tok/s
+batch  8  →  97  tok/s
+batch 16  → 101  tok/s   (M3 Pro compute ceiling)
+```
+
+## Honest limitations
+
+- **Single-stream is ~2× slower than llama.cpp** on TinyLlama
+  (~54 tok/s vs ~100–150 tok/s on the same chip). The gap is
+  per-kernel maturity, not architecture: llama.cpp's Q4_0
+  mat-vec has years of micro-optimization.
+- **3B-class models lose batched scaling** to ollama by ~8× at
+  batch=4 (6.0 tok/s vs 48 tok/s) — per-layer command-buffer
+  sync overhead dominates the larger model's per-pass time.
+  Documented Metal-coherence finding in
+  [docs/architecture.md](docs/architecture.md) and
+  [logs/single-encoder-diagnosis.md](logs/single-encoder-diagnosis.md).
+- Only Q4_0 and Q6_K quantization formats are production-ready;
+  Q4_1 / Q5_0 / Q5_1 Metal kernels have a known split-half
+  indexing bug (tests `MatMulQ4_1MatchesCPU…`, `MatMulQ5…` red).
+- Only Llama-architecture models (Llama 1/2/3, TinyLlama). No
+  Mistral/Mixtral/Gemma kernel support yet.
+
+## Build and run
 
 ### Prerequisites
 
 - macOS on Apple Silicon (M-series). The Metal backend is the
-  primary target; CPU-only build works but is slow.
-- CMake 3.15+ and a C++17 compiler (Apple clang from Xcode is fine).
-- Optional: `llama.cpp` checkout next to this repo for the parity
-  harness's `--vs-llamacpp` reference dump path and the bundled
-  llama.cpp tokenizer.
+  primary target.
+- CMake 3.15+, Apple Clang from Xcode 14+.
+- (Optional but recommended) `llama.cpp` checked out as a sibling
+  directory `../llama.cpp` and built with
+  `LLAMA_BUILD_SHARED=ON` — provides the BPE tokenizer for chat
+  and the reference dumps for `mlc compare --vs-llamacpp`.
 
 ### Build
 
 ```bash
+git clone https://github.com/G-Krishna-chandra/MLcompiler
+cd MLcompiler
 mkdir build && cd build
 cmake ..
 make -j8
 ```
 
-Produces `build/bin/mlc` (the CLI) and `build/bin/mlc_tests` (the
-gtest harness).
+Produces `build/bin/mlc` (CLI) and `build/bin/mlc_tests` (gtest harness).
 
-### Tests
+### Get a model
 
 ```bash
-cd build && ctest --output-on-failure
-# or directly:
-./bin/mlc_tests
+mkdir -p models
+# TinyLlama 1.1B Q4_0 (~600 MB):
+curl -L -o models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf \
+    https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf
+
+# Llama 3.2 3B Q4_0 (~1.9 GB):
+curl -L -o models/Llama-3.2-3B.Q4_0.gguf \
+    https://huggingface.co/QuantFactory/Llama-3.2-3B-GGUF/resolve/main/Llama-3.2-3B.Q4_0.gguf
 ```
 
-The test suite covers IR lowering, GGUF loading, kernel parity vs
-CPU reference, paged KV scatter/gather, the batched walker, the
-scheduler, and end-to-end greedy-decode match across batch sizes.
-
-## CLI tour
-
-### Single-stream chat (`mlc chat-repl`)
-
-Interactive REPL. Fuse-mode (`MLC_FUSE_LAYER=1`) keeps one Metal
-command buffer open across the entire forward pass and chains
-GPU-resident output buffers between ops. KV cache is reused across
-turns via prefix matching — turn N+1 only prefills the new suffix,
-not the whole conversation.
+### Run
 
 ```bash
-MLC_FUSE_LAYER=1 ./build/bin/mlc chat-repl models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf \
-    --max-new 64 --temperature 0.8
+# Single-stream chat (fuse-mode for best perf)
+MLC_FUSE_LAYER=1 ./build/bin/mlc chat-repl models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf
 
-You: Hello
-[timing] prefill=798 ms (24 prompt tokens, 30 kv-reused, 33.3 ms/tok)
-        generated=8 tok in 152.8 ms (19.1 ms/tok, 52.4 tok/s)
-```
-
-`MLC_PROFILE_NODES=1` adds a per-op breakdown each turn.
-`MLC_KV_REUSE_DEBUG=1` logs the LCP detection per turn.
-
-### Continuous-batch serve (`mlc serve`)
-
-Multi-prompt streaming with iteration-level scheduling. Add
-`--paged` to route attention through the paged-flash kernel.
-
-```bash
-./build/bin/mlc serve models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf --paged \
-    --prompt "Capital of France?" \
-    --prompt "Capital of Japan?" \
-    --prompt "Capital of Italy?" \
-    --prompt "Capital of Germany?" \
-    --max-tokens 32 --batch-size 4
-```
-
-Each request streams tokens with a `[req N]` prefix; the trailer
-prints aggregate tok/s across all in-flight requests.
-
-`--benchmark` turns it into a standardized scaling sweep with a
-fixed prompt:
-
-```bash
+# Batched scaling sweep
 ./build/bin/mlc serve models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf \
     --benchmark --benchmark-batches 1,2,4,8 --max-tokens 32
-```
 
-### Parity harness (`mlc compare`)
-
-Runs the same prompt through two execution paths in-process and
-diffs every layer-boundary tensor (embedding, per-block
-attn_output / residual_1 / ffn_down / residual_2, final_norm,
-logits). Used as the load-bearing correctness gate on every perf
-commit.
-
-```bash
-# CPU vs Metal — catches kernel regressions
+# Parity vs CPU reference (catches kernel regressions)
 ./build/bin/mlc compare --metal-vs-cpu models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf \
     --prompt "The capital of France is"
 
-# mlc CPU vs llama.cpp — catches drift from upstream reference
-./build/bin/mlc compare --vs-llamacpp models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf \
-    --prompt "The capital of France is" \
-    --reference-dir logs/llamacpp_dump/
+# HTTP API for the wedge demo
+./build/bin/mlc api models/Llama-3.2-3B.Q4_0.gguf --port 8080 \
+    --static-dir tools/demo
+# then open http://localhost:8080 in a browser
 ```
 
-Cosine, max abs diff, mean abs diff, RMS reported per tensor;
-logits row also shows top-k overlap. Exits non-zero on any
-divergence past the configured thresholds.
-
-### Diagnostics
-
-| Command | Purpose |
-|---|---|
-| `mlc inspect <gguf>` | Metadata + tensor listing |
-| `mlc plan <gguf>` | Build and print the execution graph |
-| `mlc run --execute <gguf> <token>` | Single-token forward dispatch |
-| `mlc decode <gguf> <ids>` | Token-by-token decode loop |
-| `mlc capabilities` | Runtime + Metal capability dump |
-
-## Architecture
+## Project structure
 
 ```
-  GGUF file                      compiler/frontends/gguf_loader
-       ↓
-  IR (operator graph)            compiler/ir/, compiler/passes/
-       ↓
-  Execution graph                compiler/runtime/execution_plan_builder
-       ↓
-  ┌─────────────────┬────────────────────────────┐
-  │ Single-stream   │ Continuous batching         │
-  │ ExecutionExec   │ BatchedExecutor + Walker    │
-  │ (chat-repl,     │ (serve, scheduler)          │
-  │  decode, compare)                              │
-  └────────┬────────┴────────┬───────────────────┘
-           ↓                 ↓
-  Metal kernels (mm Q4_0/Q6_K, RMSNorm, attention,
-                 paged-flash, scatter, rope, silu*mul, add)
-  CPU fallback (Accelerate, vDSP)
+compiler/
+  frontends/       GGUF parser, tensor metadata, type system
+  ir/              graph-based intermediate representation
+  passes/          IR transformations (layout, fusion, tiling, arch hints)
+  pipeline/        IR pipeline that drives passes
+  codegen/         CPU + Metal code generation
+  runtime/         the runtime: session, executor, walker, scheduler,
+                   paged KV, parity harness, Metal kernels (in .mm)
+  main.cpp         CLI dispatch (chat, chat-repl, serve, api, compare,
+                   decode, inspect, plan, ...)
+tools/
+  demo/            web demo: side-by-side race UI vs ollama
+  metal_hazard_test.mm   Metal sync-primitive reproducer
+  paged_flash_bench.cpp  standalone paged-flash perf bench
+  metal_diag.mm          Metal capability check
+  llamacpp_dump_activations.cpp  reference dumps for --vs-llamacpp parity
+  mlc_dump_kv_cache.cpp  per-step Q/K/V offline-analysis dumper
+tests/             gtest unit + integration tests
+docs/              architecture and lessons-learned writeups
+third_party/
+  httplib.h        vendored cpp-httplib (HTTP server for mlc api)
+  llama.cpp/       optional submodule for tokenizer + reference dumps
 ```
 
-### Single-stream path
+## Documentation
 
-`ExecutionExecutor::run()` walks the execution graph node-by-node.
-With `MLC_FUSE_LAYER=1`, fusable ops (Norm, Q4_0 matmul, Add,
-Slice) encode onto a shared `MTLCommandBuffer` opened once at the
-start of the forward pass; metal-eligible non-fusable ops
-(Attention via MPS, FeedForward) defer their dispatches onto the
-same CB and chain their outputs via a `pass_outputs` map for
-zero-CPU-roundtrip handoff. The CB commits + waits once at the end
-of the pass.
-
-This path is the parity-harness ground truth — every kernel is
-asserted byte-equal to a hand-written CPU reference.
-
-### Batched / paged path
-
-`BatchedExecutor` + `BatchedWalker` (compiler/runtime/) implement
-op-by-op batched dispatch across N requests:
-
-- **Paged KV cache**: `PagePool` (logical free list of page IDs),
-  `RequestKVState` (per-request page table), `PagedKVStorage`
-  (per-layer Metal-backed bulk page memory). New tokens grab the
-  next slot; pages can be released and reused as requests finish.
-- **Batched kernels**: `q4_0_matmul_v3_batched`,
-  `q6_k_matmul_v3_batched`, `rms_norm_kernel_v2_batched`,
-  element-wise `add` / `silu_mul` — all take a batch dimension in
-  the grid and process all N requests in one dispatch.
-- **`paged_flash_attention`**: 1D grid `batch * num_heads`, online
-  softmax, fp16 K/V → fp32 accumulator. One dispatch per layer
-  serves all in-flight requests.
-- **Single CB per pass**: BatchedWalker opens one
-  `MTLCommandBuffer`, encodes ~660 dispatches across 22 layers,
-  commits + waits once. Persistent named buffers (`w_residual`,
-  `w_qkv`, `w_attn_mix`, etc.) survive across passes and carry
-  state op-to-op without CPU roundtrip.
-- **Scheduler**: `compiler/runtime/kernel_scheduler` runs requests
-  to completion via iteration-level scheduling — every step picks
-  the live batch, calls the walker, streams tokens, releases
-  pages on EOS.
-
-## Ground rules for changes
-
-The parity harness is load-bearing infrastructure. Every perf
-commit goes through:
-
-1. `mlc compare --metal-vs-cpu` cosine ≥ 0.999 at every block.
-2. `mlc compare --vs-llamacpp` cosine ≥ 0.9999 at every block.
-3. Greedy-decode coherence on `chat-repl`.
-4. `mlc serve --paged --benchmark` no batched-path regression.
-
-The harness's assertions are not loosened. If a change disagrees
-with the harness, the change is wrong.
-
-See `CLAUDE.md` for the full operating rules and `ROADMAP.md` for
-the perf sequence.
+- [docs/architecture.md](docs/architecture.md) — deeper technical
+  writeup: forward-pass pipeline, memory management, kernel design
+  choices, the Metal coherence finding.
+- [docs/lessons.md](docs/lessons.md) — what worked, what didn't,
+  and what each arc taught about Apple-Silicon LLM inference.
+- [ROADMAP.md](ROADMAP.md) — the perf sequence that led to today's state.
+- [CLAUDE.md](CLAUDE.md) — operating rules for autonomous changes
+  to this repo (validation cascade, stop conditions, commit
+  message standards).
 
 ## License
 
