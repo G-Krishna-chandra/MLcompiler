@@ -180,9 +180,6 @@ third_party/
 - [docs/lessons.md](docs/lessons.md) — what worked, what didn't,
   and what each arc taught about Apple-Silicon LLM inference.
 - [ROADMAP.md](ROADMAP.md) — the perf sequence that led to today's state.
-- [CLAUDE.md](CLAUDE.md) — operating rules for autonomous changes
-  to this repo (validation cascade, stop conditions, commit
-  message standards).
 
 ## License
 

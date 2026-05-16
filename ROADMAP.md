@@ -127,14 +127,12 @@ Capture `[timing]` and `[profile]` output. Compare against the previous commit's
 
 If the new commit's tok/s is lower than the previous commit's, that's a perf regression. Stop, investigate, do not commit until resolved or until the regression is consciously accepted with a written justification.
 
-## Operating rules for autonomous work
-
-These apply when running without a human in the loop. See CLAUDE.md for the full operating spec.
+## Working rules
 
 - Every commit goes through the full validation cascade. No skipping steps because they passed last time.
 - Parity claims require harness verification. "It looks right" is not parity.
 - Commit messages describe what changed, what the measured speedup was, and what the next bottleneck is. Future-you (or future contributors) read these to understand the project's trajectory.
-- When in doubt about a design decision, prefer the choice that's architecturally compatible with continuous batching (item 5). If a perf optimization makes batching harder later, flag it in the commit body or stop and write to the session report.
+- When in doubt about a design decision, prefer the choice that's architecturally compatible with continuous batching (item 5). If a perf optimization makes batching harder later, flag it in the commit body or stop and write a note.
 - The parity harness is load-bearing infrastructure. Do not weaken its assertions to make a commit pass. If the harness catches a regression, the regression is real.
 
 ## Project facts worth remembering

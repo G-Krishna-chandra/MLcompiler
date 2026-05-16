@@ -174,20 +174,20 @@ would have been too risky to land.
 **Lesson**: invest in your safety net BEFORE you take the risks
 that the safety net protects you from. The 1 week spent building
 the parity harness probably saved 1 month of debugging downstream
-when something inevitably went wrong. The CLAUDE.md operating rule
-"never weaken the harness to make a commit pass" exists because
-this principle is non-obvious to anyone who hasn't been burned.
+when something inevitably went wrong. "Never weaken the harness to
+make a commit pass" became a hard rule because this principle is
+non-obvious to anyone who hasn't been burned.
 
 ## On stopping when you said you would
 
-Three perf arcs in a row I attempted past the documented stop
+Three perf arcs in a row I pushed past the documented stop
 condition because "one more change should fix it." All three
 times, the next change didn't fix it, and I spent hours more than
-budgeted before stopping. The session report became progressively
+budgeted before stopping. The session notes became progressively
 less honest about what was actually happening.
 
 After arc M (the agentic demo / Llama 3.2 3B push), I started
-strictly enforcing the two-attempt rule from CLAUDE.md. Output
+strictly enforcing a two-attempt rule on each perf goal. Output
 quality went up: cleaner stop reports, faster iteration, no
 "sandbagging language" creeping in. The N arc (single-encoder
 rewrite) hit the stop condition cleanly, was reverted cleanly,
