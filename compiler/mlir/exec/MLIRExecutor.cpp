@@ -477,12 +477,14 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       mx::array y_ff = [&]() {
         if (all_q4) {
           int in_dim = q4_value_dims_.at(ff.getWGate()).first;
-          // Gate+Up batched matmul through the Q4 kernel:
-          auto gu = q4_0_matmul(get(ff.getX()), cache_it->second, in_dim,
-                                 2 * ffn_dim);
-          auto g = mx::slice(gu, {0, 0}, {gu.shape(0), ffn_dim});
-          auto u = mx::slice(gu, {0, ffn_dim}, {gu.shape(0), 2 * ffn_dim});
-          auto h = mx::multiply(mx::multiply(g, mx::sigmoid(g)), u);
+          // Multi-output Q4_0 kernel: one dispatch writes gate and up
+          // into separate buffers — no mx::slice allocation between
+          // them. The combined gate||up weight is still cached on
+          // `ffn_gateup_cache_` from the concat above.
+          auto gu = q4_0_matmul_gate_up(get(ff.getX()), cache_it->second,
+                                         in_dim, ffn_dim, ffn_dim);
+          auto h = mx::multiply(mx::multiply(gu.gate, mx::sigmoid(gu.gate)),
+                                gu.up);
           int down_in = q4_value_dims_.at(ff.getWDown()).first;
           int down_out = q4_value_dims_.at(ff.getWDown()).second;
           return q4_0_matmul(h, get(ff.getWDown()), down_in, down_out);
@@ -560,21 +562,26 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
           cache_it = qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
         }
       }
-      mx::array out_arr = [&]() {
-        if (all_q4) {
-          int in_dim = q4_value_dims_.at(qkv.getWQ()).first;
-          return q4_0_matmul(n, cache_it->second, in_dim,
-                              q_dim + k_dim + v_dim);
-        }
-        return buildMatMul(n, cache_it->second, qkv.getTransposeB());
-      }();
-      put(qkv.getQ(),
-          mx::slice(out_arr, {0, 0}, {out_arr.shape(0), q_dim}));
-      put(qkv.getK(),
-          mx::slice(out_arr, {0, q_dim}, {out_arr.shape(0), q_dim + k_dim}));
-      put(qkv.getV(),
-          mx::slice(out_arr, {0, q_dim + k_dim},
-                    {out_arr.shape(0), q_dim + k_dim + v_dim}));
+      if (all_q4) {
+        int in_dim = q4_value_dims_.at(qkv.getWQ()).first;
+        // Multi-output Q4_0 kernel: one dispatch, three output buffers.
+        // Replaces the q4_0_matmul + 3*mx::slice round-trip that hurt
+        // fusion-ON in v3.
+        auto r = q4_0_matmul_qkv(n, cache_it->second, in_dim, q_dim, k_dim,
+                                  v_dim);
+        put(qkv.getQ(), r.q);
+        put(qkv.getK(), r.k);
+        put(qkv.getV(), r.v);
+      } else {
+        auto out_arr = buildMatMul(n, cache_it->second, qkv.getTransposeB());
+        put(qkv.getQ(),
+            mx::slice(out_arr, {0, 0}, {out_arr.shape(0), q_dim}));
+        put(qkv.getK(),
+            mx::slice(out_arr, {0, q_dim}, {out_arr.shape(0), q_dim + k_dim}));
+        put(qkv.getV(),
+            mx::slice(out_arr, {0, q_dim + k_dim},
+                      {out_arr.shape(0), q_dim + k_dim + v_dim}));
+      }
     } else if (auto attn = ::llvm::dyn_cast<::mlir::mlc::AttentionOp>(op)) {
       // Grow the cache lazily so an executor used without any decode
       // doesn't pay for the storage.
