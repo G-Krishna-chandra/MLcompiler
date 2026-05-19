@@ -33,8 +33,32 @@ endif()
 include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${CMAKE_SOURCE_DIR}/compiler)
 
+# Enable CTest early so add_test() calls from any subdir register. The
+# `BUILD_TESTS` option below still gates whether the gtest suite is built.
+option(BUILD_TESTS "Build tests" ON)
+if(BUILD_TESTS)
+    enable_testing()
+endif()
+
 # Add compiler subdirectories
 add_subdirectory(compiler)
+
+# MLX bridge — Phase-2 dependency for the future `mlc.matmul` GPU lowering.
+# Built when MLX is installed (Homebrew default on Apple silicon).
+option(MLC_ENABLE_MLX "Build the MLX bridge + smoke test" ON)
+if(MLC_ENABLE_MLX)
+    if(APPLE AND NOT MLC_MLX_ROOT AND EXISTS "/opt/homebrew/opt/mlx/include/mlx/mlx.h")
+        set(MLC_MLX_ROOT "/opt/homebrew/opt/mlx" CACHE PATH "MLX install prefix")
+    endif()
+    if(MLC_MLX_ROOT AND EXISTS "${MLC_MLX_ROOT}/include/mlx/mlx.h")
+        add_subdirectory(compiler/mlx_bridge)
+        set(MLC_HAVE_MLX TRUE)
+        message(STATUS "  MLX: ${MLC_MLX_ROOT}")
+    else()
+        message(STATUS "  MLX: not found, skipping mlx_bridge (set -DMLC_MLX_ROOT=...)")
+        set(MLC_ENABLE_MLX OFF)
+    endif()
+endif()
 
 # MLIR/LLVM integration. The Phase-2 compiler lives under compiler/mlir/.
 # On macOS we expect Homebrew's llvm formula (ships MLIR). The user can
@@ -67,10 +91,9 @@ if(MLC_ENABLE_MLIR)
     endif()
 endif()
 
-# Add tests if enabled
-option(BUILD_TESTS "Build tests" ON)
+# Add tests if enabled (BUILD_TESTS option was declared and enable_testing()
+# called above so subdirs registered earlier can already add tests).
 if(BUILD_TESTS)
-    enable_testing()
     add_subdirectory(tests)
 endif()
 
@@ -133,6 +156,7 @@ message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build tests: ${BUILD_TESTS}")
 message(STATUS "  MLIR enabled: ${MLC_ENABLE_MLIR}")
+message(STATUS "  MLX  enabled: ${MLC_ENABLE_MLX}")
 
 
 
