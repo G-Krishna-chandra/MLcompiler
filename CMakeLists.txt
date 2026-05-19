@@ -151,6 +151,12 @@ if(APPLE)
         "-framework Accelerate")
 endif()
 
+# ANE/CoreML probe (Objective-C++; macOS only). Needs MLC_HAVE_MLX for
+# the GPU comparison binary, so we add it after MLX detection above.
+if(APPLE)
+    add_subdirectory(compiler/coreml)
+endif()
+
 message(STATUS "MLCompiler configuration:")
 message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard: ${CMAKE_CXX_STANDARD}")
