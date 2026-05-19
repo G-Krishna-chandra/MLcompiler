@@ -148,7 +148,8 @@ int main(int argc, char **argv) {
   double toks_per_s = new_tokens > 0 ? (new_tokens / secs) : 0.0;
   std::cout << "[stats] generated " << new_tokens << " tokens in "
             << secs << "s (" << toks_per_s << " tok/s, "
-            << "resident fp16 weights, KV cache, single-token decode)\n";
+            << "Q4_0 weights + custom Metal kernel, KV cache, "
+            << "single-token decode)\n";
 
   return 0;
 }

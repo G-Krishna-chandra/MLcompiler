@@ -4,6 +4,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
+#include "llvm/ADT/DenseMap.h"
 
 #include <mlx/array.h>
 
@@ -54,9 +55,19 @@ public:
 private:
   ::mlir::ModuleOp module_;
   const ::mlc::frontend::GGUFLoader &loader_;
-  // Resident fp16 weights, keyed by GGUF tensor name (== `mlc.name` arg
-  // attr). Populated in the constructor; immutable afterward.
+  // Resident fp16 weights, keyed by GGUF tensor name. Used for non-matmul
+  // operands (norm gamma, embedding table, lm_head's Q6_K weight) and as
+  // a fallback when a matmul weight isn't in Q4_0.
   std::unordered_map<std::string, mlx::core::array> weight_cache_;
+  // Q4_0 weight bytes (raw GGUF blocks, no dequant) keyed by tensor name.
+  // Used by the custom Q4_0 Metal kernel — drops weight memory by ~2x vs
+  // the fp16-resident path.
+  std::unordered_map<std::string, mlx::core::array> q4_bytes_cache_;
+  // (in_dim, out_dim) for each Q4_0 weight, parallel to q4_bytes_cache_.
+  std::unordered_map<std::string, std::pair<int, int>> q4_dims_cache_;
+  // Set of mlir::Values bound to Q4_0 bytes (vs fp16 weights). Builders
+  // check this to dispatch to the Q4_0 kernel.
+  ::llvm::DenseMap<::mlir::Value, std::pair<int, int>> q4_value_dims_;
   // Pre-concatenated W_QKV weights, keyed by the fused_norm_qkv_matmul
   // Operation* that owns them. Populated lazily on first encounter.
   std::unordered_map<::mlir::Operation *, mlx::core::array> qkv_concat_cache_;

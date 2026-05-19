@@ -1,6 +1,8 @@
 #include "compiler/mlir/exec/MLIRExecutor.h"
 #include "compiler/mlir/exec/MLXBuilder.h"
+#include "compiler/mlir/exec/Q4MatMul.h"
 #include "compiler/mlir/exec/Quantize.h"
+#include "compiler/frontends/ggml_types.hpp"
 #include "compiler/mlir/dialect/MLCDialect.h"
 #include "compiler/mlir/dialect/MLCOps.h"
 
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace mx = mlx::core;
 
@@ -203,25 +206,54 @@ int64_t i64Of(::mlir::IntegerAttr a) { return a.getInt(); }
 MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
                            const ::mlc::frontend::GGUFLoader &loader)
     : module_(module), loader_(loader) {
-  // Pre-load every weight arg: dequant Q4_0 / Q6_K / etc. to fp32 via the
-  // runtime helpers, upload as an mx::array, cast to fp16, eval to force
-  // materialization, then drop the fp32 view. Each weight is materialized
-  // exactly once for the executor's lifetime — `run()` does zero dequant.
   auto func = *module_.getOps<::mlir::func::FuncOp>().begin();
+
+  // First pass: identify which func args are used as the weight operand of
+  // a matmul-style op (mlc.matmul, fused_norm_matmul, fused_norm_qkv_matmul,
+  // feedforward). Those are the candidates for the Q4_0 byte-resident path.
+  ::std::unordered_set<unsigned> matmul_arg_idxs;
+  auto markArg = [&](::mlir::Value v) {
+    if (auto barg = ::llvm::dyn_cast<::mlir::BlockArgument>(v))
+      matmul_arg_idxs.insert(barg.getArgNumber());
+  };
+  func.walk([&](::mlir::Operation *op) {
+    if (auto mm = ::llvm::dyn_cast<::mlir::mlc::MatMulOp>(op)) markArg(mm.getW());
+    else if (auto fnm = ::llvm::dyn_cast<::mlir::mlc::FusedNormMatMulOp>(op)) markArg(fnm.getW());
+    else if (auto qkv = ::llvm::dyn_cast<::mlir::mlc::FusedNormQKVMatMulOp>(op)) {
+      markArg(qkv.getWQ()); markArg(qkv.getWK()); markArg(qkv.getWV());
+    } else if (auto ff = ::llvm::dyn_cast<::mlir::mlc::FeedForwardOp>(op)) {
+      markArg(ff.getWGate()); markArg(ff.getWUp()); markArg(ff.getWDown());
+    }
+  });
+
+  // Second pass: per-arg, decide between Q4_0 bytes (matmul + Q4_0 dtype)
+  // and fp16 dequant (everything else, including embedding table, norm
+  // gamma, and the Q6_K lm_head weight).
   auto &entry = func.getBody().front();
   ::std::vector<mx::array> to_eval;
   to_eval.reserve(entry.getNumArguments());
   for (unsigned i = 0; i < entry.getNumArguments(); ++i) {
     const std::string &nm = argName(func, i);
-    if (nm == "ids" || nm == "positions")
-      continue;
-    auto a32 = gufWeightToMLX(loader_, nm);
-    auto a16 = mx::astype(a32, mx::float16);
-    auto [it, inserted] = weight_cache_.emplace(nm, a16);
-    if (inserted)
-      to_eval.push_back(a16);
+    if (nm == "ids" || nm == "positions") continue;
+    const auto &info = loader_.tensors().at(nm);
+    bool is_q4_target = matmul_arg_idxs.count(i) &&
+                        info.dtype == ::mlc::frontend::GGML_TYPE_Q4_0 &&
+                        info.shape.size() == 2;
+    if (is_q4_target) {
+      auto bytes = gufWeightToBytesMLX(loader_, nm);
+      q4_bytes_cache_.emplace(nm, bytes);
+      // GGUF shape is innermost-first → shape[0]=in, shape[1]=out.
+      int in_dim = static_cast<int>(info.shape[0]);
+      int out_dim = static_cast<int>(info.shape[1]);
+      q4_dims_cache_.emplace(nm, std::pair<int, int>{in_dim, out_dim});
+      to_eval.push_back(bytes);
+    } else {
+      auto a32 = gufWeightToMLX(loader_, nm);
+      auto a16 = mx::astype(a32, mx::float16);
+      auto [it, inserted] = weight_cache_.emplace(nm, a16);
+      if (inserted) to_eval.push_back(a16);
+    }
   }
-  // Batch-materialize so MLX can pipeline the host→device uploads.
   mx::eval(to_eval);
 }
 
@@ -262,6 +294,7 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
   mx::array ids_arr = makeI32(token_ids);
   mx::array pos_arr = makeI32(positions);
 
+  q4_value_dims_.clear();
   for (unsigned i = 0; i < entryBlock.getNumArguments(); ++i) {
     const std::string &nm = argName(func, i);
     auto value = entryBlock.getArgument(i);
@@ -269,8 +302,10 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       values.insert({value, ids_arr});
     } else if (nm == "positions") {
       values.insert({value, pos_arr});
+    } else if (auto q4 = q4_bytes_cache_.find(nm); q4 != q4_bytes_cache_.end()) {
+      values.insert({value, q4->second});
+      q4_value_dims_.insert({value, q4_dims_cache_.at(nm)});
     } else {
-      // GGUF weight — resident fp16, populated once in the constructor.
       auto it = weight_cache_.find(nm);
       if (it == weight_cache_.end())
         throw std::runtime_error("missing weight in cache: " + nm);
@@ -294,9 +329,17 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
   size_t attn_idx = 0;
   for (auto &op : entryBlock) {
     if (auto matmul = ::llvm::dyn_cast<::mlir::mlc::MatMulOp>(op)) {
-      put(matmul.getY(),
-          buildMatMul(get(matmul.getX()), get(matmul.getW()),
-                      matmul.getTransposeB()));
+      auto w_v = matmul.getW();
+      auto dims = q4_value_dims_.find(w_v);
+      if (dims != q4_value_dims_.end()) {
+        put(matmul.getY(), q4_0_matmul(get(matmul.getX()), get(w_v),
+                                       dims->second.first,
+                                       dims->second.second));
+      } else {
+        put(matmul.getY(),
+            buildMatMul(get(matmul.getX()), get(w_v),
+                        matmul.getTransposeB()));
+      }
     } else if (auto norm = ::llvm::dyn_cast<::mlir::mlc::NormOp>(op)) {
       put(norm.getY(),
           buildNorm(get(norm.getX()), get(norm.getGamma()),
@@ -304,21 +347,37 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
     } else if (auto add = ::llvm::dyn_cast<::mlir::mlc::AddOp>(op)) {
       put(add.getY(), buildAdd(get(add.getA()), get(add.getB())));
     } else if (auto ff = ::llvm::dyn_cast<::mlir::mlc::FeedForwardOp>(op)) {
+      auto w_gate_ty =
+          ::llvm::cast<::mlir::RankedTensorType>(ff.getWGate().getType());
+      int ffn_dim = w_gate_ty.getShape()[0];
+      bool all_q4 = q4_value_dims_.count(ff.getWGate()) &&
+                    q4_value_dims_.count(ff.getWUp()) &&
+                    q4_value_dims_.count(ff.getWDown());
       auto cache_it = ffn_gateup_cache_.find(ff.getOperation());
       if (cache_it == ffn_gateup_cache_.end()) {
         auto concat =
             mx::concatenate({get(ff.getWGate()), get(ff.getWUp())}, /*axis=*/0);
         auto owned = mx::copy(concat);
         mx::eval(owned);
-        cache_it =
-            ffn_gateup_cache_.emplace(ff.getOperation(), owned).first;
+        cache_it = ffn_gateup_cache_.emplace(ff.getOperation(), owned).first;
       }
-      auto w_gate_ty =
-          ::llvm::cast<::mlir::RankedTensorType>(ff.getWGate().getType());
-      int ffn_dim = w_gate_ty.getShape()[0];
-      put(ff.getY(),
-          buildFeedForward(get(ff.getX()), cache_it->second,
-                           get(ff.getWDown()), ffn_dim));
+      mx::array y_ff = [&]() {
+        if (all_q4) {
+          int in_dim = q4_value_dims_.at(ff.getWGate()).first;
+          // Gate+Up batched matmul through the Q4 kernel:
+          auto gu = q4_0_matmul(get(ff.getX()), cache_it->second, in_dim,
+                                 2 * ffn_dim);
+          auto g = mx::slice(gu, {0, 0}, {gu.shape(0), ffn_dim});
+          auto u = mx::slice(gu, {0, ffn_dim}, {gu.shape(0), 2 * ffn_dim});
+          auto h = mx::multiply(mx::multiply(g, mx::sigmoid(g)), u);
+          int down_in = q4_value_dims_.at(ff.getWDown()).first;
+          int down_out = q4_value_dims_.at(ff.getWDown()).second;
+          return q4_0_matmul(h, get(ff.getWDown()), down_in, down_out);
+        }
+        return buildFeedForward(get(ff.getX()), cache_it->second,
+                                 get(ff.getWDown()), ffn_dim);
+      }();
+      put(ff.getY(), y_ff);
     } else if (auto emb = ::llvm::dyn_cast<::mlir::mlc::EmbeddingOp>(op)) {
       int hidden = emb.getY().getType().getShape().back();
       put(emb.getY(),
@@ -328,39 +387,62 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
     } else if (auto fused = ::llvm::dyn_cast<::mlir::mlc::FusedNormMatMulOp>(op)) {
       auto n = buildNorm(get(fused.getX()), get(fused.getGamma()),
                          f32Of(fused.getEpsilonAttr()));
-      put(fused.getY(), buildMatMul(n, get(fused.getW()),
-                                    fused.getTransposeB()));
+      auto w_v = fused.getW();
+      auto dims = q4_value_dims_.find(w_v);
+      if (dims != q4_value_dims_.end()) {
+        put(fused.getY(), q4_0_matmul(n, get(w_v), dims->second.first,
+                                       dims->second.second));
+      } else {
+        put(fused.getY(), buildMatMul(n, get(w_v), fused.getTransposeB()));
+      }
     } else if (auto qkv = ::llvm::dyn_cast<::mlir::mlc::FusedNormQKVMatMulOp>(op)) {
       auto n = buildNorm(get(qkv.getX()), get(qkv.getGamma()),
                          f32Of(qkv.getEpsilonAttr()));
-      // Concatenate Q/K/V weights once at first use along the out-dim
-      // axis; cache keyed by the op so subsequent forward passes skip
-      // the re-concat.
-      auto cache_it = qkv_concat_cache_.find(qkv.getOperation());
-      if (cache_it == qkv_concat_cache_.end()) {
-        auto w_concat = mx::concatenate(
-            {get(qkv.getWQ()), get(qkv.getWK()), get(qkv.getWV())}, /*axis=*/0);
-        auto owned = mx::copy(w_concat);
-        mx::eval(owned);
-        cache_it =
-            qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
-      }
-      auto out = buildMatMul(n, cache_it->second, qkv.getTransposeB());
-      // out has shape [seq, q_out + k_out + v_out]. Split by the result
-      // types' last dims.
       auto q_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getQ().getType());
       auto k_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getK().getType());
       auto v_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getV().getType());
       int q_dim = q_ty.getShape().back();
       int k_dim = k_ty.getShape().back();
       int v_dim = v_ty.getShape().back();
+      bool all_q4 = q4_value_dims_.count(qkv.getWQ()) &&
+                    q4_value_dims_.count(qkv.getWK()) &&
+                    q4_value_dims_.count(qkv.getWV());
+      auto cache_it = qkv_concat_cache_.find(qkv.getOperation());
+      if (cache_it == qkv_concat_cache_.end()) {
+        if (all_q4) {
+          // Q4_0 byte concat: each row's bytes are contiguous (row_bytes =
+          // (in/32)*18); rows for Q come first, then K, then V. The Q4 kernel
+          // walks `out_total` rows in one launch.
+          auto w_concat = mx::concatenate({get(qkv.getWQ()), get(qkv.getWK()),
+                                            get(qkv.getWV())},
+                                           /*axis=*/0);
+          auto owned = mx::copy(w_concat);
+          mx::eval(owned);
+          cache_it = qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
+        } else {
+          auto w_concat = mx::concatenate({get(qkv.getWQ()), get(qkv.getWK()),
+                                            get(qkv.getWV())},
+                                           0);
+          auto owned = mx::copy(w_concat);
+          mx::eval(owned);
+          cache_it = qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
+        }
+      }
+      mx::array out_arr = [&]() {
+        if (all_q4) {
+          int in_dim = q4_value_dims_.at(qkv.getWQ()).first;
+          return q4_0_matmul(n, cache_it->second, in_dim,
+                              q_dim + k_dim + v_dim);
+        }
+        return buildMatMul(n, cache_it->second, qkv.getTransposeB());
+      }();
       put(qkv.getQ(),
-          mx::slice(out, {0, 0}, {out.shape(0), q_dim}));
+          mx::slice(out_arr, {0, 0}, {out_arr.shape(0), q_dim}));
       put(qkv.getK(),
-          mx::slice(out, {0, q_dim}, {out.shape(0), q_dim + k_dim}));
+          mx::slice(out_arr, {0, q_dim}, {out_arr.shape(0), q_dim + k_dim}));
       put(qkv.getV(),
-          mx::slice(out, {0, q_dim + k_dim},
-                    {out.shape(0), q_dim + k_dim + v_dim}));
+          mx::slice(out_arr, {0, q_dim + k_dim},
+                    {out_arr.shape(0), q_dim + k_dim + v_dim}));
     } else if (auto attn = ::llvm::dyn_cast<::mlir::mlc::AttentionOp>(op)) {
       // Grow the cache lazily so an executor used without any decode
       // doesn't pay for the storage.
