@@ -25,6 +25,7 @@ target_link_libraries(MLCExec PUBLIC
     mlc_lib
     MLIRMLCDialect
     MLIRFuncDialect
+    MLCPasses
     ${MLC_MLX_ROOT}/lib/libmlx.dylib)
 
 if(APPLE)

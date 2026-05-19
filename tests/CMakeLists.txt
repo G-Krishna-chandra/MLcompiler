@@ -87,7 +87,8 @@ endif()
 if(MLC_ENABLE_MLIR AND TARGET MLCExec)
     add_executable(mlir_exec_tests
         mlir/test_mlx_matmul_lowering.cpp
-        mlir/test_compiler_path_forward.cpp)
+        mlir/test_compiler_path_forward.cpp
+        mlir/test_norm_matmul_fusion.cpp)
     set_target_properties(mlir_exec_tests PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON

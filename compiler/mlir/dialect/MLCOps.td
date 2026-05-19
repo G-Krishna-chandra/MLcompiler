@@ -100,6 +100,31 @@ def MLC_EmbeddingOp : MLC_Op<"embedding", [Pure]> {
   }];
 }
 
+def MLC_FusedNormMatMulOp : MLC_Op<"fused_norm_matmul", [Pure]> {
+  let summary = "Fused RMSNorm + matmul: y = matmul(rms_norm(x, gamma, eps), w)";
+  let description = [{
+    Emitted by the norm+matmul fusion pass when one or more matmuls all
+    consume the same RMSNorm result. The pass copies the norm into each
+    fused op (the recomputation is cheap relative to the matmul); when all
+    of a norm's matmul users have been fused, the original norm op is dead
+    and can be DCE'd.
+  }];
+  let arguments = (ins
+      MLC_FloatTensor:$x,
+      MLC_FloatTensor:$gamma,
+      MLC_QuantTensor:$w,
+      MLC_DeviceAttr:$target_device,
+      F32Attr:$epsilon,
+      StrAttr:$quant_format,
+      DefaultValuedAttr<BoolAttr, "false">:$transpose_b
+  );
+  let results = (outs MLC_FloatTensor:$y);
+  let assemblyFormat = [{
+      $x `,` $gamma `,` $w attr-dict
+      `:` functional-type(operands, results)
+  }];
+}
+
 def MLC_LMHeadOp : MLC_Op<"lm_head", [Pure]> {
   let summary = "Project hidden state to vocabulary logits";
   let arguments = (ins

@@ -234,6 +234,11 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
           buildEmbedding(get(emb.getTable()), get(emb.getIds()), hidden));
     } else if (auto lm = ::llvm::dyn_cast<::mlir::mlc::LMHeadOp>(op)) {
       put(lm.getLogits(), buildLMHead(get(lm.getX()), get(lm.getW())));
+    } else if (auto fused = ::llvm::dyn_cast<::mlir::mlc::FusedNormMatMulOp>(op)) {
+      auto n = buildNorm(get(fused.getX()), get(fused.getGamma()),
+                         f32Of(fused.getEpsilonAttr()));
+      put(fused.getY(), buildMatMul(n, get(fused.getW()),
+                                    fused.getTransposeB()));
     } else if (auto attn = ::llvm::dyn_cast<::mlir::mlc::AttentionOp>(op)) {
       put(attn.getOut(),
           buildAttention(get(attn.getQ()), get(attn.getK()), get(attn.getV()),
