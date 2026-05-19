@@ -80,3 +80,22 @@ if(MLC_ENABLE_MLIR AND TARGET mlc-emit AND TARGET mlc-opt)
                 $<TARGET_FILE:mlc-opt>
                 ${CMAKE_SOURCE_DIR}/models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf)
 endif()
+
+# Compiler-path tests (require MLX + GGUFLoader + dialect). These live in a
+# separate gtest binary because they need C++20 (MLX headers) — the main
+# mlc_tests target is C++17 to keep the existing runtime build undisturbed.
+if(MLC_ENABLE_MLIR AND TARGET MLCExec)
+    add_executable(mlir_exec_tests mlir/test_mlx_matmul_lowering.cpp)
+    set_target_properties(mlir_exec_tests PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF)
+    target_link_libraries(mlir_exec_tests PRIVATE
+        MLCExec
+        GTest::gtest
+        GTest::gtest_main)
+    target_include_directories(mlir_exec_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/compiler)
+    add_test(NAME mlir_exec_q1_matmul COMMAND mlir_exec_tests)
+endif()
