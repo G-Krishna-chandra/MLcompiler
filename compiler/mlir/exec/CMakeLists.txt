@@ -11,11 +11,12 @@ add_library(MLCExec STATIC
     MLXBuilder.cpp
     MLIRExecutor.cpp
     Q4MatMul.cpp
-    ANEMatMul.mm)
+    ANEMatMul.mm
+    ANELayer.mm)
 
 if(APPLE)
     target_link_libraries(MLCExec PUBLIC "-framework CoreML")
-    set_source_files_properties(ANEMatMul.mm
+    set_source_files_properties(ANEMatMul.mm ANELayer.mm
         PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 

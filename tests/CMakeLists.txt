@@ -93,7 +93,8 @@ if(MLC_ENABLE_MLIR AND TARGET MLCExec)
         mlir/test_mlx_metal_kernel_smoke.cpp
         mlir/test_q4_kernel.cpp
         mlir/test_schedule_devices.cpp
-        mlir/test_ane_matmul.cpp)
+        mlir/test_ane_matmul.cpp
+        mlir/test_ane_layer.cpp)
     set_target_properties(mlir_exec_tests PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON
