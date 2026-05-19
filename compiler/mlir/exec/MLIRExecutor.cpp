@@ -134,24 +134,45 @@ mx::array buildAttention(const mx::array &q_flat, const mx::array &k_flat,
                      /*scale=*/1.0f, offset);
   k = mx::fast::rope(k, head_dim, true, 10000.0f, 1.0f, offset);
 
-  // KV cache: concat the new (post-RoPE) K and (raw) V onto whatever the
-  // cache already holds, then write a fresh, materialized copy back. K is
-  // stored fp32 to dodge the fp16 RoPE precision issue noted above; V is
-  // stored at its natural dtype.
+  // KV cache: pre-allocate K and V buffers at max-seq capacity on first
+  // use, then patch new K/V slots in via `slice_update`. Attention reads
+  // back the contiguous prefix. The old code rebuilt a new concat'd array
+  // every step (O(seq_so_far) copy per token); this is O(seq_new).
+  //
+  // 2048 covers TinyLlama's default context; bump if we run longer
+  // prompts/decodes.
+  constexpr int kMaxSeq = 2048;
+  int seq_full;
   if (cache) {
-    if (cache->K.has_value())
-      k = mx::concatenate({*cache->K, k}, /*axis=*/1);
-    if (cache->V.has_value())
-      v = mx::concatenate({*cache->V, v}, 1);
-    auto k_owned = mx::copy(k);
-    auto v_owned = mx::copy(v);
-    mx::eval({k_owned, v_owned});
-    cache->K = k_owned;
-    cache->V = v_owned;
-    k = k_owned;
-    v = v_owned;
+    if (!cache->K.has_value()) {
+      auto K0 =
+          mx::zeros({n_kv_heads, kMaxSeq, head_dim}, k.dtype());
+      auto V0 =
+          mx::zeros({n_kv_heads, kMaxSeq, head_dim}, v.dtype());
+      mx::eval({K0, V0});
+      cache->K = K0;
+      cache->V = V0;
+      cache->seq_filled = 0;
+    }
+    int start = cache->seq_filled;
+    int stop = start + seq_new;
+    if (stop > kMaxSeq)
+      throw std::runtime_error("KV cache overflow (raise kMaxSeq)");
+    auto K_new = mx::slice_update(*cache->K, k, {0, start, 0},
+                                   {n_kv_heads, stop, head_dim});
+    auto V_new = mx::slice_update(*cache->V, v, {0, start, 0},
+                                   {n_kv_heads, stop, head_dim});
+    mx::eval({K_new, V_new});
+    cache->K = K_new;
+    cache->V = V_new;
+    cache->seq_filled = stop;
+    // Attention reads the contiguous prefix only.
+    k = mx::slice(*cache->K, {0, 0, 0}, {n_kv_heads, stop, head_dim});
+    v = mx::slice(*cache->V, {0, 0, 0}, {n_kv_heads, stop, head_dim});
+    seq_full = stop;
+  } else {
+    seq_full = k.shape(1);
   }
-  int seq_full = k.shape(1);
   // Keep Q in fp32 too so the QK^T matmul is consistent with the fp32 K.
   // V stays in fp16 — the matmul to V happens after softmax, where fp32
   // probabilities multiplying fp16 values is well-conditioned.

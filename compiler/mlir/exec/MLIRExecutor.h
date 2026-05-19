@@ -17,12 +17,15 @@
 
 namespace mlir::mlc::exec {
 
-// One per-layer KV cache slot. K/V are stored in `[n_kv_heads, seq, head_dim]`
-// layout (post-transpose, post-RoPE for K), so attention can read them
-// directly. Optional because cache is empty before the first prefill call.
+// One per-layer KV cache slot. K and V are pre-allocated at full
+// `[n_kv_heads, max_seq, head_dim]` capacity on first use, and updated
+// in place via `mx::slice_update` as tokens stream in — no per-token
+// concat-and-copy. `seq_filled` is the contiguous prefix that has been
+// written; attention reads `[:, :seq_filled, :]`.
 struct KVCacheSlot {
   std::optional<mlx::core::array> K;
   std::optional<mlx::core::array> V;
+  int seq_filled = 0;
 };
 
 // Walks a mlc-dialect ModuleOp and executes it on MLX. Weight tensors come
