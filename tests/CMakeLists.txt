@@ -62,3 +62,11 @@ target_include_directories(mlc_tests PRIVATE
 # Register tests with CTest
 include(GoogleTest)
 gtest_discover_tests(mlc_tests)
+
+# MLIR dialect round-trip test (only when MLIR is enabled).
+if(MLC_ENABLE_MLIR AND TARGET mlc-opt)
+    add_test(NAME mlir_dialect_roundtrip
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/mlir/test_dialect_roundtrip.sh
+                $<TARGET_FILE:mlc-opt>
+                ${CMAKE_CURRENT_SOURCE_DIR}/mlir/tinyllama_layer.mlir)
+endif()

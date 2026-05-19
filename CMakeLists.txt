@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(MLCompiler VERSION 1.0.0 LANGUAGES CXX)
+project(MLCompiler VERSION 1.0.0 LANGUAGES C CXX)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -35,6 +35,37 @@ include_directories(${CMAKE_SOURCE_DIR}/compiler)
 
 # Add compiler subdirectories
 add_subdirectory(compiler)
+
+# MLIR/LLVM integration. The Phase-2 compiler lives under compiler/mlir/.
+# On macOS we expect Homebrew's llvm formula (ships MLIR). The user can
+# override via -DCMAKE_PREFIX_PATH=/path/to/llvm. Configured BEFORE tests/
+# so the mlc-opt target is visible when tests/CMakeLists.txt registers the
+# round-trip ctest entry.
+option(MLC_ENABLE_MLIR "Build the MLcompiler MLIR dialect + mlc-opt" ON)
+if(MLC_ENABLE_MLIR)
+    if(APPLE AND NOT MLIR_DIR AND NOT LLVM_DIR AND
+       EXISTS "/opt/homebrew/opt/llvm/lib/cmake/mlir")
+        set(MLIR_DIR "/opt/homebrew/opt/llvm/lib/cmake/mlir" CACHE PATH "")
+        set(LLVM_DIR "/opt/homebrew/opt/llvm/lib/cmake/llvm" CACHE PATH "")
+    endif()
+    find_package(MLIR CONFIG)
+    if(MLIR_FOUND)
+        find_package(LLVM REQUIRED CONFIG)
+        list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+        list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+        include(TableGen)
+        include(AddLLVM)
+        include(AddMLIR)
+        include(HandleLLVMOptions)
+        include_directories(${LLVM_INCLUDE_DIRS})
+        include_directories(${MLIR_INCLUDE_DIRS})
+        add_subdirectory(compiler/mlir)
+        message(STATUS "  MLIR: ${MLIR_DIR}")
+    else()
+        message(STATUS "  MLIR: not found, skipping compiler/mlir (set -DMLIR_DIR=...)")
+        set(MLC_ENABLE_MLIR OFF)
+    endif()
+endif()
 
 # Add tests if enabled
 option(BUILD_TESTS "Build tests" ON)
@@ -97,14 +128,11 @@ if(APPLE)
         "-framework Accelerate")
 endif()
 
-# Future: MLIR/LLVM integration point
-# find_package(MLIR REQUIRED CONFIG)
-# find_package(LLVM REQUIRED CONFIG)
-
 message(STATUS "MLCompiler configuration:")
 message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build tests: ${BUILD_TESTS}")
+message(STATUS "  MLIR enabled: ${MLC_ENABLE_MLIR}")
 
 
 
