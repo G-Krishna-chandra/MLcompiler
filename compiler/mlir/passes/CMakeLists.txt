@@ -3,7 +3,8 @@
 
 add_library(MLCPasses STATIC
     FuseNormMatMul.cpp
-    FuseQKVMatMul.cpp)
+    FuseQKVMatMul.cpp
+    ScheduleDevices.cpp)
 
 target_include_directories(MLCPasses PUBLIC
     ${CMAKE_SOURCE_DIR}
