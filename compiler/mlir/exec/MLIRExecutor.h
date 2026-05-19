@@ -57,6 +57,9 @@ private:
   // Resident fp16 weights, keyed by GGUF tensor name (== `mlc.name` arg
   // attr). Populated in the constructor; immutable afterward.
   std::unordered_map<std::string, mlx::core::array> weight_cache_;
+  // Pre-concatenated W_QKV weights, keyed by the fused_norm_qkv_matmul
+  // Operation* that owns them. Populated lazily on first encounter.
+  std::unordered_map<::mlir::Operation *, mlx::core::array> qkv_concat_cache_;
   // KV cache, one slot per mlc.attention op encountered (in walk order).
   // Grows on the first prefill call; updated in place every step.
   std::vector<KVCacheSlot> kv_cache_;

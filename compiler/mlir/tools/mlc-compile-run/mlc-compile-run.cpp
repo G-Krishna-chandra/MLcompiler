@@ -12,6 +12,7 @@
 #include "compiler/mlir/emit/GGUFToMLIR.h"
 #include "compiler/mlir/exec/MLIRExecutor.h"
 #include "compiler/mlir/passes/FuseNormMatMul.h"
+#include "compiler/mlir/passes/FuseQKVMatMul.h"
 #include "compiler/runtime/tokenizer.hpp"
 
 #include "mlir/IR/MLIRContext.h"
@@ -86,10 +87,14 @@ int main(int argc, char **argv) {
   mlir::MLIRContext ctx;
   auto module = mlir::mlc::emitMLIR(ctx, loader);
   unsigned fused = 0;
-  if (args.fuse)
+  unsigned qkv_fused = 0;
+  if (args.fuse) {
     fused = mlir::mlc::fuseNormMatMul(*module);
+    qkv_fused = mlir::mlc::fuseQKVMatMul(*module);
+  }
   std::cout << "[compile] fusion " << (args.fuse ? "ON" : "OFF")
-            << ", " << fused << " norm+matmul ops fused\n";
+            << ", " << fused << " norm+matmul fused, "
+            << qkv_fused << " QKV triples merged\n";
 
   mlir::mlc::exec::MLIRExecutor exec(*module, loader);
 

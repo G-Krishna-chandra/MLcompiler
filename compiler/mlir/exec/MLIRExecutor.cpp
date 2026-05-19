@@ -313,6 +313,37 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
                          f32Of(fused.getEpsilonAttr()));
       put(fused.getY(), buildMatMul(n, get(fused.getW()),
                                     fused.getTransposeB()));
+    } else if (auto qkv = ::llvm::dyn_cast<::mlir::mlc::FusedNormQKVMatMulOp>(op)) {
+      auto n = buildNorm(get(qkv.getX()), get(qkv.getGamma()),
+                         f32Of(qkv.getEpsilonAttr()));
+      // Concatenate Q/K/V weights once at first use along the out-dim
+      // axis; cache keyed by the op so subsequent forward passes skip
+      // the re-concat.
+      auto cache_it = qkv_concat_cache_.find(qkv.getOperation());
+      if (cache_it == qkv_concat_cache_.end()) {
+        auto w_concat = mx::concatenate(
+            {get(qkv.getWQ()), get(qkv.getWK()), get(qkv.getWV())}, /*axis=*/0);
+        auto owned = mx::copy(w_concat);
+        mx::eval(owned);
+        cache_it =
+            qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
+      }
+      auto out = buildMatMul(n, cache_it->second, qkv.getTransposeB());
+      // out has shape [seq, q_out + k_out + v_out]. Split by the result
+      // types' last dims.
+      auto q_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getQ().getType());
+      auto k_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getK().getType());
+      auto v_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getV().getType());
+      int q_dim = q_ty.getShape().back();
+      int k_dim = k_ty.getShape().back();
+      int v_dim = v_ty.getShape().back();
+      put(qkv.getQ(),
+          mx::slice(out, {0, 0}, {out.shape(0), q_dim}));
+      put(qkv.getK(),
+          mx::slice(out, {0, q_dim}, {out.shape(0), q_dim + k_dim}));
+      put(qkv.getV(),
+          mx::slice(out, {0, q_dim + k_dim},
+                    {out.shape(0), q_dim + k_dim + v_dim}));
     } else if (auto attn = ::llvm::dyn_cast<::mlir::mlc::AttentionOp>(op)) {
       // Grow the cache lazily so an executor used without any decode
       // doesn't pay for the storage.

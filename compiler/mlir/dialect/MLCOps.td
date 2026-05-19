@@ -100,6 +100,37 @@ def MLC_EmbeddingOp : MLC_Op<"embedding", [Pure]> {
   }];
 }
 
+def MLC_FusedNormQKVMatMulOp : MLC_Op<"fused_norm_qkv_matmul", [Pure]> {
+  let summary = "Fused RMSNorm + Q/K/V projections sharing a single norm.";
+  let description = [{
+    Produced by the QKV-fusion pass when three `fused_norm_matmul` ops
+    share the same `x` and `gamma`. The three weights are concatenated
+    along the out-dim axis at executor cache time, so this op compiles
+    down to one norm + one matmul + a split into three results — saving
+    two of every three matmul kernel launches per attention layer.
+  }];
+  let arguments = (ins
+      MLC_FloatTensor:$x,
+      MLC_FloatTensor:$gamma,
+      MLC_QuantTensor:$w_q,
+      MLC_QuantTensor:$w_k,
+      MLC_QuantTensor:$w_v,
+      MLC_DeviceAttr:$target_device,
+      F32Attr:$epsilon,
+      StrAttr:$quant_format,
+      DefaultValuedAttr<BoolAttr, "false">:$transpose_b
+  );
+  let results = (outs
+      MLC_FloatTensor:$q,
+      MLC_FloatTensor:$k,
+      MLC_FloatTensor:$v
+  );
+  let assemblyFormat = [{
+      $x `,` $gamma `,` $w_q `,` $w_k `,` $w_v attr-dict
+      `:` functional-type(operands, results)
+  }];
+}
+
 def MLC_FusedNormMatMulOp : MLC_Op<"fused_norm_matmul", [Pure]> {
   let summary = "Fused RMSNorm + matmul: y = matmul(rms_norm(x, gamma, eps), w)";
   let description = [{
