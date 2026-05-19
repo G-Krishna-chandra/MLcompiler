@@ -76,13 +76,8 @@ LogicalResult FeedForwardOp::verify() {
   return success();
 }
 
-LogicalResult AddOp::inferReturnTypes(
-    MLIRContext *, std::optional<Location>, ValueRange operands,
-    DictionaryAttr, OpaqueProperties, RegionRange,
-    ::llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  inferredReturnTypes.push_back(operands.front().getType());
-  return success();
-}
+// Note: AddOp::inferReturnTypes is auto-emitted by TableGen because of
+// SameOperandsAndResultType + DeclareOpInterfaceMethods<InferTypeOpInterface>.
 
 } // namespace mlc
 } // namespace mlir

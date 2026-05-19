@@ -70,3 +70,13 @@ if(MLC_ENABLE_MLIR AND TARGET mlc-opt)
                 $<TARGET_FILE:mlc-opt>
                 ${CMAKE_CURRENT_SOURCE_DIR}/mlir/tinyllama_layer.mlir)
 endif()
+
+# GGUF → MLIR emission test on TinyLlama. Skips gracefully when the model
+# isn't present (see the .sh script).
+if(MLC_ENABLE_MLIR AND TARGET mlc-emit AND TARGET mlc-opt)
+    add_test(NAME mlir_emit_tinyllama
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/mlir/test_emit_tinyllama.sh
+                $<TARGET_FILE:mlc-emit>
+                $<TARGET_FILE:mlc-opt>
+                ${CMAKE_SOURCE_DIR}/models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf)
+endif()
