@@ -8,7 +8,8 @@ endif()
 
 add_library(MLCExec STATIC
     Quantize.cpp
-    MLXBuilder.cpp)
+    MLXBuilder.cpp
+    MLIRExecutor.cpp)
 
 set_target_properties(MLCExec PROPERTIES
     CXX_STANDARD 20
@@ -17,10 +18,13 @@ set_target_properties(MLCExec PROPERTIES
 
 target_include_directories(MLCExec PUBLIC
     ${CMAKE_SOURCE_DIR}
+    ${CMAKE_BINARY_DIR}
     ${MLC_MLX_ROOT}/include)
 
 target_link_libraries(MLCExec PUBLIC
     mlc_lib
+    MLIRMLCDialect
+    MLIRFuncDialect
     ${MLC_MLX_ROOT}/lib/libmlx.dylib)
 
 if(APPLE)

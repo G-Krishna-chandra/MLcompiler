@@ -85,13 +85,16 @@ endif()
 # separate gtest binary because they need C++20 (MLX headers) — the main
 # mlc_tests target is C++17 to keep the existing runtime build undisturbed.
 if(MLC_ENABLE_MLIR AND TARGET MLCExec)
-    add_executable(mlir_exec_tests mlir/test_mlx_matmul_lowering.cpp)
+    add_executable(mlir_exec_tests
+        mlir/test_mlx_matmul_lowering.cpp
+        mlir/test_compiler_path_forward.cpp)
     set_target_properties(mlir_exec_tests PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON
         CXX_EXTENSIONS OFF)
     target_link_libraries(mlir_exec_tests PRIVATE
         MLCExec
+        MLCEmit
         GTest::gtest
         GTest::gtest_main)
     target_include_directories(mlir_exec_tests PRIVATE
