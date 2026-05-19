@@ -9,7 +9,8 @@ endif()
 add_library(MLCExec STATIC
     Quantize.cpp
     MLXBuilder.cpp
-    MLIRExecutor.cpp)
+    MLIRExecutor.cpp
+    Q4MatMul.cpp)
 
 set_target_properties(MLCExec PROPERTIES
     CXX_STANDARD 20
