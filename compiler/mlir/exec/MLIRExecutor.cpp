@@ -45,13 +45,18 @@ mx::array buildMatMul(const mx::array &x, const mx::array &w,
   return mx::matmul(x, transpose_b ? mx::transpose(w) : w);
 }
 
-// SwiGLU FFN: down(silu(gate(x)) * up(x)). v1 calls matmul thrice.
-// All three weights are stored [out, in] (GGUF / numpy row-major), so each
-// matmul transposes the weight to get the matmul-convention [in, out].
-mx::array buildFeedForward(const mx::array &x, const mx::array &w_gate,
-                           const mx::array &w_up, const mx::array &w_down) {
-  auto g = mx::matmul(x, mx::transpose(w_gate));
-  auto u = mx::matmul(x, mx::transpose(w_up));
+// SwiGLU FFN: down(silu(gate(x)) * up(x)).
+//
+// Gate and up share x, so we concat them along the out-dim once (cached by
+// the caller, identified by the FeedForward Operation*) and do a single
+// batched matmul, splitting the result. Down is its own matmul. All three
+// weights are stored [out, in] in numpy row-major, hence the transpose.
+mx::array buildFeedForward(const mx::array &x, const mx::array &gate_up_concat,
+                           const mx::array &w_down, int ffn_dim) {
+  auto gu = mx::matmul(x, mx::transpose(gate_up_concat));
+  // gu shape: [seq, 2*ffn_dim]. Split along last axis.
+  auto g = mx::slice(gu, {0, 0}, {gu.shape(0), ffn_dim});
+  auto u = mx::slice(gu, {0, ffn_dim}, {gu.shape(0), 2 * ffn_dim});
   // silu(x) = x * sigmoid(x).
   auto h = mx::multiply(mx::multiply(g, mx::sigmoid(g)), u);
   return mx::matmul(h, mx::transpose(w_down));
@@ -299,9 +304,21 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
     } else if (auto add = ::llvm::dyn_cast<::mlir::mlc::AddOp>(op)) {
       put(add.getY(), buildAdd(get(add.getA()), get(add.getB())));
     } else if (auto ff = ::llvm::dyn_cast<::mlir::mlc::FeedForwardOp>(op)) {
+      auto cache_it = ffn_gateup_cache_.find(ff.getOperation());
+      if (cache_it == ffn_gateup_cache_.end()) {
+        auto concat =
+            mx::concatenate({get(ff.getWGate()), get(ff.getWUp())}, /*axis=*/0);
+        auto owned = mx::copy(concat);
+        mx::eval(owned);
+        cache_it =
+            ffn_gateup_cache_.emplace(ff.getOperation(), owned).first;
+      }
+      auto w_gate_ty =
+          ::llvm::cast<::mlir::RankedTensorType>(ff.getWGate().getType());
+      int ffn_dim = w_gate_ty.getShape()[0];
       put(ff.getY(),
-          buildFeedForward(get(ff.getX()), get(ff.getWGate()),
-                           get(ff.getWUp()), get(ff.getWDown())));
+          buildFeedForward(get(ff.getX()), cache_it->second,
+                           get(ff.getWDown()), ffn_dim));
     } else if (auto emb = ::llvm::dyn_cast<::mlir::mlc::EmbeddingOp>(op)) {
       int hidden = emb.getY().getType().getShape().back();
       put(emb.getY(),

@@ -60,6 +60,10 @@ private:
   // Pre-concatenated W_QKV weights, keyed by the fused_norm_qkv_matmul
   // Operation* that owns them. Populated lazily on first encounter.
   std::unordered_map<::mlir::Operation *, mlx::core::array> qkv_concat_cache_;
+  // Pre-concatenated W_gate ++ W_up weights, keyed by the mlc.feedforward
+  // Operation*. Same idea as `qkv_concat_cache_` — one batched matmul
+  // instead of two for the SwiGLU gate/up projections.
+  std::unordered_map<::mlir::Operation *, mlx::core::array> ffn_gateup_cache_;
   // KV cache, one slot per mlc.attention op encountered (in walk order).
   // Grows on the first prefill call; updated in place every step.
   std::vector<KVCacheSlot> kv_cache_;
