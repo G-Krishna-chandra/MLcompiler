@@ -154,7 +154,28 @@ int64_t i64Of(::mlir::IntegerAttr a) { return a.getInt(); }
 
 MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
                            const ::mlc::frontend::GGUFLoader &loader)
-    : module_(module), loader_(loader) {}
+    : module_(module), loader_(loader) {
+  // Pre-load every weight arg: dequant Q4_0 / Q6_K / etc. to fp32 via the
+  // runtime helpers, upload as an mx::array, cast to fp16, eval to force
+  // materialization, then drop the fp32 view. Each weight is materialized
+  // exactly once for the executor's lifetime — `run()` does zero dequant.
+  auto func = *module_.getOps<::mlir::func::FuncOp>().begin();
+  auto &entry = func.getBody().front();
+  ::std::vector<mx::array> to_eval;
+  to_eval.reserve(entry.getNumArguments());
+  for (unsigned i = 0; i < entry.getNumArguments(); ++i) {
+    const std::string &nm = argName(func, i);
+    if (nm == "ids" || nm == "positions")
+      continue;
+    auto a32 = gufWeightToMLX(loader_, nm);
+    auto a16 = mx::astype(a32, mx::float16);
+    auto [it, inserted] = weight_cache_.emplace(nm, a16);
+    if (inserted)
+      to_eval.push_back(a16);
+  }
+  // Batch-materialize so MLX can pipeline the host→device uploads.
+  mx::eval(to_eval);
+}
 
 MLIRExecutor::RunResult
 MLIRExecutor::run(const std::vector<int32_t> &token_ids,
@@ -199,8 +220,11 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
     } else if (nm == "positions") {
       values.insert({value, pos_arr});
     } else {
-      // GGUF weight — dequant + upload.
-      values.insert({value, gufWeightToMLX(loader_, nm)});
+      // GGUF weight — resident fp16, populated once in the constructor.
+      auto it = weight_cache_.find(nm);
+      if (it == weight_cache_.end())
+        throw std::runtime_error("missing weight in cache: " + nm);
+      values.insert({value, it->second});
     }
   }
 

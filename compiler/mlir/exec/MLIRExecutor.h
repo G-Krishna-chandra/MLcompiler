@@ -8,6 +8,8 @@
 #include <mlx/array.h>
 
 #include <cstdint>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mlir::mlc::exec {
@@ -16,6 +18,9 @@ namespace mlir::mlc::exec {
 // from a GGUFLoader (matched by the `mlc.name` arg attribute the emitter
 // attaches). Result of the inference function is realized to a host fp32
 // buffer.
+//
+// Weights are dequantized to fp16 once at construction and held resident
+// for the lifetime of the executor; per-run() calls do no dequant work.
 class MLIRExecutor {
 public:
   MLIRExecutor(::mlir::ModuleOp module,
@@ -34,6 +39,9 @@ public:
 private:
   ::mlir::ModuleOp module_;
   const ::mlc::frontend::GGUFLoader &loader_;
+  // Resident fp16 weights, keyed by GGUF tensor name (== `mlc.name` arg
+  // attr). Populated in the constructor; immutable afterward.
+  std::unordered_map<std::string, mlx::core::array> weight_cache_;
 };
 
 } // namespace mlir::mlc::exec
