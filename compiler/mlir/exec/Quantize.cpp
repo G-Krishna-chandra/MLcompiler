@@ -23,10 +23,11 @@ std::vector<float> dequantizeToF32(const GGUFLoader &loader,
 
   std::vector<uint8_t> raw = loader.loadTensorData(info);
 
-  // GGUF stores weights as a sequence of "rows", each row being the innermost
-  // dimension (info.shape.back()) elements. dequantizeRowTo takes one row at
-  // a time.
-  size_t cols = static_cast<size_t>(info.shape.back());
+  // GGUF stores tensor dimensions in REVERSE numpy order: shape[0] is the
+  // INNERMOST (fastest-varying) dim, i.e. elements-per-row of the row-major
+  // byte layout. shape.back() is the OUTERMOST = number of rows. The runtime
+  // uses the same convention (see batched_walker.cpp:191 for token_embd).
+  size_t cols = static_cast<size_t>(info.shape[0]);
   size_t rows = n_elements / cols;
   size_t row_bytes = raw.size() / rows;
   if (rows * row_bytes != raw.size())

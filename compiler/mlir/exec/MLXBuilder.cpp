@@ -45,10 +45,12 @@ mx::array gufWeightToMLX(const ::mlc::frontend::GGUFLoader &loader,
                          const std::string &tensor_name) {
   auto deq = dequantizeToF32(loader, tensor_name);
   const auto &info = loader.tensors().at(tensor_name);
+  // GGUF dimensions are innermost-first; the dequantized byte order is
+  // row-major C, so the mx::array shape is the GGUF shape REVERSED.
   std::vector<int> shape;
   shape.reserve(info.shape.size());
-  for (uint64_t d : info.shape)
-    shape.push_back(static_cast<int>(d));
+  for (auto it = info.shape.rbegin(); it != info.shape.rend(); ++it)
+    shape.push_back(static_cast<int>(*it));
   return fp32ToMLX(deq, shape);
 }
 

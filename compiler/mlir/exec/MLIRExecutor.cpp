@@ -45,13 +45,15 @@ mx::array buildMatMul(const mx::array &x, const mx::array &w,
 }
 
 // SwiGLU FFN: down(silu(gate(x)) * up(x)). v1 calls matmul thrice.
+// All three weights are stored [out, in] (GGUF / numpy row-major), so each
+// matmul transposes the weight to get the matmul-convention [in, out].
 mx::array buildFeedForward(const mx::array &x, const mx::array &w_gate,
                            const mx::array &w_up, const mx::array &w_down) {
-  auto g = mx::matmul(x, w_gate);
-  auto u = mx::matmul(x, w_up);
+  auto g = mx::matmul(x, mx::transpose(w_gate));
+  auto u = mx::matmul(x, mx::transpose(w_up));
   // silu(x) = x * sigmoid(x).
   auto h = mx::multiply(mx::multiply(g, mx::sigmoid(g)), u);
-  return mx::matmul(h, w_down);
+  return mx::matmul(h, mx::transpose(w_down));
 }
 
 // Embedding lookup. TinyLlama stores the table as [hidden, vocab] (column =
@@ -100,10 +102,12 @@ mx::array buildAttention(const mx::array &q_flat, const mx::array &k_flat,
   mx::array p0 = mx::take(positions, 0);
   mx::eval(p0);
   int offset = static_cast<int>(p0.item<int32_t>());
-  // Llama-style RoPE: non-traditional layout, base = 10000.
-  q = mx::fast::rope(q, head_dim, /*traditional=*/false, /*base=*/10000.0f,
+  // GGUF-format Llama uses consecutive-pair RoPE (rotates dims [2i, 2i+1])
+  // — MLX calls this `traditional=true`. Confirmed against the runtime's
+  // applyRotaryToBuffer in attention_cpu.cpp.
+  q = mx::fast::rope(q, head_dim, /*traditional=*/true, /*base=*/10000.0f,
                      /*scale=*/1.0f, offset);
-  k = mx::fast::rope(k, head_dim, false, 10000.0f, 1.0f, offset);
+  k = mx::fast::rope(k, head_dim, true, 10000.0f, 1.0f, offset);
 
   // GQA: replicate K, V across each group of n_heads/n_kv_heads.
   if (n_heads != n_kv_heads) {

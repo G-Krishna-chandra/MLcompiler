@@ -103,10 +103,14 @@ const char *ggufQuantFormat(uint32_t dtype) {
 }
 
 RankedTensorType tensorTypeOf(MLIRContext &ctx, const GGUFTensorInfo &t) {
+  // GGUF dimensions are stored INNERMOST-FIRST (fortran-like ordering at the
+  // metadata level), but the byte layout is row-major C-order. Reverse the
+  // shape here so MLIR tensor types match numpy/C convention — shape[0] is
+  // the outermost dim (number of rows), shape.back() the innermost (cols).
   ::llvm::SmallVector<int64_t> shape;
   shape.reserve(t.shape.size());
-  for (uint64_t d : t.shape)
-    shape.push_back(static_cast<int64_t>(d));
+  for (auto it = t.shape.rbegin(); it != t.shape.rend(); ++it)
+    shape.push_back(static_cast<int64_t>(*it));
   return RankedTensorType::get(shape, ggufElementType(ctx, t.dtype));
 }
 
@@ -136,9 +140,9 @@ OwningOpRef<ModuleOp> emitMLIR(MLIRContext &ctx, const GGUFLoader &loader) {
   const float   epsilon  = getKvF(loader, "llama.attention.layer_norm_rms_epsilon");
 
   const int64_t kvDim = nKvHeads * headDim;
-  // Vocab dim: whichever side of the 2D output.weight is NOT hidden. GGUF
-  // models differ on whether output.weight is stored as [vocab, hidden]
-  // (Llama 2, 3) or [hidden, vocab] (TinyLlama, some 1.1B variants).
+  // Vocab dim: whichever GGUF dim of output.weight isn't hidden. GGUF stores
+  // shapes innermost-first, so the runtime/IR sees [hidden, vocab] for
+  // TinyLlama and [vocab, hidden] for Llama 2/3.
   const auto &outW = mustGet(loader, "output.weight").shape;
   if (outW.size() != 2)
     throw std::runtime_error("output.weight must be rank-2");
@@ -197,15 +201,14 @@ OwningOpRef<ModuleOp> emitMLIR(MLIRContext &ctx, const GGUFLoader &loader) {
   b.setInsertionPointToStart(entry);
 
   auto autoDev = DeviceAttr::get(&ctx, Device::Auto);
-  // TinyLlama (and similar 1.1B Llama variants) stores weights as [in, out]
-  // — same convention the matmul wants — so no transpose. Models that store
-  // [out, in] (e.g., Llama 2/3 output.weight) would need transpose_b=true on
-  // the affected ops; handle per-tensor when we add support for them.
-  auto falseAttr = b.getBoolAttr(false);
+  // GGUF stores weights as [out, in] in numpy/MLIR row-major terms (after
+  // we reverse the GGUF inner-first shape). So the matmul math x @ w_logical
+  // = x @ w_stored^T needs transpose_b=true on every matmul.
+  auto trueAttr = b.getBoolAttr(true);
   auto emitMatMul = [&](Value x, Value w, RankedTensorType outTy,
                         const char *qf) -> Value {
     return b.create<MatMulOp>(loc, outTy, x, w, autoDev,
-                              b.getStringAttr(qf), falseAttr);
+                              b.getStringAttr(qf), trueAttr);
   };
 
   // Convenience: format strings for each layer-arg slot.
