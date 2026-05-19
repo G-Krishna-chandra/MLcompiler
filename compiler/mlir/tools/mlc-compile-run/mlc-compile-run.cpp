@@ -13,6 +13,7 @@
 #include "compiler/mlir/exec/MLIRExecutor.h"
 #include "compiler/mlir/passes/FuseNormMatMul.h"
 #include "compiler/mlir/passes/FuseQKVMatMul.h"
+#include "compiler/mlir/passes/ScheduleDevices.h"
 #include "compiler/runtime/tokenizer.hpp"
 
 #include "mlir/IR/MLIRContext.h"
@@ -34,6 +35,7 @@ struct Args {
   std::string prompt = "The capital of France is";
   int max_tokens = 16;
   bool fuse = true;
+  bool ane = false;
 };
 
 Args parseArgs(int argc, char **argv) {
@@ -43,6 +45,7 @@ Args parseArgs(int argc, char **argv) {
     if (s == "--prompt" && i + 1 < argc)      a.prompt = argv[++i];
     else if (s == "--max-tokens" && i + 1 < argc) a.max_tokens = std::atoi(argv[++i]);
     else if (s == "--no-fuse")                a.fuse = false;
+    else if (s == "--ane")                    a.ane = true;
     else if (s.size() && s[0] != '-')         a.model_path = s;
     else {
       std::fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -92,11 +95,16 @@ int main(int argc, char **argv) {
     fused = mlir::mlc::fuseNormMatMul(*module);
     qkv_fused = mlir::mlc::fuseQKVMatMul(*module);
   }
+  if (args.ane)
+    mlir::mlc::scheduleDevices(*module);
   std::cout << "[compile] fusion " << (args.fuse ? "ON" : "OFF")
             << ", " << fused << " norm+matmul fused, "
-            << qkv_fused << " QKV triples merged\n";
+            << qkv_fused << " QKV triples merged"
+            << ", ANE " << (args.ane ? "ON" : "OFF") << "\n";
+  if (args.ane)
+    std::cout << "[compile] baking ANE models (first run ~1s/op; cached after)…\n";
 
-  mlir::mlc::exec::MLIRExecutor exec(*module, loader);
+  mlir::mlc::exec::MLIRExecutor exec(*module, loader, /*use_ane=*/args.ane);
 
   // Tokenize. TinyLlama uses BOS=1 and the chat-repl convention adds it by
   // default. Use add_bos=true to match the runtime.

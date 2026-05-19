@@ -225,8 +225,9 @@ int64_t i64Of(::mlir::IntegerAttr a) { return a.getInt(); }
 } // namespace
 
 MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
-                           const ::mlc::frontend::GGUFLoader &loader)
-    : module_(module), loader_(loader) {
+                           const ::mlc::frontend::GGUFLoader &loader,
+                           bool use_ane)
+    : module_(module), loader_(loader), use_ane_(use_ane) {
   auto func = *module_.getOps<::mlir::func::FuncOp>().begin();
 
   // First pass: identify which func args are used as the weight operand of
@@ -276,6 +277,86 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
     }
   }
   mx::eval(to_eval);
+
+  // Third pass: if ANE is enabled, bake a CoreML model for every op the
+  // scheduler marked Device::ANE. The models hold their weights baked in
+  // as fp16 constants, so we can drop the corresponding Q4_0 byte cache
+  // entries after baking — but only if no GPU op references the same
+  // weight, which on TinyLlama doesn't happen for ANE-eligible ops.
+  if (use_ane_) {
+    std::string ane_dir = "/tmp/mlc-ane-cache";
+    auto deviceIsANE = [](Operation *op) {
+      auto attr = op->getAttrOfType<DeviceAttr>("target_device");
+      return attr && attr.getValue() == Device::ANE;
+    };
+    auto bytesToFP16MLX = [&](Value w_val) -> mx::array {
+      // The bound value in q4_bytes_cache_ is the raw GGUF byte array.
+      // Dequant to fp32 + cast to fp16 for the CoreML model bake.
+      auto barg = ::llvm::cast<BlockArgument>(w_val);
+      const std::string &nm = argName(func, barg.getArgNumber());
+      auto f32 = dequantizeToF32(loader_, nm);
+      // GGUF row-major: [out, in]. CoreML's matmul wants weight [K=in, N=out],
+      // so transpose during the upload.
+      const auto &info = loader_.tensors().at(nm);
+      int OUT = static_cast<int>(info.shape[1]);
+      int IN = static_cast<int>(info.shape[0]);
+      std::vector<float> w_kn(static_cast<size_t>(IN) * OUT);
+      for (int o = 0; o < OUT; ++o)
+        for (int k = 0; k < IN; ++k)
+          w_kn[static_cast<size_t>(k) * OUT + o] =
+              f32[static_cast<size_t>(o) * IN + k];
+      auto w_mlx = fp32ToMLX(w_kn, {IN, OUT});
+      auto w_fp16 = mx::astype(w_mlx, mx::float16);
+      mx::eval(w_fp16);
+      return w_fp16;
+    };
+    auto getWeightName = [&](Value w_val) {
+      auto barg = ::llvm::cast<BlockArgument>(w_val);
+      return argName(func, barg.getArgNumber());
+    };
+
+    // Optional: skip the QKV-fused ANE path by setting MLC_ANE_QKV=0 (env).
+    // Lets us isolate the contribution of just attn_output during benching.
+    bool ane_qkv = []() {
+      const char *s = std::getenv("MLC_ANE_QKV");
+      return !s || std::string(s) != "0";
+    }();
+
+    func.walk([&](Operation *op) {
+      if (!deviceIsANE(op)) return;
+      if (auto mm = ::llvm::dyn_cast<MatMulOp>(op)) {
+        std::string key = getWeightName(mm.getW());
+        auto w_fp16 = bytesToFP16MLX(mm.getW());
+        const auto &info = loader_.tensors().at(key);
+        int IN = static_cast<int>(info.shape[0]);
+        int OUT = static_cast<int>(info.shape[1]);
+        auto pkg = buildANEMatMulPackage(ane_dir, key, /*M=*/1, IN, OUT, w_fp16);
+        ane_cache_.emplace(op, std::make_shared<ANEMatMul>(pkg, 1, IN, OUT));
+      } else if (auto qkv = ::llvm::dyn_cast<FusedNormQKVMatMulOp>(op);
+                 qkv && ane_qkv) {
+        // Bake Q ‖ K ‖ V as a single [IN, OUT_total] fp16 weight.
+        auto wq_name = getWeightName(qkv.getWQ());
+        auto wk_name = getWeightName(qkv.getWK());
+        auto wv_name = getWeightName(qkv.getWV());
+        const auto &iq = loader_.tensors().at(wq_name);
+        const auto &ik = loader_.tensors().at(wk_name);
+        const auto &iv = loader_.tensors().at(wv_name);
+        int IN = static_cast<int>(iq.shape[0]);
+        int Oq = static_cast<int>(iq.shape[1]);
+        int Ok = static_cast<int>(ik.shape[1]);
+        int Ov = static_cast<int>(iv.shape[1]);
+        int OUT = Oq + Ok + Ov;
+        auto wq = bytesToFP16MLX(qkv.getWQ());
+        auto wk = bytesToFP16MLX(qkv.getWK());
+        auto wv = bytesToFP16MLX(qkv.getWV());
+        auto wcat = mx::concatenate({wq, wk, wv}, /*axis=*/1);
+        mx::eval(wcat);
+        std::string key = wq_name + "+kv";
+        auto pkg = buildANEMatMulPackage(ane_dir, key, 1, IN, OUT, wcat);
+        ane_cache_.emplace(op, std::make_shared<ANEMatMul>(pkg, 1, IN, OUT));
+      }
+    });
+  }
 }
 
 void MLIRExecutor::reset() { kv_cache_.clear(); }
@@ -351,8 +432,19 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
   for (auto &op : entryBlock) {
     if (auto matmul = ::llvm::dyn_cast<::mlir::mlc::MatMulOp>(op)) {
       auto w_v = matmul.getW();
-      auto dims = q4_value_dims_.find(w_v);
-      if (dims != q4_value_dims_.end()) {
+      auto ane_it = ane_cache_.find(matmul.getOperation());
+      auto x_in = get(matmul.getX());
+      // ANE models are baked at a fixed M (1 today). At other seq_lens
+      // (prefill) fall through to the Q4_0 kernel — already cached.
+      bool ane_match = ane_it != ane_cache_.end() &&
+                       x_in.shape(0) == ane_it->second->M();
+      if (ane_match) {
+        // CoreML/ANE path. Input x is whatever dtype; ANE wraps it as
+        // fp16 internally; output comes back as fp32 (CoreML default).
+        auto y_out = ane_it->second->predict(x_in);
+        put(matmul.getY(), mx::astype(y_out, x_in.dtype()));
+      } else if (auto dims = q4_value_dims_.find(w_v);
+                 dims != q4_value_dims_.end()) {
         put(matmul.getY(), q4_0_matmul(get(matmul.getX()), get(w_v),
                                        dims->second.first,
                                        dims->second.second));
@@ -425,6 +517,25 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       int q_dim = q_ty.getShape().back();
       int k_dim = k_ty.getShape().back();
       int v_dim = v_ty.getShape().back();
+      // CoreML/ANE path: one predict() over the baked concat'd Q‖K‖V weight,
+      // then split. Saves three Q4_0 kernel launches per layer. Falls
+      // through to the Q4_0 kernel at any seq_len other than the baked
+      // M (1 today) — that's the prefill case.
+      auto ane_qkv_it = ane_cache_.find(qkv.getOperation());
+      if (ane_qkv_it != ane_cache_.end() &&
+          n.shape(0) == ane_qkv_it->second->M()) {
+        auto out_arr = ane_qkv_it->second->predict(n);
+        out_arr = mx::astype(out_arr, n.dtype());
+        put(qkv.getQ(),
+            mx::slice(out_arr, {0, 0}, {out_arr.shape(0), q_dim}));
+        put(qkv.getK(),
+            mx::slice(out_arr, {0, q_dim},
+                      {out_arr.shape(0), q_dim + k_dim}));
+        put(qkv.getV(),
+            mx::slice(out_arr, {0, q_dim + k_dim},
+                      {out_arr.shape(0), q_dim + k_dim + v_dim}));
+        continue;
+      }
       bool all_q4 = q4_value_dims_.count(qkv.getWQ()) &&
                     q4_value_dims_.count(qkv.getWK()) &&
                     q4_value_dims_.count(qkv.getWV());

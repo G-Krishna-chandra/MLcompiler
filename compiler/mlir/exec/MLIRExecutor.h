@@ -2,9 +2,13 @@
 
 #include "compiler/frontends/gguf_loader.hpp"
 
+#include "compiler/mlir/exec/ANEMatMul.h"
+
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "llvm/ADT/DenseMap.h"
+
+#include <memory>
 
 #include <mlx/array.h>
 
@@ -43,7 +47,8 @@ struct KVCacheSlot {
 class MLIRExecutor {
 public:
   MLIRExecutor(::mlir::ModuleOp module,
-               const ::mlc::frontend::GGUFLoader &loader);
+               const ::mlc::frontend::GGUFLoader &loader,
+               bool use_ane = false);
 
   struct RunResult {
     std::vector<float> data;
@@ -74,6 +79,12 @@ private:
   // Pre-concatenated W_QKV weights, keyed by the fused_norm_qkv_matmul
   // Operation* that owns them. Populated lazily on first encounter.
   std::unordered_map<::mlir::Operation *, mlx::core::array> qkv_concat_cache_;
+  // CoreML/ANE matmuls keyed by op. Populated at construction for ops
+  // the scheduler marked Device::ANE. Empty when ANE is disabled.
+  std::unordered_map<::mlir::Operation *, std::shared_ptr<ANEMatMul>>
+      ane_cache_;
+  // Whether to actually route ANE-annotated ops to CoreML.
+  bool use_ane_ = false;
   // Pre-concatenated W_gate ++ W_up weights, keyed by the mlc.feedforward
   // Operation*. Same idea as `qkv_concat_cache_` — one batched matmul
   // instead of two for the SwiGLU gate/up projections.
