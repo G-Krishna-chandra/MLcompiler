@@ -50,7 +50,18 @@ int main(int argc, const char *argv[]) {
             return 1;
         }
         MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
-        cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+        const char *units = std::getenv("MLC_COREML_UNITS");
+        if (units && std::string(units) == "cpu") {
+            cfg.computeUnits = MLComputeUnitsCPUOnly;
+        } else if (units && std::string(units) == "gpu") {
+            cfg.computeUnits = MLComputeUnitsCPUAndGPU;
+        } else if (units && std::string(units) == "all") {
+            cfg.computeUnits = MLComputeUnitsAll;
+        } else {
+            cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+        }
+        std::fprintf(stderr, "[compute units] %s\n",
+                     units ? units : "cpu+ne (default)");
         MLModel *model = [MLModel modelWithContentsOfURL:compiled
                                            configuration:cfg
                                                    error:&err];

@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Generate a minimal CoreML model that does fp16 matmul.
-
-Used by the S4 investigation: tells us whether a CoreML-compiled matmul
-can actually land on the Neural Engine, and what the latency looks like
-vs MLX-on-GPU for the same shape.
+"""Generate a CoreML model that does fp16 matmul with a baked weight.
 
 Usage:
-  python3 gen_matmul_model.py <out_path.mlpackage> <M> <K> <N>
+  python3 gen_matmul_model.py <out_path.mlpackage> <M> <K> <N> [weight.bin]
 
-Example:
-  python3 gen_matmul_model.py /tmp/matmul.mlpackage 1 2048 2048
+If weight.bin is given, it must contain K*N fp16 values in row-major
+[K, N] layout. Otherwise a deterministic seeded random weight is used
+(for the S4-style timing probes that don't care about correctness).
 """
 import os
 import sys
@@ -19,7 +16,16 @@ from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types as mil_types
 
 
-def build_matmul_program(M, K, N):
+def load_weight(path, K, N):
+    """Read a raw fp16 binary blob of shape [K, N], row-major."""
+    arr = np.fromfile(path, dtype=np.float16)
+    if arr.size != K * N:
+        raise SystemExit(
+            f"weight {path}: expected {K*N} fp16 elements, got {arr.size}")
+    return arr.reshape(K, N)
+
+
+def build_matmul_program(M, K, N, weight):
     """Build a single-matmul MIL program: x @ w (both fp16)."""
     @mb.program(
         input_specs=[
@@ -27,21 +33,26 @@ def build_matmul_program(M, K, N):
         ]
     )
     def prog(x):
-        # Bake the weight as a constant — that's how production models load
-        # frozen Q/K/V/etc. into a CoreML graph.
-        w = np.random.randn(K, N).astype(np.float16)
-        return mb.matmul(x=x, y=w, transpose_x=False, transpose_y=False)
+        return mb.matmul(x=x, y=weight, transpose_x=False, transpose_y=False)
     return prog
 
 
 def main():
-    if len(sys.argv) != 5:
+    if len(sys.argv) < 5:
         sys.stderr.write(__doc__)
         sys.exit(2)
     out_path = sys.argv[1]
     M, K, N = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+    weight_path = sys.argv[5] if len(sys.argv) >= 6 else None
+    if weight_path:
+        w = load_weight(weight_path, K, N)
+        print(f"loaded weight: shape={w.shape} dtype={w.dtype} "
+              f"w[0,0..3]={w[0, :3]} w[1,0..3]={w[1, :3]}")
+    else:
+        rng = np.random.default_rng(0xC0DE)
+        w = rng.standard_normal((K, N)).astype(np.float16)
 
-    prog = build_matmul_program(M, K, N)
+    prog = build_matmul_program(M, K, N, w)
     # MLProgram-format CoreML model. precision=FP16 keeps the model
     # eligible for ANE; FP32 would force CPU/GPU fallback for many ops.
     model = ct.convert(

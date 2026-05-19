@@ -10,7 +10,14 @@ add_library(MLCExec STATIC
     Quantize.cpp
     MLXBuilder.cpp
     MLIRExecutor.cpp
-    Q4MatMul.cpp)
+    Q4MatMul.cpp
+    ANEMatMul.mm)
+
+if(APPLE)
+    target_link_libraries(MLCExec PUBLIC "-framework CoreML")
+    set_source_files_properties(ANEMatMul.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
 
 set_target_properties(MLCExec PROPERTIES
     CXX_STANDARD 20
