@@ -108,12 +108,16 @@ int main(int argc, char **argv) {
   std::cout.flush();
 
   auto t_start = std::chrono::steady_clock::now();
+  // Prefill: feed the whole prompt in a single run() to seed the KV cache.
+  // Decode: feed one new token per call, advancing the absolute position.
+  exec.reset();
+  std::vector<int32_t> prefill_positions(tokens.size());
+  std::iota(prefill_positions.begin(), prefill_positions.end(), 0);
+  auto out = exec.run(tokens, prefill_positions);
+
+  int abs_pos = static_cast<int>(tokens.size()) - 1;
   int new_tokens = 0;
   for (int step = 0; step < args.max_tokens; ++step) {
-    std::vector<int32_t> positions(tokens.size());
-    std::iota(positions.begin(), positions.end(), 0);
-
-    auto out = exec.run(tokens, positions);
     int seq = out.shape[0];
     int vocab = out.shape[1];
     const float *last_row = out.data.data() + static_cast<size_t>(seq - 1) * vocab;
@@ -125,6 +129,11 @@ int main(int argc, char **argv) {
     std::cout << tok.tokenString(static_cast<uint64_t>(next)) << std::flush;
     tokens.push_back(next);
     ++new_tokens;
+    ++abs_pos;
+    if (step + 1 >= args.max_tokens) break;
+
+    // One-token decode call. KV cache carries forward.
+    out = exec.run({next}, {abs_pos});
   }
   auto t_end = std::chrono::steady_clock::now();
   std::cout << "\n";
@@ -134,7 +143,7 @@ int main(int argc, char **argv) {
   double toks_per_s = new_tokens > 0 ? (new_tokens / secs) : 0.0;
   std::cout << "[stats] generated " << new_tokens << " tokens in "
             << secs << "s (" << toks_per_s << " tok/s, "
-            << "resident fp16 weights, no KV cache, dense attention)\n";
+            << "resident fp16 weights, KV cache, single-token decode)\n";
 
   return 0;
 }

@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 
 namespace mx = mlx::core;
@@ -79,61 +80,103 @@ mx::array buildLMHead(const mx::array &x, const mx::array &w) {
   return mx::matmul(x, mx::transpose(w));  // [vocab, hidden]
 }
 
-// Dense attention with causal mask and inline RoPE for Q/K.
-// q: [seq, n_heads * head_dim]
-// k, v: [seq, n_kv_heads * head_dim]
-// positions: [seq] int32. Used only for the RoPE start offset (positions[0]).
+// Dense attention with causal mask, inline RoPE, and an optional KV cache.
+//
+// q: [seq_new, n_heads * head_dim]
+// k, v: [seq_new, n_kv_heads * head_dim]
+// positions: [seq_new] int32. positions[0] is the absolute index of the
+// first new token; the rest are assumed contiguous (this matches both
+// prefill-from-zero and one-token-decode workloads).
+// cache: when non-null, the slot's K and V arrays hold the prefix
+// (post-RoPE for K, raw for V); we append new K/V and write the full
+// arrays back. nullptr → recompute from scratch each call.
 mx::array buildAttention(const mx::array &q_flat, const mx::array &k_flat,
                          const mx::array &v_flat, const mx::array &positions,
-                         int n_heads, int n_kv_heads, int head_dim) {
-  int seq = q_flat.shape(0);
+                         int n_heads, int n_kv_heads, int head_dim,
+                         KVCacheSlot *cache) {
+  int seq_new = q_flat.shape(0);
 
   // Reshape to [seq, head, dim] then transpose to [head, seq, dim].
-  auto q = mx::transpose(mx::reshape(q_flat, {seq, n_heads, head_dim}),
+  auto q = mx::transpose(mx::reshape(q_flat, {seq_new, n_heads, head_dim}),
                          {1, 0, 2});
-  auto k = mx::transpose(mx::reshape(k_flat, {seq, n_kv_heads, head_dim}),
+  auto k = mx::transpose(mx::reshape(k_flat, {seq_new, n_kv_heads, head_dim}),
                          {1, 0, 2});
-  auto v = mx::transpose(mx::reshape(v_flat, {seq, n_kv_heads, head_dim}),
+  auto v = mx::transpose(mx::reshape(v_flat, {seq_new, n_kv_heads, head_dim}),
                          {1, 0, 2});
 
   // RoPE — start offset from positions[0]. We pull it eagerly (sync) since
   // MLX's rope op takes an int, not an array. v1 only supports
-  // contiguous-from-offset sequences.
+  // contiguous-from-offset sequences, which is what prefill + greedy decode
+  // produce anyway.
   mx::array p0 = mx::take(positions, 0);
   mx::eval(p0);
   int offset = static_cast<int>(p0.item<int32_t>());
   // GGUF-format Llama uses consecutive-pair RoPE (rotates dims [2i, 2i+1])
   // — MLX calls this `traditional=true`. Confirmed against the runtime's
   // applyRotaryToBuffer in attention_cpu.cpp.
+  //
+  // MLX's `fast::rope` returns NaN at seq_len=1 in fp16 (verified empirically
+  // on M-series during R2). Working around it by running the rope, the cache
+  // store, and the QK^T matmul in fp32. The downstream attention math (V,
+  // softmax, etc.) returns to whatever dtype `v` already has.
+  auto q_dtype = q.dtype();
+  q = mx::astype(q, mx::float32);
+  k = mx::astype(k, mx::float32);
   q = mx::fast::rope(q, head_dim, /*traditional=*/true, /*base=*/10000.0f,
                      /*scale=*/1.0f, offset);
   k = mx::fast::rope(k, head_dim, true, 10000.0f, 1.0f, offset);
 
+  // KV cache: concat the new (post-RoPE) K and (raw) V onto whatever the
+  // cache already holds, then write a fresh, materialized copy back. K is
+  // stored fp32 to dodge the fp16 RoPE precision issue noted above; V is
+  // stored at its natural dtype.
+  if (cache) {
+    if (cache->K.has_value())
+      k = mx::concatenate({*cache->K, k}, /*axis=*/1);
+    if (cache->V.has_value())
+      v = mx::concatenate({*cache->V, v}, 1);
+    auto k_owned = mx::copy(k);
+    auto v_owned = mx::copy(v);
+    mx::eval({k_owned, v_owned});
+    cache->K = k_owned;
+    cache->V = v_owned;
+    k = k_owned;
+    v = v_owned;
+  }
+  int seq_full = k.shape(1);
+  // Keep Q in fp32 too so the QK^T matmul is consistent with the fp32 K.
+  // V stays in fp16 — the matmul to V happens after softmax, where fp32
+  // probabilities multiplying fp16 values is well-conditioned.
+
   // GQA: replicate K, V across each group of n_heads/n_kv_heads.
   if (n_heads != n_kv_heads) {
     int n_rep = n_heads / n_kv_heads;
-    auto k_exp = mx::expand_dims(k, 1);  // [n_kv, 1, seq, dim]
+    auto k_exp = mx::expand_dims(k, 1);  // [n_kv, 1, seq_full, dim]
     auto v_exp = mx::expand_dims(v, 1);
-    k_exp = mx::broadcast_to(k_exp, mx::Shape{n_kv_heads, n_rep, seq, head_dim});
-    v_exp = mx::broadcast_to(v_exp, mx::Shape{n_kv_heads, n_rep, seq, head_dim});
-    k = mx::reshape(k_exp, {n_heads, seq, head_dim});
-    v = mx::reshape(v_exp, {n_heads, seq, head_dim});
+    k_exp = mx::broadcast_to(k_exp, mx::Shape{n_kv_heads, n_rep, seq_full, head_dim});
+    v_exp = mx::broadcast_to(v_exp, mx::Shape{n_kv_heads, n_rep, seq_full, head_dim});
+    k = mx::reshape(k_exp, {n_heads, seq_full, head_dim});
+    v = mx::reshape(v_exp, {n_heads, seq_full, head_dim});
   }
 
-  // scores = Q @ K^T / sqrt(head_dim) — [n_heads, seq_q, seq_k]
-  auto k_T = mx::transpose(k, {0, 2, 1});
-  auto scale_scalar = mx::array(1.0f / std::sqrt(static_cast<float>(head_dim)));
-  auto scores = mx::multiply(mx::matmul(q, k_T), scale_scalar);
-
-  // Causal mask: -inf above the diagonal.
-  auto mask = mx::tril(mx::ones({seq, seq}, mx::float32));
-  auto neg_inf = mx::array(-1e9f);
-  scores = mx::where(mx::equal(mask, mx::array(0.0f)), neg_inf, scores);
-
-  scores = mx::softmax(scores, /*axes=*/std::vector<int>{-1});
-  auto out = mx::matmul(scores, v);                    // [n_heads, seq, dim]
-  out = mx::transpose(out, {1, 0, 2});                  // [seq, n_heads, dim]
-  return mx::reshape(out, {seq, n_heads * head_dim});
+  // MLX's `scaled_dot_product_attention` does the softmax(QK^T/√d)V dance for
+  // us, with a built-in causal mask path. Inputs are [B, H, L, D]; we have a
+  // single batch so add a leading dim and drop it on the way out.
+  auto q4 = mx::expand_dims(q, 0);                  // [1, H, seq_new, D]
+  auto k4 = mx::expand_dims(k, 0);                  // [1, H, seq_full, D]
+  auto v4 = mx::expand_dims(v, 0);                  // [1, H, seq_full, D]
+  // Cast V up to match Q/K (both fp32 by now) — the kernel asks for matching dtypes.
+  v4 = mx::astype(v4, q4.dtype());
+  float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  // Causal mask only when there's history we need to hide (prefill).
+  // For one-token decode every cached key is in the past, so no mask.
+  std::string mask_mode = (seq_new > 1) ? "causal" : "";
+  auto out4 = mx::fast::scaled_dot_product_attention(q4, k4, v4, scale,
+                                                     mask_mode);
+  auto out = mx::squeeze(out4, 0);                  // [H, seq_new, D]
+  out = mx::transpose(out, {1, 0, 2});              // [seq_new, H, D]
+  out = mx::reshape(out, {seq_new, n_heads * head_dim});
+  return mx::astype(out, q_dtype);
 }
 
 // ----- Arg binding -----
@@ -176,6 +219,8 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
   // Batch-materialize so MLX can pipeline the host→device uploads.
   mx::eval(to_eval);
 }
+
+void MLIRExecutor::reset() { kv_cache_.clear(); }
 
 MLIRExecutor::RunResult
 MLIRExecutor::run(const std::vector<int32_t> &token_ids,
@@ -241,6 +286,7 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
   // Walk ops top-down. Each mlc-dialect op dispatches to one of the builders
   // above; func.return marks the end and surfaces its operand as the result.
   ::mlir::Value result;
+  size_t attn_idx = 0;
   for (auto &op : entryBlock) {
     if (auto matmul = ::llvm::dyn_cast<::mlir::mlc::MatMulOp>(op)) {
       put(matmul.getY(),
@@ -268,12 +314,18 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       put(fused.getY(), buildMatMul(n, get(fused.getW()),
                                     fused.getTransposeB()));
     } else if (auto attn = ::llvm::dyn_cast<::mlir::mlc::AttentionOp>(op)) {
+      // Grow the cache lazily so an executor used without any decode
+      // doesn't pay for the storage.
+      if (attn_idx >= kv_cache_.size())
+        kv_cache_.emplace_back();
       put(attn.getOut(),
           buildAttention(get(attn.getQ()), get(attn.getK()), get(attn.getV()),
                          get(attn.getPositions()),
                          i64Of(attn.getNumHeadsAttr()),
                          i64Of(attn.getNumKvHeadsAttr()),
-                         i64Of(attn.getHeadDimAttr())));
+                         i64Of(attn.getHeadDimAttr()),
+                         &kv_cache_[attn_idx]));
+      ++attn_idx;
     } else if (auto ret = ::llvm::dyn_cast<::mlir::func::ReturnOp>(op)) {
       result = ret.getOperand(0);
       break;
