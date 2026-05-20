@@ -49,14 +49,16 @@ Our compiler sees the full graph and can fuse adjacent ops (QKV projection batch
 
 ## Current state (as of last session)
 
-Compiler path: 77 tok/s single-stream / 143 tok/s batch=8, TinyLlama Q4_0, M3 Pro.
+Compiler path: 78 tok/s single-stream / ~185 tok/s peak ceiling, TinyLlama Q4_0, M3 Pro.
 - MLIR dialect: 7 ops, IR emission from GGUF, round-trip through mlc-opt
 - Fusion passes: QKV batching, FFN gate+up batching (marginal advantage at batch≥2)
 - Execution: mx::quantized_matmul (group_size=32, bits=4, affine), MLX SDPA, KV cache
-- Batching: prefillBatch + runBatch, N concurrent requests; 143 tok/s at batch=8
+- Batching: prefillBatch + runBatch, batch=1-64 validated, no OOM
+- GPU compute ceiling: ~185-190 tok/s aggregate at batch=32-64 (M3 Pro saturated)
+- Beats Ollama (144 tok/s single-stream) starting at batch=16 (160 tok/s)
 - Driver: `mlc-compile-run --prompt A --prompt B ... --max-tokens N`
-- Profiling: `MLC_COMPILER_PROFILE=1` per-op timing table
-- `MLC_Q4_CUSTOM_KERNEL=1` falls back to original custom kernel (debugging)
+- `MLC_FUSED_KERNELS=1` enables fused ops (correct, no improvement found — U9)
+- Llama 3.2 3B: blocked — weight-tied embeddings, output.weight absent in GGUF
 
 ## Immediate next steps (priority order)
 
@@ -97,7 +99,15 @@ Compiler path: 77 tok/s single-stream / 143 tok/s batch=8, TinyLlama Q4_0, M3 Pr
    tok/s on TinyLlama batch=1 decode. mx::quantized_matmul is the default because it
    is Apple's optimized path and matches the Python/MLX reference. The custom kernel
    is retained behind `MLC_Q4_CUSTOM_KERNEL=1`.
-5. **Batching at 143 tok/s matches Ollama's batch=1 ceiling.** The compiler path's
+5. **Batching scaling curve: GPU ceiling at batch=32-64, ~185-190 tok/s.**
+   Full curve (TinyLlama Q4_0, M3 Pro, 32 tok/req, peak numbers):
+   batch=1: 78 tok/s / batch=2: 105 / batch=4: 129 / batch=8: 141 /
+   batch=16: 160 / batch=32: 185 / batch=64: 187 (plateau).
+   Beats Ollama single-stream (144 tok/s) at batch=16. No OOM to batch=64.
+   KV cache pre-alloc (kMaxSeq=2048): 88 MB/request. Throughput ceiling is
+   GPU compute saturation, not memory. Peak agg throughput = 2.40× batch=1.
+
+5b. **Batching at 141-143 tok/s (batch=8) matches Ollama's batch=1 ceiling.** The compiler path's
    continuous batching (V1–V3) reaches 143 tok/s aggregate at batch=8, matching Ollama
    (144 tok/s) which has no batch serving mode. Phase-1 runtime batch=8 was 97 tok/s;
    compiler path is 1.47× faster. The thin-matmul inefficiency at batch=1 (MLX
