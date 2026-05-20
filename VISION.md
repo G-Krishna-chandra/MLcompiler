@@ -39,9 +39,10 @@ Our compiler sees the full graph and can fuse adjacent ops (QKV projection batch
 - **Batch-aware tiling passes.** When batch_size > 1, tile across both batch and output dimensions jointly for optimal GPU occupancy.
 - **Device scheduling pass.** Annotate ops with target device. Currently GPU-only (ANE via CoreML was falsified — per-op dispatch overhead doesn't amortize). Future: direct ANE via private APIs if the overhead problem can be bypassed.
 - **The C++ execution engine.** Lower latency than Python for agentic workloads where per-token overhead matters.
+- **Fused layer kernels.** A single Metal kernel covering an entire transformer layer (norm → QKV matmul → attention → output projection → norm → FFN gate+up → SiLU×mul → FFN down → residual add). Reduces dispatches from ~5 per layer to 1 per layer (110 → 22 per forward pass). This is the core compiler moat: graph-level op fusion lowered to a single dispatch that no op-by-op runtime can achieve.
 
 ## What we do NOT build:
-- Custom matmul Metal kernels for the compiler path. Use mx::quantized_matmul.
+- Custom Metal kernels for **individual ops** (standalone matmul, standalone norm) on the compiler path — use MLX for these. **EXCEPTION: custom FUSED Metal kernels that combine multiple ops into a single dispatch ARE permitted when the purpose is dispatch count reduction.** W1 profiling proved 85% of batch=1 step time is dispatch overhead (110 dispatches × 100 µs = 11 ms of 13 ms total). Fusing ops into fewer dispatches is the only path to materially better single-stream throughput and is a compiler optimization MLX structurally cannot perform.
 - Custom attention Metal kernels for the compiler path. Use mx::fast::scaled_dot_product_attention.
 - A from-scratch scheduler. Adopt vllm-mlx's design.
 - CoreML/ANE integration. Falsified (U1). Per-matmul CoreML overhead is ~250 µs regardless of subgraph packing. Revisit only via direct _ANEClient APIs, not CoreML.
