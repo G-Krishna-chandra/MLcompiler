@@ -48,14 +48,14 @@ Our compiler sees the full graph and can fuse adjacent ops (QKV projection batch
 
 ## Current state (as of last session)
 
-Compiler path: 66 tok/s on TinyLlama 1.1B Q4_0, M3 Pro.
+Compiler path: 77 tok/s single-stream / 143 tok/s batch=8, TinyLlama Q4_0, M3 Pro.
 - MLIR dialect: 7 ops, IR emission from GGUF, round-trip through mlc-opt
-- Fusion passes: QKV batching, FFN gate+up batching
-- Execution: mx::quantized_matmul (group_size=32, bits=4, affine) for all Q4_0 weights,
-  converted from GGUF at load time; in-place KV cache; MLX SDPA
-- ANE: investigated and falsified via CoreML (T2, U1). Code retained, off by default.
-- `MLC_Q4_CUSTOM_KERNEL=1` falls back to the original hand-written Q4_0 Metal kernel
-  (same tok/s, same generation — retained for debugging)
+- Fusion passes: QKV batching, FFN gate+up batching (marginal advantage at batch≥2)
+- Execution: mx::quantized_matmul (group_size=32, bits=4, affine), MLX SDPA, KV cache
+- Batching: prefillBatch + runBatch, N concurrent requests; 143 tok/s at batch=8
+- Driver: `mlc-compile-run --prompt A --prompt B ... --max-tokens N`
+- Profiling: `MLC_COMPILER_PROFILE=1` per-op timing table
+- `MLC_Q4_CUSTOM_KERNEL=1` falls back to original custom kernel (debugging)
 
 ## Immediate next steps (priority order)
 
@@ -65,7 +65,14 @@ Compiler path: 66 tok/s on TinyLlama 1.1B Q4_0, M3 Pro.
    the standard prompt — this is TinyLlama's failure mode, not a regression. The
    "Paris." output from U5 was from the fp32 dequant path (1 tok/s), not Q4_0.
 
-2. **Continuous batching through the compiler path.** Add batched execution to the MLIR pipeline. The MLIR fusion passes (QKV batching, FFN gate+up) should reduce dispatch count per forward pass, improving batched throughput over vanilla MLX.
+2. ~~**Continuous batching through the compiler path.**~~ DONE (U7). batch=8
+   reaches 143 tok/s aggregate, matching Ollama's 144 tok/s at batch=1.
+   Phase-1 runtime batch=8: 97 tok/s; compiler path: 1.47× faster.
+   **STOP CONDITION triggered:** fusion advantage < 2% at batch≥4. The QKV
+   and FFN gate+up fusion passes provide at most 3.2% (batch=2) and regress
+   -2% at batch=1. MLX's lazy evaluation already fuses these ops; MLIR passes
+   duplicate work MLX does for free. The moat, as currently implemented, is
+   not measurable at this scale.
 
 3. **Adopt vllm-mlx scheduler design.** Replace FIFO scheduler with preemption-capable, prefix-caching scheduler based on vllm-mlx's approach.
 
@@ -84,8 +91,18 @@ Compiler path: 66 tok/s on TinyLlama 1.1B Q4_0, M3 Pro.
 
 1. **ANE via CoreML doesn't work for inference.** Per-matmul CoreML overhead is ~250 µs regardless of subgraph packing. The S4 "5x ANE win" was an apples-to-oranges benchmark (fresh weights vs resident weights). Falsified in U1.
 2. **Metal memory coherence breaks at scale.** Single-encoder forward pass with barriers works at small scale (10 dispatches) but produces garbage at walker scale (260 dispatches, 20 reused buffers). Diagnosed in N1, documented in tools/metal_hazard_test.mm.
-3. **MLX lazy evaluation already fuses adjacent ops.** MLIR norm+matmul fusion added zero wall-clock improvement because MLX was already doing it internally. Only cross-op fusions (shared-input batching) move the clock.
+3. **MLX lazy evaluation already fuses adjacent ops.** MLIR norm+matmul fusion added zero wall-clock improvement because MLX was already doing it internally. QKV batching and FFN gate+up batching fusion passes gave at most 3.2% advantage (batch=2) and regressed by -2% at batch=1. MLX handles the same cross-op fusion in its graph automatically. Only cross-compile-boundary information (device assignment, scheduler-driven batch formation) can produce structural advantages that MLX cannot match alone.
 4. **Custom Q4_0 kernel ≈ mx::quantized_matmul in decode mode.** Both give ~65–66
    tok/s on TinyLlama batch=1 decode. mx::quantized_matmul is the default because it
    is Apple's optimized path and matches the Python/MLX reference. The custom kernel
    is retained behind `MLC_Q4_CUSTOM_KERNEL=1`.
+5. **Batching at 143 tok/s matches Ollama's batch=1 ceiling.** The compiler path's
+   continuous batching (V1–V3) reaches 143 tok/s aggregate at batch=8, matching Ollama
+   (144 tok/s) which has no batch serving mode. Phase-1 runtime batch=8 was 97 tok/s;
+   compiler path is 1.47× faster. The thin-matmul inefficiency at batch=1 (MLX
+   vs custom Metal) is solved by batching — at batch=8 the mats are [8,2048]×[K,2048],
+   fully utilizing MLX's tiled quantized_matmul.
+6. **The 2× gap to Ollama batch=1 is thin-matmul.** At seq=1 batch=1, matmuls are
+   [1,2048]×[K,2048] — too thin for MLX's tiled kernel. Llama.cpp's custom simdgroup
+   reduction handles this shape ~2× better. Not fixable without custom Metal shaders
+   (which we explicitly don't write for the compiler path).
