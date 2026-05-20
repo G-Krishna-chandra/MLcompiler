@@ -116,7 +116,10 @@ int main(int argc, char **argv) {
     tokens.push_back(static_cast<int32_t>(id));
 
   std::cout << "[prompt] " << args.prompt << "\n";
-  std::cout << "[encoded] " << tokens.size() << " tokens\n";
+  std::cout << "[encoded] " << tokens.size() << " tokens: [";
+  for (size_t i = 0; i < tokens.size(); ++i)
+    std::cout << (i ? "," : "") << tokens[i];
+  std::cout << "]\n";
   std::cout << "[generation] ";
   std::cout.flush();
 
@@ -154,10 +157,13 @@ int main(int argc, char **argv) {
   double secs =
       std::chrono::duration<double>(t_end - t_start).count();
   double toks_per_s = new_tokens > 0 ? (new_tokens / secs) : 0.0;
+  const char *q4_mode = std::getenv("MLC_Q4_CUSTOM_KERNEL");
+  bool use_custom = q4_mode && std::string(q4_mode) == "1";
   std::cout << "[stats] generated " << new_tokens << " tokens in "
             << secs << "s (" << toks_per_s << " tok/s, "
-            << "Q4_0 weights + custom Metal kernel, KV cache, "
-            << "single-token decode)\n";
+            << (use_custom ? "custom Q4_0 Metal kernel [MLC_Q4_CUSTOM_KERNEL=1]"
+                           : "mx::quantized_matmul (group_size=32 bits=4 affine)")
+            << ", KV cache, single-token decode)\n";
 
   return 0;
 }

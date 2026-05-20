@@ -1,6 +1,6 @@
 #include "compiler/mlir/exec/MLIRExecutor.h"
 #include "compiler/mlir/exec/MLXBuilder.h"
-#include "compiler/mlir/exec/Q4MatMul.h"
+#include "compiler/mlir/exec/MLXQuantize.h"
 #include "compiler/mlir/exec/Quantize.h"
 #include "compiler/frontends/ggml_types.hpp"
 #include "compiler/mlir/dialect/MLCDialect.h"
@@ -32,6 +32,16 @@ namespace {
 // Kept as free functions inside this TU so the walker switch below stays
 // short and readable. Each builder takes already-materialized mx::array
 // operands and returns the result of the op as a (lazy) mx::array.
+
+// mx::quantized_matmul always returns float32 regardless of x's dtype.
+// We leave it in fp32; all activations flow in fp32 downstream. The custom
+// kernel had fp32 accumulation + fp16 output; keeping fp32 throughout here
+// gives better precision and matches the expected greedy-decode trajectory.
+inline mx::array qmatmul(const mx::array &x, const MLXQuantWeights &pkg) {
+  return mx::quantized_matmul(x, pkg.w_q, pkg.scales, pkg.biases,
+                              /*transpose=*/true, /*group_size=*/32,
+                              /*bits=*/4, "affine");
+}
 
 mx::array buildNorm(const mx::array &x, const mx::array &gamma, float eps) {
   // RMSNorm with fused gamma. MLX's fast::rms_norm matches what TinyLlama
@@ -228,6 +238,10 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
                            const ::mlc::frontend::GGUFLoader &loader,
                            bool use_ane)
     : module_(module), loader_(loader), use_ane_(use_ane) {
+  {
+    const char *env = std::getenv("MLC_Q4_CUSTOM_KERNEL");
+    use_custom_q4_ = env && std::string(env) == "1";
+  }
   auto func = *module_.getOps<::mlir::func::FuncOp>().begin();
 
   // First pass: identify which func args are used as the weight operand of
@@ -248,12 +262,10 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
     }
   });
 
-  // Second pass: per-arg, decide between Q4_0 bytes (matmul + Q4_0 dtype)
-  // and fp16 dequant (everything else, including embedding table, norm
-  // gamma, and the Q6_K lm_head weight).
+  // Second pass: per-arg, decide between MLX native-quantized (Q4_0 matmul
+  // weights → mx::quantized_matmul) and fp16 dequant (embedding table, norm
+  // gamma, Q6_K lm_head, and anything non-Q4_0).
   auto &entry = func.getBody().front();
-  ::std::vector<mx::array> to_eval;
-  to_eval.reserve(entry.getNumArguments());
   for (unsigned i = 0; i < entry.getNumArguments(); ++i) {
     const std::string &nm = argName(func, i);
     if (nm == "ids" || nm == "positions") continue;
@@ -261,22 +273,26 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
     bool is_q4_target = matmul_arg_idxs.count(i) &&
                         info.dtype == ::mlc::frontend::GGML_TYPE_Q4_0 &&
                         info.shape.size() == 2;
-    if (is_q4_target) {
+    if (is_q4_target && use_custom_q4_) {
+      // Legacy path: keep raw GGUF Q4_0 bytes for the custom Metal kernel.
       auto bytes = gufWeightToBytesMLX(loader_, nm);
       q4_bytes_cache_.emplace(nm, bytes);
-      // GGUF shape is innermost-first → shape[0]=in, shape[1]=out.
       int in_dim = static_cast<int>(info.shape[0]);
       int out_dim = static_cast<int>(info.shape[1]);
       q4_dims_cache_.emplace(nm, std::pair<int, int>{in_dim, out_dim});
-      to_eval.push_back(bytes);
+      mx::eval(bytes);
+    } else if (is_q4_target) {
+      // ggufQ4_0ToMLXQuantized builds and evaluates (w_q, scales, biases)
+      // from GGUF bytes in one shot. The conversion is bit-exact: no
+      // re-quantization, no fp16 dequant of the full weight matrix.
+      mlxq_cache_.emplace(nm, ggufQ4_0ToMLXQuantized(loader_, nm));
     } else {
       auto a32 = gufWeightToMLX(loader_, nm);
       auto a16 = mx::astype(a32, mx::float16);
       auto [it, inserted] = weight_cache_.emplace(nm, a16);
-      if (inserted) to_eval.push_back(a16);
+      if (inserted) mx::eval(a16);
     }
   }
-  mx::eval(to_eval);
 
   // Third pass: if ANE is enabled, bake a CoreML model for every op the
   // scheduler marked Device::ANE. The models hold their weights baked in
@@ -290,7 +306,6 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
       return attr && attr.getValue() == Device::ANE;
     };
     auto bytesToFP16MLX = [&](Value w_val) -> mx::array {
-      // The bound value in q4_bytes_cache_ is the raw GGUF byte array.
       // Dequant to fp32 + cast to fp16 for the CoreML model bake.
       auto barg = ::llvm::cast<BlockArgument>(w_val);
       const std::string &nm = argName(func, barg.getArgNumber());
@@ -396,6 +411,7 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
   mx::array ids_arr = makeI32(token_ids);
   mx::array pos_arr = makeI32(positions);
 
+  mlxq_value_pkg_.clear();
   q4_value_dims_.clear();
   for (unsigned i = 0; i < entryBlock.getNumArguments(); ++i) {
     const std::string &nm = argName(func, i);
@@ -404,9 +420,19 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       values.insert({value, ids_arr});
     } else if (nm == "positions") {
       values.insert({value, pos_arr});
-    } else if (auto q4 = q4_bytes_cache_.find(nm); q4 != q4_bytes_cache_.end()) {
-      values.insert({value, q4->second});
-      q4_value_dims_.insert({value, q4_dims_cache_.at(nm)});
+    } else if (use_custom_q4_) {
+      if (auto q4it = q4_bytes_cache_.find(nm); q4it != q4_bytes_cache_.end()) {
+        values.insert({value, q4it->second});
+        q4_value_dims_.insert({value, q4_dims_cache_.at(nm)});
+      } else {
+        auto it = weight_cache_.find(nm);
+        if (it == weight_cache_.end())
+          throw std::runtime_error("missing weight in cache: " + nm);
+        values.insert({value, it->second});
+      }
+    } else if (auto q4it = mlxq_cache_.find(nm); q4it != mlxq_cache_.end()) {
+      values.insert({value, q4it->second.w_q});
+      mlxq_value_pkg_.insert({value, &q4it->second});
     } else {
       auto it = weight_cache_.find(nm);
       if (it == weight_cache_.end())
@@ -435,7 +461,7 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       auto ane_it = ane_cache_.find(matmul.getOperation());
       auto x_in = get(matmul.getX());
       // ANE models are baked at a fixed M (1 today). At other seq_lens
-      // (prefill) fall through to the Q4_0 kernel — already cached.
+      // (prefill) fall through to the quantized kernel.
       bool ane_match = ane_it != ane_cache_.end() &&
                        x_in.shape(0) == ane_it->second->M();
       if (ane_match) {
@@ -443,15 +469,18 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
         // fp16 internally; output comes back as fp32 (CoreML default).
         auto y_out = ane_it->second->predict(x_in);
         put(matmul.getY(), mx::astype(y_out, x_in.dtype()));
-      } else if (auto dims = q4_value_dims_.find(w_v);
-                 dims != q4_value_dims_.end()) {
-        put(matmul.getY(), q4_0_matmul(get(matmul.getX()), get(w_v),
-                                       dims->second.first,
-                                       dims->second.second));
+      } else if (use_custom_q4_) {
+        if (auto dims = q4_value_dims_.find(w_v); dims != q4_value_dims_.end())
+          put(matmul.getY(), q4_0_matmul(x_in, get(w_v),
+                                         dims->second.first, dims->second.second));
+        else
+          put(matmul.getY(), buildMatMul(x_in, get(w_v), matmul.getTransposeB()));
+      } else if (auto pkg_it = mlxq_value_pkg_.find(w_v);
+                 pkg_it != mlxq_value_pkg_.end()) {
+        put(matmul.getY(), qmatmul(x_in, *pkg_it->second));
       } else {
         put(matmul.getY(),
-            buildMatMul(get(matmul.getX()), get(w_v),
-                        matmul.getTransposeB()));
+            buildMatMul(x_in, get(w_v), matmul.getTransposeB()));
       }
     } else if (auto norm = ::llvm::dyn_cast<::mlir::mlc::NormOp>(op)) {
       put(norm.getY(),
@@ -463,36 +492,72 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       auto w_gate_ty =
           ::llvm::cast<::mlir::RankedTensorType>(ff.getWGate().getType());
       int ffn_dim = w_gate_ty.getShape()[0];
-      bool all_q4 = q4_value_dims_.count(ff.getWGate()) &&
-                    q4_value_dims_.count(ff.getWUp()) &&
-                    q4_value_dims_.count(ff.getWDown());
-      auto cache_it = ffn_gateup_cache_.find(ff.getOperation());
-      if (cache_it == ffn_gateup_cache_.end()) {
-        auto concat =
-            mx::concatenate({get(ff.getWGate()), get(ff.getWUp())}, /*axis=*/0);
-        auto owned = mx::copy(concat);
-        mx::eval(owned);
-        cache_it = ffn_gateup_cache_.emplace(ff.getOperation(), owned).first;
-      }
-      mx::array y_ff = [&]() {
-        if (all_q4) {
-          int in_dim = q4_value_dims_.at(ff.getWGate()).first;
-          // Multi-output Q4_0 kernel: one dispatch writes gate and up
-          // into separate buffers — no mx::slice allocation between
-          // them. The combined gate||up weight is still cached on
-          // `ffn_gateup_cache_` from the concat above.
-          auto gu = q4_0_matmul_gate_up(get(ff.getX()), cache_it->second,
-                                         in_dim, ffn_dim, ffn_dim);
-          auto h = mx::multiply(mx::multiply(gu.gate, mx::sigmoid(gu.gate)),
-                                gu.up);
-          int down_in = q4_value_dims_.at(ff.getWDown()).first;
-          int down_out = q4_value_dims_.at(ff.getWDown()).second;
-          return q4_0_matmul(h, get(ff.getWDown()), down_in, down_out);
+      auto gate_pkg = mlxq_value_pkg_.find(ff.getWGate());
+      auto up_pkg   = mlxq_value_pkg_.find(ff.getWUp());
+      auto down_pkg = mlxq_value_pkg_.find(ff.getWDown());
+      bool all_q4 = gate_pkg != mlxq_value_pkg_.end() &&
+                    up_pkg   != mlxq_value_pkg_.end() &&
+                    down_pkg != mlxq_value_pkg_.end();
+      if (use_custom_q4_) {
+        bool cq4 = q4_value_dims_.count(ff.getWGate()) &&
+                   q4_value_dims_.count(ff.getWUp()) &&
+                   q4_value_dims_.count(ff.getWDown());
+        auto gu_it = q4_ffngu_concat_cache_.find(ff.getOperation());
+        if (gu_it == q4_ffngu_concat_cache_.end()) {
+          auto cat = mx::concatenate({get(ff.getWGate()), get(ff.getWUp())}, 0);
+          auto owned = mx::copy(cat); mx::eval(owned);
+          gu_it = q4_ffngu_concat_cache_.emplace(ff.getOperation(), owned).first;
         }
-        return buildFeedForward(get(ff.getX()), cache_it->second,
-                                 get(ff.getWDown()), ffn_dim);
-      }();
-      put(ff.getY(), y_ff);
+        if (cq4) {
+          int in_dim = q4_value_dims_.at(ff.getWGate()).first;
+          auto gu = q4_0_matmul_gate_up(get(ff.getX()), gu_it->second,
+                                        in_dim, ffn_dim, ffn_dim);
+          auto h = mx::multiply(mx::multiply(gu.gate, mx::sigmoid(gu.gate)), gu.up);
+          int din = q4_value_dims_.at(ff.getWDown()).first;
+          int dout = q4_value_dims_.at(ff.getWDown()).second;
+          put(ff.getY(), q4_0_matmul(h, get(ff.getWDown()), din, dout));
+        } else {
+          put(ff.getY(), buildFeedForward(get(ff.getX()), gu_it->second,
+                                         get(ff.getWDown()), ffn_dim));
+        }
+      } else if (all_q4) {
+        // Concat gate ‖ up quantized packs along the out-row axis once,
+        // then do a single quantized_matmul + slice. Cache in mlxq_ffngu_cache_.
+        auto gu_cache_it = mlxq_ffngu_cache_.find(ff.getOperation());
+        if (gu_cache_it == mlxq_ffngu_cache_.end()) {
+          const auto &gp = *gate_pkg->second;
+          const auto &up = *up_pkg->second;
+          auto w_q_cat    = mx::concatenate({gp.w_q, up.w_q}, /*axis=*/0);
+          auto scales_cat = mx::concatenate({gp.scales, up.scales}, /*axis=*/0);
+          auto biases_cat = mx::concatenate({gp.biases, up.biases}, /*axis=*/0);
+          mx::eval({w_q_cat, scales_cat, biases_cat});
+          MLXQuantWeights pkg{std::move(w_q_cat), std::move(scales_cat),
+                              std::move(biases_cat), gp.in_dim,
+                              gp.out_dim + up.out_dim};
+          gu_cache_it = mlxq_ffngu_cache_.emplace(ff.getOperation(),
+                                                   std::move(pkg)).first;
+        }
+        const auto &gu = gu_cache_it->second;
+        auto x_ff = get(ff.getX());
+        auto gu_out = qmatmul(x_ff, gu);
+        auto g = mx::slice(gu_out, {0, 0}, {gu_out.shape(0), ffn_dim});
+        auto u = mx::slice(gu_out, {0, ffn_dim}, {gu_out.shape(0), 2 * ffn_dim});
+        auto h = mx::multiply(mx::multiply(g, mx::sigmoid(g)), u);
+        put(ff.getY(), qmatmul(h, *down_pkg->second));
+      } else {
+        // fp16 path (no Q4_0 weights): gate||up concat cached in
+        // ffn_gateup_cache_.
+        auto cache_it = ffn_gateup_cache_.find(ff.getOperation());
+        if (cache_it == ffn_gateup_cache_.end()) {
+          auto concat = mx::concatenate({get(ff.getWGate()), get(ff.getWUp())},
+                                        /*axis=*/0);
+          auto owned = mx::copy(concat);
+          mx::eval(owned);
+          cache_it = ffn_gateup_cache_.emplace(ff.getOperation(), owned).first;
+        }
+        put(ff.getY(), buildFeedForward(get(ff.getX()), cache_it->second,
+                                       get(ff.getWDown()), ffn_dim));
+      }
     } else if (auto emb = ::llvm::dyn_cast<::mlir::mlc::EmbeddingOp>(op)) {
       int hidden = emb.getY().getType().getShape().back();
       put(emb.getY(),
@@ -503,10 +568,15 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       auto n = buildNorm(get(fused.getX()), get(fused.getGamma()),
                          f32Of(fused.getEpsilonAttr()));
       auto w_v = fused.getW();
-      auto dims = q4_value_dims_.find(w_v);
-      if (dims != q4_value_dims_.end()) {
-        put(fused.getY(), q4_0_matmul(n, get(w_v), dims->second.first,
-                                       dims->second.second));
+      if (use_custom_q4_) {
+        if (auto dims = q4_value_dims_.find(w_v); dims != q4_value_dims_.end())
+          put(fused.getY(), q4_0_matmul(n, get(w_v),
+                                        dims->second.first, dims->second.second));
+        else
+          put(fused.getY(), buildMatMul(n, get(w_v), fused.getTransposeB()));
+      } else if (auto pkg_it = mlxq_value_pkg_.find(w_v);
+                 pkg_it != mlxq_value_pkg_.end()) {
+        put(fused.getY(), qmatmul(n, *pkg_it->second));
       } else {
         put(fused.getY(), buildMatMul(n, get(w_v), fused.getTransposeB()));
       }
@@ -520,9 +590,7 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       int k_dim = k_ty.getShape().back();
       int v_dim = v_ty.getShape().back();
       // CoreML/ANE path: one predict() over the baked concat'd Q‖K‖V weight,
-      // then split. Saves three Q4_0 kernel launches per layer. Falls
-      // through to the Q4_0 kernel at any seq_len other than the baked
-      // M (1 today) — that's the prefill case.
+      // then split. Falls through at any seq_len other than the baked M.
       auto ane_qkv_it = ane_cache_.find(qkv.getOperation());
       if (ane_qkv_it != ane_cache_.end() &&
           n.shape(0) == ane_qkv_it->second->M()) {
@@ -538,22 +606,63 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
                       {out_arr.shape(0), q_dim + k_dim + v_dim}));
         continue;
       }
-      bool all_q4 = q4_value_dims_.count(qkv.getWQ()) &&
-                    q4_value_dims_.count(qkv.getWK()) &&
-                    q4_value_dims_.count(qkv.getWV());
-      auto cache_it = qkv_concat_cache_.find(qkv.getOperation());
-      if (cache_it == qkv_concat_cache_.end()) {
-        if (all_q4) {
-          // Q4_0 byte concat: each row's bytes are contiguous (row_bytes =
-          // (in/32)*18); rows for Q come first, then K, then V. The Q4 kernel
-          // walks `out_total` rows in one launch.
-          auto w_concat = mx::concatenate({get(qkv.getWQ()), get(qkv.getWK()),
-                                            get(qkv.getWV())},
-                                           /*axis=*/0);
-          auto owned = mx::copy(w_concat);
-          mx::eval(owned);
-          cache_it = qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
+      auto wq_pkg = mlxq_value_pkg_.find(qkv.getWQ());
+      bool all_q4 = wq_pkg != mlxq_value_pkg_.end() &&
+                    mlxq_value_pkg_.count(qkv.getWK()) &&
+                    mlxq_value_pkg_.count(qkv.getWV());
+      if (use_custom_q4_) {
+        bool cq4 = q4_value_dims_.count(qkv.getWQ()) &&
+                   q4_value_dims_.count(qkv.getWK()) &&
+                   q4_value_dims_.count(qkv.getWV());
+        auto qkv_it = q4_qkv_concat_cache_.find(qkv.getOperation());
+        if (qkv_it == q4_qkv_concat_cache_.end()) {
+          auto cat = mx::concatenate({get(qkv.getWQ()), get(qkv.getWK()),
+                                       get(qkv.getWV())}, 0);
+          auto owned = mx::copy(cat); mx::eval(owned);
+          qkv_it = q4_qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
+        }
+        if (cq4) {
+          int in_dim = q4_value_dims_.at(qkv.getWQ()).first;
+          auto r = q4_0_matmul_qkv(n, qkv_it->second, in_dim,
+                                    q_dim, k_dim, v_dim);
+          put(qkv.getQ(), r.q); put(qkv.getK(), r.k); put(qkv.getV(), r.v);
         } else {
+          auto out_arr = buildMatMul(n, qkv_it->second, qkv.getTransposeB());
+          put(qkv.getQ(), mx::slice(out_arr, {0,0}, {out_arr.shape(0), q_dim}));
+          put(qkv.getK(), mx::slice(out_arr, {0,q_dim}, {out_arr.shape(0), q_dim+k_dim}));
+          put(qkv.getV(), mx::slice(out_arr, {0,q_dim+k_dim}, {out_arr.shape(0), q_dim+k_dim+v_dim}));
+        }
+      } else if (all_q4) {
+        // Concat Q ‖ K ‖ V quantized packs along the out-row axis once,
+        // do a single quantized_matmul, then slice. Cached in mlxq_qkv_cache_.
+        auto qkv_cache_it = mlxq_qkv_cache_.find(qkv.getOperation());
+        if (qkv_cache_it == mlxq_qkv_cache_.end()) {
+          const auto &qp = *mlxq_value_pkg_.at(qkv.getWQ());
+          const auto &kp = *mlxq_value_pkg_.at(qkv.getWK());
+          const auto &vp = *mlxq_value_pkg_.at(qkv.getWV());
+          auto w_q_cat    = mx::concatenate({qp.w_q, kp.w_q, vp.w_q}, 0);
+          auto scales_cat = mx::concatenate({qp.scales, kp.scales, vp.scales}, 0);
+          auto biases_cat = mx::concatenate({qp.biases, kp.biases, vp.biases}, 0);
+          mx::eval({w_q_cat, scales_cat, biases_cat});
+          MLXQuantWeights pkg{std::move(w_q_cat), std::move(scales_cat),
+                              std::move(biases_cat), qp.in_dim,
+                              qp.out_dim + kp.out_dim + vp.out_dim};
+          qkv_cache_it = mlxq_qkv_cache_.emplace(qkv.getOperation(),
+                                                   std::move(pkg)).first;
+        }
+        const auto &qkv_pkg = qkv_cache_it->second;
+        auto out_arr = qmatmul(n, qkv_pkg);
+        put(qkv.getQ(),
+            mx::slice(out_arr, {0, 0}, {out_arr.shape(0), q_dim}));
+        put(qkv.getK(),
+            mx::slice(out_arr, {0, q_dim}, {out_arr.shape(0), q_dim + k_dim}));
+        put(qkv.getV(),
+            mx::slice(out_arr, {0, q_dim + k_dim},
+                      {out_arr.shape(0), q_dim + k_dim + v_dim}));
+      } else {
+        // fp16 path: gate||K||V concat cached in qkv_concat_cache_.
+        auto cache_it = qkv_concat_cache_.find(qkv.getOperation());
+        if (cache_it == qkv_concat_cache_.end()) {
           auto w_concat = mx::concatenate({get(qkv.getWQ()), get(qkv.getWK()),
                                             get(qkv.getWV())},
                                            0);
@@ -561,18 +670,6 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
           mx::eval(owned);
           cache_it = qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
         }
-      }
-      if (all_q4) {
-        int in_dim = q4_value_dims_.at(qkv.getWQ()).first;
-        // Multi-output Q4_0 kernel: one dispatch, three output buffers.
-        // Replaces the q4_0_matmul + 3*mx::slice round-trip that hurt
-        // fusion-ON in v3.
-        auto r = q4_0_matmul_qkv(n, cache_it->second, in_dim, q_dim, k_dim,
-                                  v_dim);
-        put(qkv.getQ(), r.q);
-        put(qkv.getK(), r.k);
-        put(qkv.getV(), r.v);
-      } else {
         auto out_arr = buildMatMul(n, cache_it->second, qkv.getTransposeB());
         put(qkv.getQ(),
             mx::slice(out_arr, {0, 0}, {out_arr.shape(0), q_dim}));

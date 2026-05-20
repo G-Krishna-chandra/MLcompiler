@@ -90,6 +90,7 @@ if(MLC_ENABLE_MLIR AND TARGET MLCExec)
         mlir/test_compiler_path_forward.cpp
         mlir/test_norm_matmul_fusion.cpp
         mlir/test_mlx_quant_roundtrip.cpp
+        mlir/test_mlx_quant_native.cpp
         mlir/test_mlx_metal_kernel_smoke.cpp
         mlir/test_q4_kernel.cpp
         mlir/test_schedule_devices.cpp

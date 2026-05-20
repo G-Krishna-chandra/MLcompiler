@@ -3,6 +3,8 @@
 #include "compiler/frontends/gguf_loader.hpp"
 
 #include "compiler/mlir/exec/ANEMatMul.h"
+#include "compiler/mlir/exec/MLXQuantize.h"
+#include "compiler/mlir/exec/Q4MatMul.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -67,17 +69,21 @@ private:
   // operands (norm gamma, embedding table, lm_head's Q6_K weight) and as
   // a fallback when a matmul weight isn't in Q4_0.
   std::unordered_map<std::string, mlx::core::array> weight_cache_;
-  // Q4_0 weight bytes (raw GGUF blocks, no dequant) keyed by tensor name.
-  // Used by the custom Q4_0 Metal kernel — drops weight memory by ~2x vs
-  // the fp16-resident path.
-  std::unordered_map<std::string, mlx::core::array> q4_bytes_cache_;
-  // (in_dim, out_dim) for each Q4_0 weight, parallel to q4_bytes_cache_.
-  std::unordered_map<std::string, std::pair<int, int>> q4_dims_cache_;
-  // Set of mlir::Values bound to Q4_0 bytes (vs fp16 weights). Builders
-  // check this to dispatch to the Q4_0 kernel.
-  ::llvm::DenseMap<::mlir::Value, std::pair<int, int>> q4_value_dims_;
+  // MLX native-quantized weights (group_size=32, bits=4, "affine") keyed by
+  // GGUF tensor name. Built once at construction from GGUF Q4_0 bytes.
+  std::unordered_map<std::string, MLXQuantWeights> mlxq_cache_;
+  // Quick lookup: is a given func-arg Value backed by a Q4_0 quantized pack?
+  // Populated per-run() from mlxq_cache_; pointer stays valid because the
+  // map itself lives for the executor lifetime.
+  ::llvm::DenseMap<::mlir::Value, const MLXQuantWeights *> mlxq_value_pkg_;
+  // Pre-concatenated (w_q, scales, biases) for the QKV fused op, keyed by
+  // Operation*. Holds Q ‖ K ‖ V along the out-row axis.
+  std::unordered_map<::mlir::Operation *, MLXQuantWeights> mlxq_qkv_cache_;
+  // Pre-concatenated (w_q, scales, biases) for the FFN gate+up op, keyed by
+  // Operation*. Holds gate ‖ up along the out-row axis.
+  std::unordered_map<::mlir::Operation *, MLXQuantWeights> mlxq_ffngu_cache_;
   // Pre-concatenated W_QKV weights, keyed by the fused_norm_qkv_matmul
-  // Operation* that owns them. Populated lazily on first encounter.
+  // Operation* that owns them. Used only for non-Q4_0 (fp16) weights.
   std::unordered_map<::mlir::Operation *, mlx::core::array> qkv_concat_cache_;
   // CoreML/ANE matmuls keyed by op. Populated at construction for ops
   // the scheduler marked Device::ANE. Empty when ANE is disabled.
@@ -92,6 +98,19 @@ private:
   // KV cache, one slot per mlc.attention op encountered (in walk order).
   // Grows on the first prefill call; updated in place every step.
   std::vector<KVCacheSlot> kv_cache_;
+  // MLC_Q4_CUSTOM_KERNEL=1: fall back to the hand-written Q4_0 Metal kernel
+  // instead of mx::quantized_matmul. The custom kernel's fp16 output truncation
+  // breaks TinyLlama's repetition trap at temperature=0; the native MLX path
+  // matches the Python/mlx-lm reference but degenerates on this prompt.
+  bool use_custom_q4_ = false;
+  // Q4_0 weight bytes (raw GGUF blocks) used by the custom kernel fallback.
+  std::unordered_map<std::string, mlx::core::array> q4_bytes_cache_;
+  std::unordered_map<std::string, std::pair<int, int>> q4_dims_cache_;
+  ::llvm::DenseMap<::mlir::Value, std::pair<int, int>> q4_value_dims_;
+  std::unordered_map<::mlir::Operation *, mlx::core::array>
+      q4_qkv_concat_cache_;
+  std::unordered_map<::mlir::Operation *, mlx::core::array>
+      q4_ffngu_concat_cache_;
 };
 
 } // namespace mlir::mlc::exec

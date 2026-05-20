@@ -9,6 +9,7 @@ endif()
 add_library(MLCExec STATIC
     Quantize.cpp
     MLXBuilder.cpp
+    MLXQuantize.cpp
     MLIRExecutor.cpp
     Q4MatMul.cpp
     ANEMatMul.mm
