@@ -17,10 +17,14 @@
 #include <mlx/transforms.h>
 
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace mx = mlx::core;
 
@@ -96,6 +100,54 @@ mx::array buildLMHead(const mx::array &x, const mx::array &w) {
   if (w.shape(0) == hidden)
     return mx::matmul(x, w);  // [hidden, vocab]
   return mx::matmul(x, mx::transpose(w));  // [vocab, hidden]
+}
+
+// Forward declaration (implemented below, after buildAttention).
+mx::array buildAttention(const mx::array &q_flat, const mx::array &k_flat,
+                         const mx::array &v_flat, const mx::array &positions,
+                         int n_heads, int n_kv_heads, int head_dim,
+                         KVCacheSlot *cache);
+
+// Batched attention for N concurrent requests, all at the same decode position.
+// Implemented as N separate buildAttention calls to reuse the proven
+// single-stream path. Outputs are concatenated into [N, n_heads * head_dim].
+//
+// V2 can replace this with a true batched SDPA once the GQA broadcasting
+// semantics in MLX are verified for N>1.
+mx::array buildBatchedAttention(const mx::array &q_flat,
+                                const mx::array &k_flat,
+                                const mx::array &v_flat,
+                                int common_offset, int seq_new,
+                                int n_heads, int n_kv_heads, int head_dim,
+                                std::vector<KVCacheSlot *> &caches) {
+  int N = q_flat.shape(0);
+
+  // Build a scalar positions array with value = common_offset.
+  // buildAttention reads positions[0] to get the rope offset.
+  int32_t *pbuf = static_cast<int32_t *>(std::malloc(sizeof(int32_t)));
+  if (!pbuf) throw std::bad_alloc();
+  *pbuf = common_offset;
+  mx::array pos_scalar(static_cast<void *>(pbuf), mx::Shape{1}, mx::int32,
+                       [](void *p) { std::free(p); });
+
+  // Per-request q/k/v: slice row i from the [N, ...] input.
+  std::vector<mx::array> outs;
+  outs.reserve(N);
+  int q_row = n_heads    * head_dim;
+  int k_row = n_kv_heads * head_dim;
+
+  for (int i = 0; i < N; ++i) {
+    // Slice out a [1, dim] row for request i.
+    auto qi = mx::slice(q_flat, {i, 0}, {i+1, q_row});  // [1, q_dim]
+    auto ki = mx::slice(k_flat, {i, 0}, {i+1, k_row});  // [1, k_dim]
+    auto vi = mx::slice(v_flat, {i, 0}, {i+1, k_row});  // [1, v_dim]
+    outs.push_back(buildAttention(qi, ki, vi, pos_scalar,
+                                  n_heads, n_kv_heads, head_dim,
+                                  caches[i]));
+  }
+
+  // Concatenate N outputs: [1, H*D] × N → [N, H*D]
+  return mx::concatenate(outs, 0);
 }
 
 // Dense attention with causal mask, inline RoPE, and an optional KV cache.
@@ -242,6 +294,10 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
     const char *env = std::getenv("MLC_Q4_CUSTOM_KERNEL");
     use_custom_q4_ = env && std::string(env) == "1";
   }
+  {
+    const char *env = std::getenv("MLC_COMPILER_PROFILE");
+    profile_enabled_ = env && std::string(env) == "1";
+  }
   auto func = *module_.getOps<::mlir::func::FuncOp>().begin();
 
   // First pass: identify which func args are used as the weight operand of
@@ -374,7 +430,364 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
   }
 }
 
-void MLIRExecutor::reset() { kv_cache_.clear(); }
+void MLIRExecutor::reset() {
+  kv_cache_.clear();
+  batch_kv_slots_.clear();
+}
+
+void MLIRExecutor::resetSlot(int slot_idx) {
+  if (slot_idx == 0 && batch_kv_slots_.empty()) {
+    kv_cache_.clear();
+  } else if (slot_idx >= 0 &&
+             static_cast<size_t>(slot_idx) < batch_kv_slots_.size()) {
+    batch_kv_slots_[slot_idx].clear();
+  }
+}
+
+// Prefill N requests in one batched call.
+// For V1: all prompts must be the same length (equal-length constraint).
+// Strategy: run ONE single-stream prefill (reusing existing run()), then
+// replicate the resulting KV cache N times into batch_kv_slots_.
+// This avoids N full forward passes for an identical prompt.
+std::vector<MLIRExecutor::RunResult>
+MLIRExecutor::prefillBatch(
+    const std::vector<std::vector<int32_t>> &prompt_ids) {
+  if (prompt_ids.empty())
+    throw std::runtime_error("prefillBatch: empty request list");
+  int N = static_cast<int>(prompt_ids.size());
+  // V1: require all prompts the same length.
+  size_t L = prompt_ids[0].size();
+  for (int i = 1; i < N; ++i)
+    if (prompt_ids[i].size() != L)
+      throw std::runtime_error("prefillBatch: prompts must have equal length in V1");
+
+  // Run one prefill using the single-stream path (populates kv_cache_).
+  reset();
+  std::vector<int32_t> pos(L);
+  std::iota(pos.begin(), pos.end(), 0);
+  auto single_out = run(prompt_ids[0], pos);
+
+  // Replicate the single-stream KV cache N times.
+  batch_kv_slots_.clear();
+  batch_kv_slots_.resize(N);
+  for (int i = 0; i < N; ++i) {
+    batch_kv_slots_[i].resize(kv_cache_.size());
+    for (size_t layer = 0; layer < kv_cache_.size(); ++layer) {
+      auto &src = kv_cache_[layer];
+      auto &dst = batch_kv_slots_[i][layer];
+      // Deep-copy the KV arrays so each request owns independent storage.
+      if (src.K.has_value()) {
+        dst.K = mx::copy(*src.K);
+        dst.V = mx::copy(*src.V);
+        mx::eval({*dst.K, *dst.V});
+      }
+      dst.seq_filled = src.seq_filled;
+    }
+  }
+
+  // Return N identical logit results (all from the same prefill).
+  std::vector<RunResult> out(N, single_out);
+  return out;
+}
+
+// Batched decode: one token per request, all at the same absolute position.
+// batch_kv_slots_ must have been populated by prefillBatch first.
+//
+// token_ids[i] = next token for request i
+// positions[i] = absolute position (must all be equal in V1; first is used)
+//
+// Returns N results, each shape [1, vocab_size].
+std::vector<MLIRExecutor::RunResult>
+MLIRExecutor::runBatch(const std::vector<int32_t> &token_ids,
+                       const std::vector<int32_t> &positions) {
+  int N = static_cast<int>(token_ids.size());
+  if (N == 0) throw std::runtime_error("runBatch: empty token list");
+  if (positions.size() != static_cast<size_t>(N))
+    throw std::runtime_error("runBatch: token_ids and positions size mismatch");
+  if (batch_kv_slots_.size() != static_cast<size_t>(N))
+    throw std::runtime_error("runBatch: must call prefillBatch first with same N");
+
+  auto func = *module_.getOps<::mlir::func::FuncOp>().begin();
+  auto &entryBlock = func.getBody().front();
+
+  // Build integer arrays for IDs and positions.
+  auto makeI32 = [](int32_t v) {
+    int32_t *buf = static_cast<int32_t *>(std::malloc(sizeof(int32_t)));
+    if (!buf) throw std::bad_alloc();
+    *buf = v;
+    mx::Shape s{1};
+    return mx::array(static_cast<void *>(buf), std::move(s), mx::int32,
+                     [](void *p) { std::free(p); });
+  };
+
+  // Stack N token embeddings into one [N, 1] ids array.
+  // The embedding table is looked up per-request: embed each separately,
+  // then concatenate → [N, hidden_dim].
+  // positions: use positions[0] as the common offset (V1 equal-pos assumption).
+  int common_offset = positions[0];
+
+  // We need to build [N, hidden] activations. The cleanest approach:
+  // treat the N tokens as a mini-batch. Build a single [N] IDs tensor,
+  // look up the embedding table, get [N, hidden].
+  // Then run the same IR walker with [N, hidden] tensors.
+  // At attention ops: dispatch to buildBatchedAttention with batch_kv_slots_.
+
+  // Build [N] integer token array.
+  int32_t *id_buf = static_cast<int32_t *>(std::malloc(N * sizeof(int32_t)));
+  if (!id_buf) throw std::bad_alloc();
+  for (int i = 0; i < N; ++i) id_buf[i] = token_ids[i];
+  mx::array ids_arr(static_cast<void *>(id_buf), mx::Shape{N}, mx::int32,
+                    [](void *p) { std::free(p); });
+  // positions array (all same value in V1)
+  auto pos_arr = makeI32(common_offset);
+
+  // Bind func args.
+  ::llvm::DenseMap<::mlir::Value, mx::array> values;
+
+  mlxq_value_pkg_.clear();
+  q4_value_dims_.clear();
+  for (unsigned i = 0; i < entryBlock.getNumArguments(); ++i) {
+    const std::string &nm = argName(func, i);
+    auto value = entryBlock.getArgument(i);
+    if (nm == "ids") {
+      values.insert({value, ids_arr});
+    } else if (nm == "positions") {
+      values.insert({value, pos_arr});
+    } else if (use_custom_q4_) {
+      if (auto it = q4_bytes_cache_.find(nm); it != q4_bytes_cache_.end()) {
+        values.insert({value, it->second});
+        q4_value_dims_.insert({value, q4_dims_cache_.at(nm)});
+      } else {
+        auto it2 = weight_cache_.find(nm);
+        if (it2 == weight_cache_.end())
+          throw std::runtime_error("runBatch: missing weight: " + nm);
+        values.insert({value, it2->second});
+      }
+    } else if (auto q4it = mlxq_cache_.find(nm); q4it != mlxq_cache_.end()) {
+      values.insert({value, q4it->second.w_q});
+      mlxq_value_pkg_.insert({value, &q4it->second});
+    } else {
+      auto it = weight_cache_.find(nm);
+      if (it == weight_cache_.end())
+        throw std::runtime_error("runBatch: missing weight: " + nm);
+      values.insert({value, it->second});
+    }
+  }
+
+  auto get = [&](::mlir::Value v) -> mx::array & {
+    auto it = values.find(v);
+    if (it == values.end()) throw std::runtime_error("SSA value not bound (batch)");
+    return it->second;
+  };
+  auto put = [&](::mlir::Value v, mx::array a) {
+    values.insert_or_assign(v, std::move(a));
+  };
+
+  // Build per-request KV cache pointer lists (one pointer per attention layer,
+  // one list per attention op encounter). We'll grow this as we walk the IR.
+  std::vector<std::vector<KVCacheSlot *>> batch_attn_caches;
+  size_t n_attn_layers = batch_kv_slots_[0].size();
+  batch_attn_caches.reserve(n_attn_layers);
+  for (size_t layer = 0; layer < n_attn_layers; ++layer) {
+    std::vector<KVCacheSlot *> ptrs(N);
+    for (int i = 0; i < N; ++i)
+      ptrs[i] = &batch_kv_slots_[i][layer];
+    batch_attn_caches.push_back(std::move(ptrs));
+  }
+
+  ::mlir::Value result;
+  size_t attn_idx = 0;
+  for (auto &op : entryBlock) {
+    if (auto matmul = ::llvm::dyn_cast<::mlir::mlc::MatMulOp>(op)) {
+      auto w_v = matmul.getW();
+      auto x_in = get(matmul.getX());
+      if (use_custom_q4_) {
+        if (auto dims = q4_value_dims_.find(w_v); dims != q4_value_dims_.end())
+          put(matmul.getY(), q4_0_matmul(x_in, get(w_v),
+                                         dims->second.first, dims->second.second));
+        else
+          put(matmul.getY(), buildMatMul(x_in, get(w_v), matmul.getTransposeB()));
+      } else if (auto pkg_it = mlxq_value_pkg_.find(w_v);
+                 pkg_it != mlxq_value_pkg_.end()) {
+        put(matmul.getY(), qmatmul(x_in, *pkg_it->second));
+      } else {
+        put(matmul.getY(), buildMatMul(x_in, get(w_v), matmul.getTransposeB()));
+      }
+    } else if (auto norm = ::llvm::dyn_cast<::mlir::mlc::NormOp>(op)) {
+      put(norm.getY(), buildNorm(get(norm.getX()), get(norm.getGamma()),
+                                 f32Of(norm.getEpsilonAttr())));
+    } else if (auto add = ::llvm::dyn_cast<::mlir::mlc::AddOp>(op)) {
+      put(add.getY(), buildAdd(get(add.getA()), get(add.getB())));
+    } else if (auto ff = ::llvm::dyn_cast<::mlir::mlc::FeedForwardOp>(op)) {
+      auto w_gate_ty =
+          ::llvm::cast<::mlir::RankedTensorType>(ff.getWGate().getType());
+      int ffn_dim = w_gate_ty.getShape()[0];
+      auto gate_pkg = mlxq_value_pkg_.find(ff.getWGate());
+      auto up_pkg   = mlxq_value_pkg_.find(ff.getWUp());
+      auto down_pkg = mlxq_value_pkg_.find(ff.getWDown());
+      bool all_q4 = gate_pkg != mlxq_value_pkg_.end() &&
+                    up_pkg   != mlxq_value_pkg_.end() &&
+                    down_pkg != mlxq_value_pkg_.end();
+      if (all_q4) {
+        auto gu_it = mlxq_ffngu_cache_.find(ff.getOperation());
+        if (gu_it == mlxq_ffngu_cache_.end()) {
+          const auto &gp = *gate_pkg->second;
+          const auto &up = *up_pkg->second;
+          auto w_q_cat    = mx::concatenate({gp.w_q, up.w_q}, 0);
+          auto scales_cat = mx::concatenate({gp.scales, up.scales}, 0);
+          auto biases_cat = mx::concatenate({gp.biases, up.biases}, 0);
+          mx::eval({w_q_cat, scales_cat, biases_cat});
+          MLXQuantWeights pkg{std::move(w_q_cat), std::move(scales_cat),
+                              std::move(biases_cat), gp.in_dim,
+                              gp.out_dim + up.out_dim};
+          gu_it = mlxq_ffngu_cache_.emplace(ff.getOperation(), std::move(pkg)).first;
+        }
+        const auto &gu = gu_it->second;
+        auto x_ff   = get(ff.getX());
+        auto gu_out = qmatmul(x_ff, gu);     // [N, 2*ffn_dim]
+        auto g = mx::slice(gu_out, {0, 0},       {gu_out.shape(0), ffn_dim});
+        auto u = mx::slice(gu_out, {0, ffn_dim},  {gu_out.shape(0), 2 * ffn_dim});
+        auto h = mx::multiply(mx::multiply(g, mx::sigmoid(g)), u);
+        put(ff.getY(), qmatmul(h, *down_pkg->second));
+      } else {
+        auto cache_it = ffn_gateup_cache_.find(ff.getOperation());
+        if (cache_it == ffn_gateup_cache_.end()) {
+          auto concat = mx::concatenate({get(ff.getWGate()), get(ff.getWUp())}, 0);
+          auto owned  = mx::copy(concat);
+          mx::eval(owned);
+          cache_it = ffn_gateup_cache_.emplace(ff.getOperation(), owned).first;
+        }
+        put(ff.getY(), buildFeedForward(get(ff.getX()), cache_it->second,
+                                        get(ff.getWDown()), ffn_dim));
+      }
+    } else if (auto emb = ::llvm::dyn_cast<::mlir::mlc::EmbeddingOp>(op)) {
+      int hidden = emb.getY().getType().getShape().back();
+      put(emb.getY(),
+          buildEmbedding(get(emb.getTable()), get(emb.getIds()), hidden));
+    } else if (auto lm = ::llvm::dyn_cast<::mlir::mlc::LMHeadOp>(op)) {
+      put(lm.getLogits(), buildLMHead(get(lm.getX()), get(lm.getW())));
+    } else if (auto fused = ::llvm::dyn_cast<::mlir::mlc::FusedNormMatMulOp>(op)) {
+      auto n = buildNorm(get(fused.getX()), get(fused.getGamma()),
+                         f32Of(fused.getEpsilonAttr()));
+      auto w_v = fused.getW();
+      if (use_custom_q4_) {
+        if (auto dims = q4_value_dims_.find(w_v); dims != q4_value_dims_.end())
+          put(fused.getY(), q4_0_matmul(n, get(w_v),
+                                        dims->second.first, dims->second.second));
+        else
+          put(fused.getY(), buildMatMul(n, get(w_v), fused.getTransposeB()));
+      } else if (auto pkg_it = mlxq_value_pkg_.find(w_v);
+                 pkg_it != mlxq_value_pkg_.end()) {
+        put(fused.getY(), qmatmul(n, *pkg_it->second));
+      } else {
+        put(fused.getY(), buildMatMul(n, get(w_v), fused.getTransposeB()));
+      }
+    } else if (auto qkv = ::llvm::dyn_cast<::mlir::mlc::FusedNormQKVMatMulOp>(op)) {
+      auto n = buildNorm(get(qkv.getX()), get(qkv.getGamma()),
+                         f32Of(qkv.getEpsilonAttr()));
+      auto q_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getQ().getType());
+      auto k_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getK().getType());
+      auto v_ty = ::llvm::cast<::mlir::RankedTensorType>(qkv.getV().getType());
+      int q_dim = q_ty.getShape().back();
+      int k_dim = k_ty.getShape().back();
+      int v_dim = v_ty.getShape().back();
+      auto wq_pkg = mlxq_value_pkg_.find(qkv.getWQ());
+      bool all_q4 = wq_pkg != mlxq_value_pkg_.end() &&
+                    mlxq_value_pkg_.count(qkv.getWK()) &&
+                    mlxq_value_pkg_.count(qkv.getWV());
+      if (all_q4) {
+        auto qkv_it = mlxq_qkv_cache_.find(qkv.getOperation());
+        if (qkv_it == mlxq_qkv_cache_.end()) {
+          const auto &qp = *mlxq_value_pkg_.at(qkv.getWQ());
+          const auto &kp = *mlxq_value_pkg_.at(qkv.getWK());
+          const auto &vp = *mlxq_value_pkg_.at(qkv.getWV());
+          auto w_q_cat    = mx::concatenate({qp.w_q, kp.w_q, vp.w_q}, 0);
+          auto scales_cat = mx::concatenate({qp.scales, kp.scales, vp.scales}, 0);
+          auto biases_cat = mx::concatenate({qp.biases, kp.biases, vp.biases}, 0);
+          mx::eval({w_q_cat, scales_cat, biases_cat});
+          MLXQuantWeights pkg{std::move(w_q_cat), std::move(scales_cat),
+                              std::move(biases_cat), qp.in_dim,
+                              qp.out_dim + kp.out_dim + vp.out_dim};
+          qkv_it = mlxq_qkv_cache_.emplace(qkv.getOperation(), std::move(pkg)).first;
+        }
+        auto out_arr = qmatmul(n, qkv_it->second);  // [N, q+k+v]
+        put(qkv.getQ(), mx::slice(out_arr, {0,0}, {N, q_dim}));
+        put(qkv.getK(), mx::slice(out_arr, {0,q_dim}, {N, q_dim+k_dim}));
+        put(qkv.getV(), mx::slice(out_arr, {0,q_dim+k_dim}, {N, q_dim+k_dim+v_dim}));
+      } else {
+        auto cache_it = qkv_concat_cache_.find(qkv.getOperation());
+        if (cache_it == qkv_concat_cache_.end()) {
+          auto w_concat = mx::concatenate({get(qkv.getWQ()), get(qkv.getWK()),
+                                            get(qkv.getWV())}, 0);
+          auto owned = mx::copy(w_concat); mx::eval(owned);
+          cache_it = qkv_concat_cache_.emplace(qkv.getOperation(), owned).first;
+        }
+        auto out_arr = buildMatMul(n, cache_it->second, qkv.getTransposeB());
+        put(qkv.getQ(), mx::slice(out_arr, {0,0}, {N, q_dim}));
+        put(qkv.getK(), mx::slice(out_arr, {0,q_dim}, {N, q_dim+k_dim}));
+        put(qkv.getV(), mx::slice(out_arr, {0,q_dim+k_dim}, {N, q_dim+k_dim+v_dim}));
+      }
+    } else if (auto attn = ::llvm::dyn_cast<::mlir::mlc::AttentionOp>(op)) {
+      if (attn_idx >= batch_attn_caches.size())
+        throw std::runtime_error("runBatch: more attention ops than KV cache layers");
+      auto &cache_ptrs = batch_attn_caches[attn_idx];
+      put(attn.getOut(),
+          buildBatchedAttention(get(attn.getQ()), get(attn.getK()),
+                                get(attn.getV()),
+                                common_offset, /*seq_new=*/1,
+                                i64Of(attn.getNumHeadsAttr()),
+                                i64Of(attn.getNumKvHeadsAttr()),
+                                i64Of(attn.getHeadDimAttr()),
+                                cache_ptrs));
+      ++attn_idx;
+    } else if (auto ret = ::llvm::dyn_cast<::mlir::func::ReturnOp>(op)) {
+      result = ret.getOperand(0);
+      break;
+    }
+  }
+
+  // result is logits [N, vocab_size]. Convert to fp32, split into N results.
+  auto &logits_raw = get(result);
+  // mlxToF32 handles any dtype → host fp32 buffer.
+  auto logits_f32 = mlxToF32(logits_raw);   // evaluates and converts
+  int ndim = static_cast<int>(logits_raw.ndim());
+  int vocab = static_cast<int>(logits_raw.shape(ndim - 1));
+  std::vector<RunResult> results;
+  results.reserve(N);
+  for (int i = 0; i < N; ++i) {
+    RunResult r;
+    r.shape = {1, vocab};
+    r.data.assign(logits_f32.begin() + static_cast<ptrdiff_t>(i) * vocab,
+                  logits_f32.begin() + static_cast<ptrdiff_t>(i + 1) * vocab);
+    results.push_back(std::move(r));
+  }
+  return results;
+}
+
+void MLIRExecutor::printProfile() const {
+  if (!profile_enabled_) return;
+  double total = 0;
+  for (auto &[k, p] : prof_buckets_) total += p.first;
+  std::printf("\n[profile] %d decode steps  total_measured=%.1f ms"
+              "  per_step=%.2f ms\n",
+              profile_steps_, total,
+              profile_steps_ > 0 ? total / profile_steps_ : 0.0);
+  std::printf("%-28s  %8s  %6s  %8s  %8s\n",
+              "op category", "total ms", "   %", "calls", "µs/call");
+  std::printf("%s\n", std::string(70, '-').c_str());
+  for (auto &k : prof_order_) {
+    auto it = prof_buckets_.find(k);
+    if (it == prof_buckets_.end()) continue;
+    double ms = it->second.first;
+    int    calls = it->second.second;
+    double pct = total > 0 ? 100.0 * ms / total : 0.0;
+    double upc = calls > 0 ? 1000.0 * ms / calls : 0.0;
+    std::printf("%-28s  %8.2f  %5.1f%%  %8d  %8.1f\n",
+                k.c_str(), ms, pct, calls, upc);
+  }
+  std::printf("%s\n", std::string(70, '-').c_str());
+  std::printf("%-28s  %8.2f  %5.1f%%\n", "TOTAL", total, 100.0);
+}
 
 MLIRExecutor::RunResult
 MLIRExecutor::run(const std::vector<int32_t> &token_ids,
@@ -410,6 +823,56 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
   };
   mx::array ids_arr = makeI32(token_ids);
   mx::array pos_arr = makeI32(positions);
+
+  // Profiling helper: forces eval of `arr` and records elapsed time.
+  // Inlined as a lambda so it captures profile_enabled_ by reference.
+  // In non-profile mode this is dead code; the optimizer removes it.
+  auto profEval = [&](const std::string &key, mx::array &arr) {
+    if (!profile_enabled_) return;
+    auto t0 = std::chrono::steady_clock::now();
+    mx::eval(arr);
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    auto it = prof_buckets_.find(key);
+    if (it == prof_buckets_.end()) {
+      prof_order_.push_back(key);
+      prof_buckets_[key] = {ms, 1};
+    } else {
+      it->second.first  += ms;
+      it->second.second += 1;
+    }
+  };
+  auto profEval2 = [&](const std::string &key, mx::array &a, mx::array &b) {
+    if (!profile_enabled_) return;
+    auto t0 = std::chrono::steady_clock::now();
+    mx::eval({a, b});
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    auto it = prof_buckets_.find(key);
+    if (it == prof_buckets_.end()) {
+      prof_order_.push_back(key);
+      prof_buckets_[key] = {ms, 1};
+    } else {
+      it->second.first  += ms;
+      it->second.second += 1;
+    }
+  };
+  auto profEval3 = [&](const std::string &key,
+                        mx::array &a, mx::array &b, mx::array &c) {
+    if (!profile_enabled_) return;
+    auto t0 = std::chrono::steady_clock::now();
+    mx::eval({a, b, c});
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    auto it = prof_buckets_.find(key);
+    if (it == prof_buckets_.end()) {
+      prof_order_.push_back(key);
+      prof_buckets_[key] = {ms, 1};
+    } else {
+      it->second.first  += ms;
+      it->second.second += 1;
+    }
+  };
 
   mlxq_value_pkg_.clear();
   q4_value_dims_.clear();
@@ -465,29 +928,32 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       bool ane_match = ane_it != ane_cache_.end() &&
                        x_in.shape(0) == ane_it->second->M();
       if (ane_match) {
-        // CoreML/ANE path. Input x is whatever dtype; ANE wraps it as
-        // fp16 internally; output comes back as fp32 (CoreML default).
         auto y_out = ane_it->second->predict(x_in);
         put(matmul.getY(), mx::astype(y_out, x_in.dtype()));
+        profEval("matmul_ane", get(matmul.getY()));
       } else if (use_custom_q4_) {
         if (auto dims = q4_value_dims_.find(w_v); dims != q4_value_dims_.end())
           put(matmul.getY(), q4_0_matmul(x_in, get(w_v),
                                          dims->second.first, dims->second.second));
         else
           put(matmul.getY(), buildMatMul(x_in, get(w_v), matmul.getTransposeB()));
+        profEval("matmul_q4", get(matmul.getY()));
       } else if (auto pkg_it = mlxq_value_pkg_.find(w_v);
                  pkg_it != mlxq_value_pkg_.end()) {
         put(matmul.getY(), qmatmul(x_in, *pkg_it->second));
+        profEval("matmul_q4", get(matmul.getY()));
       } else {
-        put(matmul.getY(),
-            buildMatMul(x_in, get(w_v), matmul.getTransposeB()));
+        put(matmul.getY(), buildMatMul(x_in, get(w_v), matmul.getTransposeB()));
+        profEval("matmul_fp", get(matmul.getY()));
       }
     } else if (auto norm = ::llvm::dyn_cast<::mlir::mlc::NormOp>(op)) {
       put(norm.getY(),
           buildNorm(get(norm.getX()), get(norm.getGamma()),
                     f32Of(norm.getEpsilonAttr())));
+      profEval("norm", get(norm.getY()));
     } else if (auto add = ::llvm::dyn_cast<::mlir::mlc::AddOp>(op)) {
       put(add.getY(), buildAdd(get(add.getA()), get(add.getB())));
+      profEval("add_residual", get(add.getY()));
     } else if (auto ff = ::llvm::dyn_cast<::mlir::mlc::FeedForwardOp>(op)) {
       auto w_gate_ty =
           ::llvm::cast<::mlir::RankedTensorType>(ff.getWGate().getType());
@@ -540,13 +1006,14 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
         const auto &gu = gu_cache_it->second;
         auto x_ff = get(ff.getX());
         auto gu_out = qmatmul(x_ff, gu);
+        profEval("ffn_gate_up_q4", gu_out);
         auto g = mx::slice(gu_out, {0, 0}, {gu_out.shape(0), ffn_dim});
         auto u = mx::slice(gu_out, {0, ffn_dim}, {gu_out.shape(0), 2 * ffn_dim});
         auto h = mx::multiply(mx::multiply(g, mx::sigmoid(g)), u);
+        profEval2("silu_mul", g, u);  // forces g, u eval to time silu*mul
         put(ff.getY(), qmatmul(h, *down_pkg->second));
+        profEval("ffn_down_q4", get(ff.getY()));
       } else {
-        // fp16 path (no Q4_0 weights): gate||up concat cached in
-        // ffn_gateup_cache_.
         auto cache_it = ffn_gateup_cache_.find(ff.getOperation());
         if (cache_it == ffn_gateup_cache_.end()) {
           auto concat = mx::concatenate({get(ff.getWGate()), get(ff.getWUp())},
@@ -557,13 +1024,16 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
         }
         put(ff.getY(), buildFeedForward(get(ff.getX()), cache_it->second,
                                        get(ff.getWDown()), ffn_dim));
+        profEval("ffn_fp", get(ff.getY()));
       }
     } else if (auto emb = ::llvm::dyn_cast<::mlir::mlc::EmbeddingOp>(op)) {
       int hidden = emb.getY().getType().getShape().back();
       put(emb.getY(),
           buildEmbedding(get(emb.getTable()), get(emb.getIds()), hidden));
+      profEval("embedding", get(emb.getY()));
     } else if (auto lm = ::llvm::dyn_cast<::mlir::mlc::LMHeadOp>(op)) {
       put(lm.getLogits(), buildLMHead(get(lm.getX()), get(lm.getW())));
+      profEval("lm_head", get(lm.getLogits()));
     } else if (auto fused = ::llvm::dyn_cast<::mlir::mlc::FusedNormMatMulOp>(op)) {
       auto n = buildNorm(get(fused.getX()), get(fused.getGamma()),
                          f32Of(fused.getEpsilonAttr()));
@@ -574,11 +1044,14 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
                                         dims->second.first, dims->second.second));
         else
           put(fused.getY(), buildMatMul(n, get(w_v), fused.getTransposeB()));
+        profEval("fused_norm_matmul_q4", get(fused.getY()));
       } else if (auto pkg_it = mlxq_value_pkg_.find(w_v);
                  pkg_it != mlxq_value_pkg_.end()) {
         put(fused.getY(), qmatmul(n, *pkg_it->second));
+        profEval("fused_norm_matmul_q4", get(fused.getY()));
       } else {
         put(fused.getY(), buildMatMul(n, get(w_v), fused.getTransposeB()));
+        profEval("fused_norm_matmul_fp", get(fused.getY()));
       }
     } else if (auto qkv = ::llvm::dyn_cast<::mlir::mlc::FusedNormQKVMatMulOp>(op)) {
       auto n = buildNorm(get(qkv.getX()), get(qkv.getGamma()),
@@ -626,15 +1099,15 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
           auto r = q4_0_matmul_qkv(n, qkv_it->second, in_dim,
                                     q_dim, k_dim, v_dim);
           put(qkv.getQ(), r.q); put(qkv.getK(), r.k); put(qkv.getV(), r.v);
+          profEval3("qkv_proj_q4", get(qkv.getQ()), get(qkv.getK()), get(qkv.getV()));
         } else {
           auto out_arr = buildMatMul(n, qkv_it->second, qkv.getTransposeB());
           put(qkv.getQ(), mx::slice(out_arr, {0,0}, {out_arr.shape(0), q_dim}));
           put(qkv.getK(), mx::slice(out_arr, {0,q_dim}, {out_arr.shape(0), q_dim+k_dim}));
           put(qkv.getV(), mx::slice(out_arr, {0,q_dim+k_dim}, {out_arr.shape(0), q_dim+k_dim+v_dim}));
+          profEval3("qkv_proj_fp", get(qkv.getQ()), get(qkv.getK()), get(qkv.getV()));
         }
       } else if (all_q4) {
-        // Concat Q ‖ K ‖ V quantized packs along the out-row axis once,
-        // do a single quantized_matmul, then slice. Cached in mlxq_qkv_cache_.
         auto qkv_cache_it = mlxq_qkv_cache_.find(qkv.getOperation());
         if (qkv_cache_it == mlxq_qkv_cache_.end()) {
           const auto &qp = *mlxq_value_pkg_.at(qkv.getWQ());
@@ -659,6 +1132,7 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
         put(qkv.getV(),
             mx::slice(out_arr, {0, q_dim + k_dim},
                       {out_arr.shape(0), q_dim + k_dim + v_dim}));
+        profEval3("qkv_proj_q4", get(qkv.getQ()), get(qkv.getK()), get(qkv.getV()));
       } else {
         // fp16 path: gate||K||V concat cached in qkv_concat_cache_.
         auto cache_it = qkv_concat_cache_.find(qkv.getOperation());
@@ -678,10 +1152,9 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
         put(qkv.getV(),
             mx::slice(out_arr, {0, q_dim + k_dim},
                       {out_arr.shape(0), q_dim + k_dim + v_dim}));
+        profEval3("qkv_proj_fp", get(qkv.getQ()), get(qkv.getK()), get(qkv.getV()));
       }
     } else if (auto attn = ::llvm::dyn_cast<::mlir::mlc::AttentionOp>(op)) {
-      // Grow the cache lazily so an executor used without any decode
-      // doesn't pay for the storage.
       if (attn_idx >= kv_cache_.size())
         kv_cache_.emplace_back();
       put(attn.getOut(),
@@ -691,21 +1164,35 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
                          i64Of(attn.getNumKvHeadsAttr()),
                          i64Of(attn.getHeadDimAttr()),
                          &kv_cache_[attn_idx]));
+      profEval("attention_sdpa_kvcache", get(attn.getOut()));
       ++attn_idx;
     } else if (auto ret = ::llvm::dyn_cast<::mlir::func::ReturnOp>(op)) {
       result = ret.getOperand(0);
       break;
     }
-    // (Skip ops we don't recognize; the emitter today produces only the
-    // 7 mlc ops + func.return.)
   }
 
   auto &resArr = get(result);
-  std::vector<float> host = mlxToF32(resArr);
-  std::vector<int> shape;
-  for (auto d : resArr.shape())
-    shape.push_back(static_cast<int>(d));
-  return RunResult{std::move(host), std::move(shape)};
+  {
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<float> host = mlxToF32(resArr);
+    auto t1 = std::chrono::steady_clock::now();
+    if (profile_enabled_) {
+      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      auto it = prof_buckets_.find("final_eval_host");
+      if (it == prof_buckets_.end()) {
+        prof_order_.push_back("final_eval_host");
+        prof_buckets_["final_eval_host"] = {ms, 1};
+      } else {
+        it->second.first += ms; it->second.second += 1;
+      }
+    }
+    std::vector<int> shape;
+    for (auto d : resArr.shape())
+      shape.push_back(static_cast<int>(d));
+    ++profile_steps_;
+    return RunResult{std::move(host), std::move(shape)};
+  }
 }
 
 } // namespace mlir::mlc::exec

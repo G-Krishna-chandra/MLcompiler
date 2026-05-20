@@ -96,7 +96,8 @@ if(MLC_ENABLE_MLIR AND TARGET MLCExec)
         mlir/test_schedule_devices.cpp
         mlir/test_ane_matmul.cpp
         mlir/test_ane_layer.cpp
-        mlir/test_q4_kernel_multi.cpp)
+        mlir/test_q4_kernel_multi.cpp
+        mlir/test_batch_executor.cpp)
     set_target_properties(mlir_exec_tests PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON

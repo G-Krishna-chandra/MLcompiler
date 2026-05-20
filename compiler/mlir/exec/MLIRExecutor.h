@@ -59,8 +59,25 @@ public:
   RunResult run(const std::vector<int32_t> &token_ids,
                 const std::vector<int32_t> &positions);
 
-  // Drop all KV cache state. Call this before a new prompt.
+  // Batched decode: N requests, each providing one token per step.
+  // token_ids[i] and positions[i] are the current token/position for request i.
+  // Returns one RunResult per request (logits over vocab, shape [1, vocab]).
+  // Each request has its own KV cache slot maintained across calls.
+  // All requests must have the same KV-cache depth (equal-length constraint
+  // for V1 — variable-length sequences come in V4 with the scheduler).
+  std::vector<RunResult> runBatch(const std::vector<int32_t> &token_ids,
+                                  const std::vector<int32_t> &positions);
+
+  // Prefill N requests in one batched forward pass.
+  // prompt_ids[i]: token ids for request i (same length required for V1).
+  // Returns one RunResult per request, shape [seq_len, vocab].
+  std::vector<RunResult> prefillBatch(
+      const std::vector<std::vector<int32_t>> &prompt_ids);
+
+  // Drop KV cache for all requests.
   void reset();
+  // Drop KV cache for one request slot.
+  void resetSlot(int slot_idx);
 
 private:
   ::mlir::ModuleOp module_;
@@ -98,6 +115,10 @@ private:
   // KV cache, one slot per mlc.attention op encountered (in walk order).
   // Grows on the first prefill call; updated in place every step.
   std::vector<KVCacheSlot> kv_cache_;
+  // Batched KV cache: one inner vector per concurrent request, each with
+  // one KVCacheSlot per attention layer. Populated by prefillBatch /
+  // runBatch; kv_cache_ is unused when batch_kv_slots_ is active.
+  std::vector<std::vector<KVCacheSlot>> batch_kv_slots_;
   // MLC_Q4_CUSTOM_KERNEL=1: fall back to the hand-written Q4_0 Metal kernel
   // instead of mx::quantized_matmul. The custom kernel's fp16 output truncation
   // breaks TinyLlama's repetition trap at temperature=0; the native MLX path
@@ -111,6 +132,17 @@ private:
       q4_qkv_concat_cache_;
   std::unordered_map<::mlir::Operation *, mlx::core::array>
       q4_ffngu_concat_cache_;
+  // Profiling state — populated when MLC_COMPILER_PROFILE=1.
+  // Exposed so run() can accumulate into them and printProfile() can dump.
+  bool profile_enabled_ = false;
+  int  profile_steps_   = 0;
+  // Insertion-ordered keys + per-key (total_ms, call_count) buckets.
+  std::vector<std::string> prof_order_;
+  std::unordered_map<std::string, std::pair<double, int>> prof_buckets_;
+
+public:
+  // Print accumulated profile table to stdout. Call after N decode steps.
+  void printProfile() const;
 };
 
 } // namespace mlir::mlc::exec
