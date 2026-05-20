@@ -106,3 +106,28 @@ Compiler path: 77 tok/s single-stream / 143 tok/s batch=8, TinyLlama Q4_0, M3 Pr
    [1,2048]×[K,2048] — too thin for MLX's tiled kernel. Llama.cpp's custom simdgroup
    reduction handles this shape ~2× better. Not fixable without custom Metal shaders
    (which we explicitly don't write for the compiler path).
+
+## Session U8 update — per-shape kernel selection falsified
+
+The per-shape kernel selection moat (W1 investigation) does not hold:
+
+**Per-kernel micro-benchmark (100 GPU-synced iterations):** Custom Q4_0
+kernel wins at M=1 by 1.1-1.5× on gate_up and qkv shapes; MLX wins at M≥4.
+
+**End-to-end ground truth:** custom-only (78.2 tok/s) ≈ MLX-only (78.5 tok/s).
+Difference < 0.5%.
+
+**Root cause:** At batch=1 decode, Metal dispatch overhead (~100 µs per
+dispatch × ~110 dispatches = ~11 ms) dominates over per-kernel compute
+(~15-50 µs per M=1 matmul). Custom kernel is 1.3-1.5× faster at compute;
+that advantage is ~20-60 µs — below the noise floor of the 11 ms overhead.
+
+**Finding #7:** Per-shape kernel selection does not improve batch=1 tok/s
+because dispatch overhead, not compute speed, is the binding constraint.
+The moat must come from reducing dispatch count (fewer Metal launches per
+forward pass), not from faster individual dispatches.
+
+**The only lever not yet tried:** Full layer fusion — single Metal kernel
+covering norm + QKV + attention + output + FFN in 1-2 GPU dispatches
+instead of ~5. This requires custom Metal kernel code, which VISION.md
+currently prohibits for the compiler path. Decision needed.
