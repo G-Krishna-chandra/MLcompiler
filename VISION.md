@@ -132,3 +132,42 @@ forward pass), not from faster individual dispatches.
 covering norm + QKV + attention + output + FFN in 1-2 GPU dispatches
 instead of ~5. This requires custom Metal kernel code, which VISION.md
 currently prohibits for the compiler path. Decision needed.
+
+## Session U9 update — fused kernel dispatch-count reduction falsified
+
+The fused multi-op Metal kernel approach (X1-X4) does not improve batch=1 throughput.
+
+**Benchmark (5-run stable, batch=1, 30 tokens):**
+- Baseline (MLX-only): 78.7 ±0.6 tok/s
+- Fused kernels (X2+X3a): 77.3 ±0.5 tok/s — **−1.8%**
+
+**Root cause — second falsification of the dispatch overhead hypothesis:**
+
+The U8 "110 dispatches × 100 µs = 11 ms overhead" measurement was from
+FORCED-EVAL (mx::eval() per op) which measures CPU-GPU SYNC cost, not GPU
+command processor overhead. In lazy-eval production mode, Metal batches all
+ops into one command buffer submitted once — the GPU executes the full
+sequence pipelined without CPU intervention between ops.
+
+The real per-GPU-command overhead (command processor side) is ~1-5 µs, not
+100 µs. 110 commands × 5 µs = 0.55 ms — a 4% overhead on the 13 ms step.
+Reducing dispatch count saves 0.55 ms at most, even if each command were free.
+
+Meanwhile, the fused kernel READS x TWICE (norm pass then matmul pass) and
+uses non-MLX-optimized MSL, making each dispatch SLOWER than Apple's
+separate optimized kernels. Net: smaller dispatch count, longer dispatches,
+net negative.
+
+**Finding #8:** Dispatch-count reduction does not improve lazy-eval
+production throughput. The bottleneck is GPU compute per op, not the number
+of GPU command submissions. Apple's MLX kernels are already highly optimized;
+custom fused kernels in naive MSL cannot outperform them at compute, and
+dispatch amortization doesn't compensate.
+
+**Correct framing for the moat (revised):**
+The compiler moat is NOT about reducing dispatch count or kernel selection.
+Both approaches address ops in isolation. The real moat is at the REQUEST
+LEVEL: the batched executor (U7) achieves 143 tok/s at batch=8, matching
+Ollama's single-stream ceiling, and the Phase-1 runtime at batch=8 (97 tok/s)
+is 1.47× slower. The compiler advantage is in batch-aware scheduling and
+execution, not per-op kernel optimization.
