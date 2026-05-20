@@ -298,6 +298,10 @@ MLIRExecutor::MLIRExecutor(::mlir::ModuleOp module,
     const char *env = std::getenv("MLC_COMPILER_PROFILE");
     profile_enabled_ = env && std::string(env) == "1";
   }
+  {
+    const char *env = std::getenv("MLC_FUSED_KERNELS");
+    use_fused_kernels_ = env && std::string(env) == "1";
+  }
   auto func = *module_.getOps<::mlir::func::FuncOp>().begin();
 
   // First pass: identify which func args are used as the weight operand of
@@ -964,7 +968,36 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       bool all_q4 = gate_pkg != mlxq_value_pkg_.end() &&
                     up_pkg   != mlxq_value_pkg_.end() &&
                     down_pkg != mlxq_value_pkg_.end();
-      if (use_custom_q4_) {
+      // ── Fused FFN dispatch (X3: gate+up+silu in 1 dispatch, down stays lazy)
+      // ff.getX() is the already-normed FFN input (from the preceding NormOp).
+      // fusedQ4GateUpSilu: gate_matmul + silu*mul in 1 custom kernel dispatch.
+      // Down matmul stays as MLX lazy op (it's structurally separate: output
+      // feeds the AddOp residual, which needs separate handling).
+      // Net: saves gate+silu dispatches; gate+up+silu = 3→1 dispatch per layer.
+      if (use_fused_kernels_ && all_q4) {
+        auto gu_fit = fused_gu_bytes_cache_.find(ff.getOperation());
+        if (gu_fit == fused_gu_bytes_cache_.end()) {
+          auto getWN = [&](::mlir::Value v) {
+            auto ba = ::llvm::cast<::mlir::BlockArgument>(v);
+            return argName(func, ba.getArgNumber());
+          };
+          auto bg = gufWeightToBytesMLX(loader_, getWN(ff.getWGate()));
+          auto bu = gufWeightToBytesMLX(loader_, getWN(ff.getWUp()));
+          auto bc = mx::concatenate({bg, bu}, 0);
+          mx::eval(bc);
+          fused_gu_dims_[ff.getOperation()] = {gate_pkg->second->in_dim, ffn_dim};
+          gu_fit = fused_gu_bytes_cache_.emplace(ff.getOperation(), bc).first;
+        }
+        auto &[K_dim, fdim] = fused_gu_dims_.at(ff.getOperation());
+        // Keep x_ff in its original dtype to match reference path precision.
+        auto x_ff = get(ff.getX());
+        // Gate+up fused (SiLU inside kernel); result h = silu(gate)*up.
+        auto h = fusedQ4GateUpSilu(x_ff, gu_fit->second, K_dim, fdim);
+        profEval("fused_gate_up_silu", h);
+        // Down stays as MLX quantized_matmul (lazy, evaluated at final eval).
+        put(ff.getY(), qmatmul(h, *down_pkg->second));
+        profEval("ffn_down_q4", get(ff.getY()));
+      } else if (use_custom_q4_) {
         bool cq4 = q4_value_dims_.count(ff.getWGate()) &&
                    q4_value_dims_.count(ff.getWUp()) &&
                    q4_value_dims_.count(ff.getWDown());
@@ -1083,6 +1116,40 @@ MLIRExecutor::run(const std::vector<int32_t> &token_ids,
       bool all_q4 = wq_pkg != mlxq_value_pkg_.end() &&
                     mlxq_value_pkg_.count(qkv.getWK()) &&
                     mlxq_value_pkg_.count(qkv.getWV());
+      // ── Fused norm+QKV dispatch (X2: replaces norm dispatch + qmatmul) ──
+      // The `n = buildNorm(...)` above is lazy; if we take this branch,
+      // `n` is never consumed → never dispatched to Metal. Net: 2→1 dispatch.
+      if (use_fused_kernels_ && all_q4) {
+        // Build raw Q4_0 bytes concat lazily (first encounter per op).
+        auto fit = fused_qkv_bytes_cache_.find(qkv.getOperation());
+        if (fit == fused_qkv_bytes_cache_.end()) {
+          auto getWN = [&](::mlir::Value v) {
+            auto ba = ::llvm::cast<::mlir::BlockArgument>(v);
+            return argName(func, ba.getArgNumber());
+          };
+          auto bq = gufWeightToBytesMLX(loader_, getWN(qkv.getWQ()));
+          auto bk = gufWeightToBytesMLX(loader_, getWN(qkv.getWK()));
+          auto bv = gufWeightToBytesMLX(loader_, getWN(qkv.getWV()));
+          auto bc = mx::concatenate({bq, bk, bv}, 0);
+          mx::eval(bc);
+          int K_dim = wq_pkg->second->in_dim;
+          fused_qkv_dims_[qkv.getOperation()] = {K_dim, q_dim + k_dim + v_dim};
+          fit = fused_qkv_bytes_cache_.emplace(qkv.getOperation(), bc).first;
+        }
+        auto &[K_dim, N_total] = fused_qkv_dims_.at(qkv.getOperation());
+        // Keep x in its original dtype (fp16 or fp32) to match the reference
+        // path's precision. Cast gamma to match x so the Metal T template
+        // compiles (const device T* g = gamma requires both same type).
+        // The kernel always accumulates in float32 internally.
+        auto x_raw   = get(qkv.getX());
+        auto gamma_f = mx::astype(get(qkv.getGamma()), x_raw.dtype());
+        float eps = f32Of(qkv.getEpsilonAttr());
+        auto r = fusedNormQ4MatmulQKV(x_raw, gamma_f, fit->second, eps,
+                                       K_dim, q_dim, k_dim, v_dim);
+        put(qkv.getQ(), r.q); put(qkv.getK(), r.k); put(qkv.getV(), r.v);
+        profEval3("fused_norm_qkv", get(qkv.getQ()), get(qkv.getK()), get(qkv.getV()));
+        continue;
+      }
       if (use_custom_q4_) {
         bool cq4 = q4_value_dims_.count(qkv.getWQ()) &&
                    q4_value_dims_.count(qkv.getWK()) &&

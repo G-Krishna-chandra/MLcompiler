@@ -3,6 +3,7 @@
 #include "compiler/frontends/gguf_loader.hpp"
 
 #include "compiler/mlir/exec/ANEMatMul.h"
+#include "compiler/mlir/exec/FusedKernels.h"
 #include "compiler/mlir/exec/MLXQuantize.h"
 #include "compiler/mlir/exec/Q4MatMul.h"
 
@@ -119,6 +120,19 @@ private:
   // one KVCacheSlot per attention layer. Populated by prefillBatch /
   // runBatch; kv_cache_ is unused when batch_kv_slots_ is active.
   std::vector<std::vector<KVCacheSlot>> batch_kv_slots_;
+  // MLC_FUSED_KERNELS=1: use fused multi-op Metal kernels (X1-X3).
+  // Reduces dispatch count from ~300 to ~200 per decode step.
+  // Raw Q4_0 bytes loaded alongside MLX native format for the fused kernels.
+  bool use_fused_kernels_ = false;
+  // Per-layer concat'd raw Q4_0 bytes for fused kernels (QKV and gate+up).
+  // Populated at construction when use_fused_kernels_=true.
+  std::unordered_map<::mlir::Operation *, mlx::core::array> fused_qkv_bytes_cache_;
+  std::unordered_map<::mlir::Operation *, std::pair<int,int>> fused_qkv_dims_; // (K, N_total)
+  std::unordered_map<::mlir::Operation *, mlx::core::array> fused_gu_bytes_cache_;
+  std::unordered_map<::mlir::Operation *, std::pair<int,int>> fused_gu_dims_;  // (K, ffn_dim)
+  std::unordered_map<::mlir::Operation *, mlx::core::array> fused_down_bytes_cache_;
+  std::unordered_map<::mlir::Operation *, std::pair<int,int>> fused_down_dims_; // (K_ffn, N)
+
   // MLC_Q4_CUSTOM_KERNEL=1: fall back to the hand-written Q4_0 Metal kernel
   // instead of mx::quantized_matmul. The custom kernel's fp16 output truncation
   // breaks TinyLlama's repetition trap at temperature=0; the native MLX path

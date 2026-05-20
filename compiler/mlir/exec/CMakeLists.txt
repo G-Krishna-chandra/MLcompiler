@@ -10,6 +10,7 @@ add_library(MLCExec STATIC
     Quantize.cpp
     MLXBuilder.cpp
     MLXQuantize.cpp
+    FusedKernels.cpp
     MLIRExecutor.cpp
     Q4MatMul.cpp
     ANEMatMul.mm
