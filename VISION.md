@@ -48,15 +48,22 @@ Our compiler sees the full graph and can fuse adjacent ops (QKV projection batch
 
 ## Current state (as of last session)
 
-Compiler path: 71 tok/s on TinyLlama 1.1B Q4_0, M3 Pro.
+Compiler path: 66 tok/s on TinyLlama 1.1B Q4_0, M3 Pro.
 - MLIR dialect: 7 ops, IR emission from GGUF, round-trip through mlc-opt
-- Fusion passes: QKV batching (+13%), FFN gate+up batching, multi-output Q4_0 kernel
-- Execution: custom Q4_0 Metal kernel via mx::fast::metal_kernel, in-place KV cache, MLX SDPA
+- Fusion passes: QKV batching, FFN gate+up batching
+- Execution: mx::quantized_matmul (group_size=32, bits=4, affine) for all Q4_0 weights,
+  converted from GGUF at load time; in-place KV cache; MLX SDPA
 - ANE: investigated and falsified via CoreML (T2, U1). Code retained, off by default.
+- `MLC_Q4_CUSTOM_KERNEL=1` falls back to the original hand-written Q4_0 Metal kernel
+  (same tok/s, same generation — retained for debugging)
 
 ## Immediate next steps (priority order)
 
-1. **Switch matmul to mx::quantized_matmul.** Convert GGUF Q4_0 weights to MLX native quantized format at load time. Replace custom Q4_0 kernel with mx::quantized_matmul calls. This should close the gap to vllm-mlx on per-op matmul speed (71 → potentially 100+ tok/s).
+1. ~~**Switch matmul to mx::quantized_matmul.**~~ DONE (U6). Speed is 66 tok/s
+   (comparable to the old custom kernel). Generation matches Python/MLX reference.
+   Both quantized paths produce "Paris, the city of love" (repeating) at temp=0 on
+   the standard prompt — this is TinyLlama's failure mode, not a regression. The
+   "Paris." output from U5 was from the fp32 dequant path (1 tok/s), not Q4_0.
 
 2. **Continuous batching through the compiler path.** Add batched execution to the MLIR pipeline. The MLIR fusion passes (QKV batching, FFN gate+up) should reduce dispatch count per forward pass, improving batched throughput over vanilla MLX.
 
@@ -78,4 +85,7 @@ Compiler path: 71 tok/s on TinyLlama 1.1B Q4_0, M3 Pro.
 1. **ANE via CoreML doesn't work for inference.** Per-matmul CoreML overhead is ~250 µs regardless of subgraph packing. The S4 "5x ANE win" was an apples-to-oranges benchmark (fresh weights vs resident weights). Falsified in U1.
 2. **Metal memory coherence breaks at scale.** Single-encoder forward pass with barriers works at small scale (10 dispatches) but produces garbage at walker scale (260 dispatches, 20 reused buffers). Diagnosed in N1, documented in tools/metal_hazard_test.mm.
 3. **MLX lazy evaluation already fuses adjacent ops.** MLIR norm+matmul fusion added zero wall-clock improvement because MLX was already doing it internally. Only cross-op fusions (shared-input batching) move the clock.
-4. **Custom Q4_0 kernel < MLX quantized_matmul.** Our hand-written kernel is slower than Apple's optimized path. Use theirs.
+4. **Custom Q4_0 kernel ≈ mx::quantized_matmul in decode mode.** Both give ~65–66
+   tok/s on TinyLlama batch=1 decode. mx::quantized_matmul is the default because it
+   is Apple's optimized path and matches the Python/MLX reference. The custom kernel
+   is retained behind `MLC_Q4_CUSTOM_KERNEL=1`.
